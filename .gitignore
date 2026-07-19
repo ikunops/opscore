@@ -1,0 +1,12 @@
+# 前端构建产物(由 go:embed 打包进二进制, 无需入库)
+/web/dist/
+/web/node_modules/
+
+# 本地 Windows 构建产物
+*.exe
+opscore.exe~
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+Thumbs.db
