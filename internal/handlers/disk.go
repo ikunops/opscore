@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/disk"
@@ -41,6 +42,12 @@ func DiskChildren(w http.ResponseWriter, r *http.Request) {
 	// 需补成 `C:\` 才能读到盘根(否则下钻内容其实是程序 CWD)。
 	if len(root) == 2 && root[1] == ':' {
 		root = root + `\`
+	}
+
+	// 禁止下钻虚拟文件系统：这些路径不是真实磁盘，扫出来会得到天文数字。
+	if isVirtualMount(root) {
+		WriteJSON(w, map[string]any{"error": "虚拟文件系统不可下钻", "root": root})
+		return
 	}
 
 	dc := DiskChildrenResp{Root: root}
@@ -105,4 +112,19 @@ func dirSize(ctx context.Context, root string) (uint64, bool) {
 		return nil
 	})
 	return total, done
+}
+
+// isVirtualMount 判断给定路径是否属于 Linux 虚拟/伪文件系统，不应被下钻扫描。
+func isVirtualMount(path string) bool {
+	// 统一小写并处理 Windows 路径分隔符，便于前缀匹配。
+	p := strings.ToLower(filepath.ToSlash(path))
+	virtualRoots := []string{
+		"/proc", "/sys", "/dev", "/run", "/boot/efi",
+	}
+	for _, root := range virtualRoots {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return true
+		}
+	}
+	return false
 }

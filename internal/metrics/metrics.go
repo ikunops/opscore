@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -120,11 +121,10 @@ func tick() {
 
 	if parts, err := disk.Partitions(false); err == nil {
 		for _, p := range parts {
-			switch p.Fstype {
-			case "proc", "tmpfs", "devtmpfs", "overlay", "sysfs", "cgroup", "cgroup2":
+			if shouldSkipDisk(p) {
 				continue
 			}
-			if u, err := disk.Usage(p.Mountpoint); err == nil {
+			if u, err := disk.Usage(p.Mountpoint); err == nil && u.Total > 0 && u.UsedPercent < 1000 {
 				s.Disks = append(s.Disks, DiskInfo{
 					Mountpoint:  p.Mountpoint,
 					Total:       u.Total,
@@ -161,6 +161,33 @@ func subtract(a, b uint64) uint64 {
 		return a - b
 	}
 	return 0
+}
+
+// shouldSkipDisk 判断一个挂载点是否属于虚拟/伪文件系统，不应纳入磁盘统计。
+// 同时按文件系统类型(Fstype)和挂载路径(Mountpoint)双重过滤，避免 /proc、/sys
+// 等虚拟 FS 混入磁盘列表，也避免 docker 容器化环境里 overlay、aufs 等被误报。
+func shouldSkipDisk(p disk.PartitionStat) bool {
+	fstype := strings.ToLower(p.Fstype)
+	switch fstype {
+	case "", "proc", "procfs", "procfs2", "subfs", "sysfs", "sysfs2",
+		"tmpfs", "devtmpfs", "devpts", "ramfs", "overlay", "aufs",
+		"squashfs", "cgroup", "cgroup2", "securityfs", "debugfs",
+		"pstore", "bpf", "fusectl", "hugetlbfs", "mqueue", "configfs",
+		"tracefs", "rpc_pipefs", "nfsd", "fuse.gvfsd-fuse", "binfmt_misc",
+		"efivarfs":
+		return true
+	}
+	mp := strings.ToLower(p.Mountpoint)
+	virtualRoots := []string{
+		"/proc", "/sys", "/dev", "/run", "/boot/efi",
+		"/var/lib/docker/", "/var/lib/containers/",
+	}
+	for _, root := range virtualRoots {
+		if mp == root || strings.HasPrefix(mp, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // Get 返回最新的指标快照。
