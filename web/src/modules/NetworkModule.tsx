@@ -25,12 +25,20 @@ type NetTab = 'network' | 'firewall'
 
 export default function NetworkModule() {
   const [data, setData] = useState<NetData | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<NetTab>('firewall')
 
   useEffect(() => {
     if (tab === 'firewall') return // 防火墙页自己拉数据
     const load = () =>
-      getJSON<NetData>('/api/core/network').then(setData).catch(() => {})
+      getJSON<NetData>('/api/core/network')
+        .then((d) => {
+          setData(d)
+          setError(null)
+        })
+        .catch((err) => {
+          setError(err instanceof Error ? err.message : String(err))
+        })
     load()
     const t = setInterval(load, 5000)
     return () => clearInterval(t)
@@ -51,7 +59,9 @@ export default function NetworkModule() {
       {tab === 'firewall' && <FirewallModule />}
 
       {tab === 'network' &&
-        (data ? (
+        (error ? (
+          <div className="banner banner-error">请求失败: {error}</div>
+        ) : data ? (
           <div className="grid grid-2">
             {(data.ifaceError || data.listenError) && (
               <div className="banner banner-warn small" style={{ gridColumn: '1 / -1' }}>
