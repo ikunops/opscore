@@ -47,18 +47,17 @@ opscore.exe
 
 ### 开机自启(可选,裸金属)
 ```bash
-# 1. 二进制放到指定位置
-sudo mkdir -p /opt/opscore
+# 1. 二进制与前端产物放到指定位置
+sudo mkdir -p /opt/opscore/web
 sudo cp opscore /opt/opscore/opscore
+sudo cp -r web/dist /opt/opscore/web/dist
 
-# 2. 创建低权用户
-sudo useradd -r -s /usr/sbin/nologin opscore
-sudo chown -R opscore:opscore /opt/opscore
-
-# 3. 安装 systemd 单元
+# 2. 安装 systemd 单元(运行用户不绑定,默认以启动者身份运行)
 sudo cp deploy/opscore.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now opscore
 ```
+> 运行用户**不绑定特定账号**:service 不写 `User=/Group=`,默认以启动者(通常 root)运行。
+> 想用普通用户跑: `systemctl edit opscore` 加 `User=/Group=` 即可;K8s/CICD 容器内非 root 用户也能直接跑,无需预建账号。
 
 > **端口对接说明**
 > - 默认监听 `:8088` (避开 Prometheus 9090 / nginx 8080/8081)
