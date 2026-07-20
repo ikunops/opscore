@@ -69,8 +69,28 @@ func listSystemd() []ServiceInfo {
 		sub := fields[3]
 		desc := strings.Join(fields[4:], " ")
 		si := ServiceInfo{ID: unit, Name: unit, Status: active, SubStatus: sub, Description: desc}
-		if fp, e := exec.Command("systemctl", "show", "-p", "FragmentPath", "--value", unit).Output(); e == nil {
-			si.UnitFile = strings.TrimSpace(string(fp))
+		// 一次 exec 取 FragmentPath + MainPID(兼容 systemd 219,它不支持 --value)
+		if out, e := exec.Command("systemctl", "show", "-p", "FragmentPath", "-p", "MainPID", unit).Output(); e == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				if v, ok := strings.CutPrefix(line, "FragmentPath="); ok {
+					si.UnitFile = strings.TrimSpace(v)
+				} else if v, ok := strings.CutPrefix(line, "MainPID="); ok {
+					if n, perr := strconv.ParseInt(strings.TrimSpace(v), 10, 32); perr == nil {
+						si.PID = int32(n)
+					}
+				}
+			}
+		}
+		// 运行中且有主进程:采集该进程的 CPU/内存占用
+		if si.SubStatus == "running" && si.PID > 0 {
+			if p, perr := process.NewProcess(si.PID); perr == nil {
+				if cpu, cerr := p.CPUPercent(); cerr == nil {
+					si.CPUPercent = cpu
+				}
+				if mem, merr := p.MemoryPercent(); merr == nil {
+					si.MemPercent = mem
+				}
+			}
 		}
 		si.LogHint = "journalctl -u " + unit
 		if meta, ok := recognizeProc(unit); ok {

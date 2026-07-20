@@ -42,6 +42,25 @@ export default function ServicesModule() {
   const [logTarget, setLogTarget] = useState<ServiceInfo | null>(null)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<'all' | 'running' | 'exited' | 'failed'>('all')
+  const [sortKey, setSortKey] = useState<'cpu' | 'mem' | null>(null)
+  const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc')
+
+  const toggleSort = (key: 'cpu' | 'mem') => {
+    if (sortKey !== key) {
+      setSortKey(key)
+      setSortDir('desc')
+    } else if (sortDir === 'desc') {
+      setSortDir('asc')
+    } else {
+      setSortKey(null)
+      setSortDir('desc')
+    }
+  }
+
+  const sortIndicator = (key: 'cpu' | 'mem') => {
+    if (sortKey !== key) return ''
+    return sortDir === 'desc' ? ' ▼' : ' ▲'
+  }
 
   const visible = useMemo(() => {
     if (!data) return []
@@ -58,10 +77,19 @@ export default function ServicesModule() {
         default: return true
       }
     })
-    // 稳定的基础排序:按名称,避免每次轮询/筛选时行位置跳动
-    list.sort((a, b) => a.name.localeCompare(b.name))
+    // 点击 CPU/内存 列头时按数值排序;否则按名称稳定排序(避免轮询时行跳动)
+    if (sortKey) {
+      const dir = sortDir === 'desc' ? -1 : 1
+      list.sort((a, b) => {
+        const av = sortKey === 'cpu' ? (a.cpuPercent || 0) : (a.memPercent || 0)
+        const bv = sortKey === 'cpu' ? (b.cpuPercent || 0) : (b.memPercent || 0)
+        return (av - bv) * dir
+      })
+    } else {
+      list.sort((a, b) => a.name.localeCompare(b.name))
+    }
     return list
-  }, [data, search, statusFilter])
+  }, [data, search, statusFilter, sortKey, sortDir])
 
   const load = useCallback(() => {
     getJSON('/api/core/services').then(setData).catch(() => setMsg('加载失败'))
@@ -123,6 +151,8 @@ export default function ServicesModule() {
                   </select>
                 </th>
                 <th>说明</th>
+                <th className="sortable" onClick={() => toggleSort('cpu')}>CPU %{sortIndicator('cpu')}</th>
+                <th className="sortable" onClick={() => toggleSort('mem')}>内存 %{sortIndicator('mem')}</th>
                 <th>单元文件 / PID</th>
                 <th>日志命令</th>
                 <th>操作</th>
@@ -147,7 +177,9 @@ export default function ServicesModule() {
                     {s.recognized && s.category && <span className="tag">{s.category}</span>}
                     <span>{s.description}</span>
                   </td>
-                  <td className="mono small">{s.isProcess ? `PID ${s.pid}` : s.unitFile || '—'}</td>
+                  <td className="mono small">{fmtPct(s.cpuPercent)}</td>
+                  <td className="mono small">{fmtPct(s.memPercent)}</td>
+                  <td className="mono small">{s.isProcess ? `PID ${s.pid}` : (s.unitFile || (s.pid ? `PID ${s.pid}` : '—'))}</td>
                   <td className="mono small dim">
                     {s.logCommand
                       ? <><button className="btn btn-sm btn-log" onClick={() => setLogTarget(s)}>查看</button> <span style={{ marginLeft: 6 }}>{s.logCommand}</span></>
@@ -307,4 +339,9 @@ function lineLevel(line: string): string {
   if (l.includes('warn') || l.includes('warning')) return 'lvl-warn'
   if (l.includes('info') || l.includes('notice')) return 'lvl-info'
   return 'lvl-default'
+}
+
+function fmtPct(v?: number): string {
+  if (v === undefined || v === null || v === 0) return '—'
+  return v.toFixed(1) + '%'
 }

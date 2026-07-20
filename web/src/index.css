@@ -2,9 +2,11 @@
   --bg: #eef2f9;
   --bg-grad-1: #e0e7ff;
   --bg-grad-2: #f0fdfa;
-  --surface: rgba(255, 255, 255, 0.72);
+  --surface: rgba(255, 255, 255, 0.78);
   --surface-solid: #ffffff;
-  --border: rgba(15, 23, 42, 0.08);
+  --surface-tint: rgba(99, 102, 241, 0.04);
+  --border: rgba(15, 23, 42, 0.14);
+  --row-hover: rgba(34, 197, 94, 0.06);
   --text: #0f172a;
   --text-dim: #64748b;
   --accent: #6366f1;
@@ -140,15 +142,17 @@ body {
 .load-item span { font-size: 11px; color: var(--text-dim); }
 
 /* ── Tables ── */
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; background: var(--surface-tint); border-radius: 12px; border: 1px solid var(--border); }
 .data-table, .mini-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table { table-layout: fixed; }
 .data-table th:nth-child(1) { width: 22%; }
-.data-table th:nth-child(2) { width: 16%; }
-.data-table th:nth-child(3) { width: 22%; }
-.data-table th:nth-child(4) { width: 16%; }
-.data-table th:nth-child(5) { width: 16%; }
-.data-table th:nth-child(6) { width: 8%; }
+.data-table th:nth-child(2) { width: 14%; }
+.data-table th:nth-child(3) { width: 18%; }
+.data-table th:nth-child(4) { width: 8%; }
+.data-table th:nth-child(5) { width: 8%; }
+.data-table th:nth-child(6) { width: 14%; }
+.data-table th:nth-child(7) { width: 10%; }
+.data-table th:nth-child(8) { width: 6%; }
 .data-table td:nth-child(1) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .data-table th, .data-table td, .mini-table th, .mini-table td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--border); }
 .data-table th { color: var(--text-dim); font-weight: 600; font-size: 12px; }
@@ -198,7 +202,7 @@ body {
 
 /* ── Disk drill-down ── */
 .mini-table tr.clickable { cursor: pointer; transition: background 0.15s ease; }
-.mini-table tr.clickable:hover { background: var(--border); }
+.mini-table tr.clickable:hover { background: var(--row-hover); }
 .mini-table tr.row-open { background: var(--border); }
 .caret { display: inline-block; width: 14px; color: var(--text-dim); font-size: 11px; }
 .usage-cell { display: flex; align-items: center; gap: 8px; }
@@ -278,7 +282,7 @@ body {
 .log-body { flex: 1; overflow-y: auto; padding: 10px 16px 16px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; line-height: 1.7; background: var(--surface-solid); }
 .log-loading, .log-empty { padding: 24px; text-align: center; color: var(--text-dim); }
 .log-line { display: flex; gap: 10px; padding: 1px 4px; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
-.log-line:hover { background: var(--border); }
+.log-line:hover { background: var(--row-hover); }
 .log-num { flex: 0 0 32px; text-align: right; color: var(--text-dim); user-select: none; }
 .log-text { flex: 1; }
 .lvl-err { color: #ef4444; background: rgba(239,68,68,.07); }
