@@ -145,12 +145,12 @@ body {
 .table-wrap { overflow-x: auto; background: var(--surface-tint); border-radius: 12px; border: 1px solid var(--border); }
 .data-table, .mini-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table { table-layout: fixed; }
-.data-table th:nth-child(1) { width: 17%; }
+.data-table th:nth-child(1) { width: 13%; }
 .data-table th:nth-child(2) { width: 8%; }
 .data-table th:nth-child(3) { width: 22%; }
 .data-table th:nth-child(4) { width: 5%; }
 .data-table th:nth-child(5) { width: 5%; }
-.data-table th:nth-child(6) { width: 22%; }
+.data-table th:nth-child(6) { width: 26%; }
 .data-table th:nth-child(7) { width: 13%; }
 .data-table th:nth-child(8) { width: 8%; }
 .data-table td:nth-child(1) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
