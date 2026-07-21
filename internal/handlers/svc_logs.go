@@ -84,7 +84,17 @@ func readJournalctl(unit string, lines int) (LogResponse, error) {
 	cmd := exec.Command("journalctl", "-u", unit, "-n", strconv.Itoa(lines), "--no-pager", "--output=short-iso", "--reverse")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return LogResponse{}, err
+		// 权限不足:当前用户无 journal 读权限,给出可读提示而非裸 exit status。
+		msg := string(out)
+		if strings.Contains(msg, "insufficient permissions") ||
+			strings.Contains(msg, "Not permitted") ||
+			strings.Contains(msg, "Failed to search") {
+			return LogResponse{}, errors.New("当前用户无 journal 读权限:请将运行用户加入 systemd-journal 组,或以 root 运行")
+		}
+		if strings.Contains(msg, "Couldn't find") || strings.Contains(msg, "No such") {
+			return LogResponse{}, errors.New("未找到 unit「" + unit + "」,请确认服务名是否正确")
+		}
+		return LogResponse{}, errors.New("journalctl 执行失败: " + strings.TrimSpace(msg))
 	}
 	return parseLines(string(out)), nil
 }
