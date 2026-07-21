@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"os/exec"
 	"runtime"
@@ -49,12 +50,44 @@ func ServicesList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// fetchPsStats 通过一次 `ps -eo pid,%cpu,%mem` 批量取所有进程的 CPU/MEM 占比。
+// 返回两个 map：pid -> cpuPct(保留2位小数), pid -> memPct(保留2位小数)。
+func fetchPsStats() (map[int32]float64, map[int32]float32) {
+	cpuMap := make(map[int32]float64)
+	memMap := make(map[int32]float32)
+	out, err := exec.Command("ps", "-eo", "pid,%cpu,%mem", "--no-headers").Output()
+	if err != nil {
+		return cpuMap, memMap
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		pid, perr := strconv.ParseInt(fields[0], 10, 32)
+		cpu, cerr := strconv.ParseFloat(fields[1], 64)
+		mem, merr := strconv.ParseFloat(fields[2], 64)
+		if perr == nil && cerr == nil {
+			cpuMap[int32(pid)] = round2(cpu)
+		}
+		if perr == nil && merr == nil {
+			memMap[int32(pid)] = float32(round2(mem))
+		}
+	}
+	return cpuMap, memMap
+}
+
 // listSystemd 解析 `systemctl list-units --type=service`,把 Linux 命令变成结构化数据。
 func listSystemd() []ServiceInfo {
 	out, err := exec.Command("systemctl", "list-units", "--type=service", "--no-legend", "--no-pager").Output()
 	if err != nil {
 		return nil
 	}
+	cpuMap, memMap := fetchPsStats()
 	var res []ServiceInfo
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line == "" {
@@ -81,15 +114,13 @@ func listSystemd() []ServiceInfo {
 				}
 			}
 		}
-		// 运行中且有主进程:采集该进程的 CPU/内存占用
+		// 运行中且有主进程:从 ps 批量结果查 CPU/内存占用（保留 2 位小数）
 		if si.SubStatus == "running" && si.PID > 0 {
-			if p, perr := process.NewProcess(si.PID); perr == nil {
-				if cpu, cerr := p.CPUPercent(); cerr == nil {
-					si.CPUPercent = cpu
-				}
-				if mem, merr := p.MemoryPercent(); merr == nil {
-					si.MemPercent = mem
-				}
+			if cpu, ok := cpuMap[si.PID]; ok {
+				si.CPUPercent = cpu
+			}
+			if mem, ok := memMap[si.PID]; ok {
+				si.MemPercent = mem
 			}
 		}
 		si.LogHint = "journalctl -u " + unit
@@ -109,18 +140,24 @@ func listSystemd() []ServiceInfo {
 	return res
 }
 
-// listProcesses 非 Linux 平台的降级:用 gopsutil 列进程,让 UI 有真实数据可看。
+// listProcesses 非 Linux 平台的降级:用 gopsutil 列进程,但 CPU/MEM 用 ps 批量查。
 func listProcesses() []ServiceInfo {
 	procs, err := process.Processes()
 	if err != nil {
 		return nil
 	}
+	cpuMap, memMap := fetchPsStats()
 	var res []ServiceInfo
 	for _, p := range procs {
 		name, _ := p.Name()
 		status, _ := p.Status()
-		cpuP, _ := p.CPUPercent()
-		memP, _ := p.MemoryPercent()
+		var si ServiceInfo
+		if cpu, ok := cpuMap[p.Pid]; ok {
+			si.CPUPercent = cpu
+		}
+		if mem, ok := memMap[p.Pid]; ok {
+			si.MemPercent = mem
+		}
 		res = append(res, ServiceInfo{
 			ID:          strconv.Itoa(int(p.Pid)),
 			Name:        name,
@@ -128,8 +165,8 @@ func listProcesses() []ServiceInfo {
 			Description: "进程(demo 降级)",
 			IsProcess:   true,
 			PID:         p.Pid,
-			CPUPercent:  cpuP,
-			MemPercent:  memP,
+			CPUPercent:  si.CPUPercent,
+			MemPercent:  si.MemPercent,
 		})
 		if meta, ok := recognizeProc(name); ok {
 			res[len(res)-1].Recognized = meta.Label
@@ -183,4 +220,9 @@ func ServiceAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, map[string]any{"ok": true, "action": body.Action, "id": body.ID})
+}
+
+// round2 将浮点数保留 2 位小数（四舍五入）。
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
 }

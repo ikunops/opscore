@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -96,7 +97,7 @@ func tick() {
 		s.Host = HostInfo{Hostname: h.Hostname, OS: h.OS, Platform: h.Platform, Uptime: h.Uptime}
 	}
 	if c, err := cpu.Percent(time.Second, false); err == nil && len(c) > 0 {
-		s.CPU.Percent = c[0]
+		s.CPU.Percent = round2(c[0])
 	}
 	if pc, err := cpu.Percent(0, true); err == nil {
 		s.CPU.PerCore = pc
@@ -108,12 +109,12 @@ func tick() {
 		s.CPU.Model = info[0].ModelName
 	}
 	if v, err := mem.VirtualMemory(); err == nil {
-		s.Memory = MemoryInfo{Total: v.Total, Used: v.Used, UsedPercent: v.UsedPercent, Free: v.Free}
+		s.Memory = MemoryInfo{Total: v.Total, Used: v.Used, UsedPercent: round2(v.UsedPercent), Free: v.Free}
 	}
 	if sw, err := mem.SwapMemory(); err == nil {
 		s.Memory.SwapTotal = sw.Total
 		s.Memory.SwapUsed = sw.Used
-		s.Memory.SwapPercent = sw.UsedPercent
+		s.Memory.SwapPercent = round2(sw.UsedPercent)
 	}
 	if la, err := load.Avg(); err == nil {
 		s.Load = la
@@ -125,13 +126,13 @@ func tick() {
 				continue
 			}
 			if u, err := disk.Usage(p.Mountpoint); err == nil && u.Total > 0 && u.UsedPercent < 1000 {
-				s.Disks = append(s.Disks, DiskInfo{
-					Mountpoint:  p.Mountpoint,
-					Total:       u.Total,
-					Used:        u.Used,
-					UsedPercent: u.UsedPercent,
-					Fstype:      p.Fstype,
-				})
+			s.Disks = append(s.Disks, DiskInfo{
+				Mountpoint:  p.Mountpoint,
+				Total:       u.Total,
+				Used:        u.Used,
+				UsedPercent: round2(u.UsedPercent),
+				Fstype:      p.Fstype,
+			})
 			}
 		}
 	}
@@ -195,4 +196,9 @@ func Get() Snapshot {
 	mu.RLock()
 	defer mu.RUnlock()
 	return current
+}
+
+// round2 将浮点数保留 2 位小数（四舍五入）。
+func round2(v float64) float64 {
+	return math.Round(v*100) / 100
 }

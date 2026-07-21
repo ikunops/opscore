@@ -176,7 +176,7 @@ export default function ResourcesModule() {
         amplitude: 14,
         waveAnimation: true,
         label: {
-          formatter: () => `${memPct.toFixed(1)}%`,
+          formatter: () => `${memPct.toFixed(2)}%`,
           fontSize: 30,
           fontWeight: 700,
           color: txt,
@@ -443,7 +443,7 @@ export default function ResourcesModule() {
                             />
                           </div>
                           <span className={`badge ${pct > 85 ? 'badge-danger' : pct > 65 ? 'badge-warn' : 'badge-ok'}`}>
-                            {pct.toFixed(1)}%
+                             {pct.toFixed(2)}%
                           </span>
                           <span className="dim small"> {fmtBytes(d.used)} / {fmtBytes(d.total)}</span>
                         </div>
@@ -472,7 +472,7 @@ export default function ResourcesModule() {
                                           style={{ width: `${Math.min(100, cp)}%` }}
                                         />
                                       </div>
-                                      <span className="drill-pct dim small">{cp.toFixed(1)}%</span>
+                                       <span className="drill-pct dim small">{cp.toFixed(2)}%</span>
                                       <span className="drill-size mono small">{fmtBytes(c.size)}</span>
                                     </div>
                                   )

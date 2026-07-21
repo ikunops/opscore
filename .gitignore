@@ -2,7 +2,8 @@
 /web/dist/
 /web/node_modules/
 
-# 本地 Windows 构建产物
+# 本地构建产物
+/opscore
 *.exe
 opscore.exe~
 

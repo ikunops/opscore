@@ -343,5 +343,5 @@ function lineLevel(line: string): string {
 
 function fmtPct(v?: number): string {
   if (v === undefined || v === null || v === 0) return '—'
-  return v.toFixed(1) + '%'
+  return v.toFixed(2) + '%'
 }

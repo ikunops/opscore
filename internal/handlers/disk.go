@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -58,7 +59,7 @@ func DiskChildren(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 用上下文超时管控遍历,避免大目录(如 Windows 的 C:\Windows)卡死请求。
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 
 	entries, err := os.ReadDir(root)
@@ -73,17 +74,19 @@ func DiskChildren(w http.ResponseWriter, r *http.Request) {
 		"snap": true, "boot": true, "mnt": true, "media": true,
 	}
 
+	// 对每个子目录单独调用 du -s 获取大小（比 filepath.WalkDir 快）
+	// 文件大小直接用 os.Stat，无需 du
 	var collected []DirEntry
 	for _, e := range entries {
 		if e.IsDir() && virtualDirs[e.Name()] {
-			continue // 跳过虚拟文件系统
+			continue
 		}
 		p := filepath.Join(root, e.Name())
 		if e.IsDir() {
-			size, ok := dirSize(ctx, p)
-			if !ok {
+			size, err := duSize(ctx, p)
+			if err != nil {
 				dc.Partial = true
-				continue // 超时或被拒,跳过该目录
+				continue
 			}
 			collected = append(collected, DirEntry{Name: e.Name(), Path: p, Size: size, IsDir: true})
 		} else if fi, ferr := e.Info(); ferr == nil {
@@ -99,17 +102,29 @@ func DiskChildren(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, dc)
 }
 
-// dirSize 计算目录总大小,支持 ctx 取消(超时/遍历过深时立即停)。
-// 返回 (size, ok):ok=false 表示中途被取消或权限不足导致未扫全。
-func dirSize(ctx context.Context, root string) (uint64, bool) {
+// duSize 调用 du -s 获取单个目录的总大小（字节），比 WalkDir 快。
+// 若 du 因权限/环境失败，回退到 filepath.WalkDir（兼容非 root 用户）。
+func duSize(ctx context.Context, dir string) (uint64, error) {
+	cmd := exec.CommandContext(ctx, "du", "-s", dir)
+	out, err := cmd.Output()
+	if err == nil {
+		parts := strings.Fields(string(out))
+		if len(parts) >= 2 {
+			return parseDuSize(parts[0]), nil
+		}
+	}
+	// du 失败（权限不足、命令不存在等），回退到 Go 遍历
+	return dirSizeWalk(ctx, dir)
+}
+
+// dirSizeWalk 用 filepath.WalkDir 计算目录总大小（回退方案）。
+func dirSizeWalk(ctx context.Context, root string) (uint64, error) {
 	var total uint64
-	done := true
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // 跳过无权访问的子树
 		}
 		if ctx.Err() != nil {
-			done = false
 			return ctx.Err()
 		}
 		if d.IsDir() {
@@ -120,7 +135,38 @@ func dirSize(ctx context.Context, root string) (uint64, bool) {
 		}
 		return nil
 	})
-	return total, done
+	return total, nil
+}
+
+// parseDuSize 解析 du 输出的文件大小（支持 K/M/G/T 等单位，默认 1K 块）。
+func parseDuSize(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	mult := uint64(1024) // du 默认单位是 1K 块
+	if last := s[len(s)-1]; last < '0' || last > '9' {
+		switch strings.ToLower(string(last)) {
+		case "k":
+			mult = 1024
+		case "m":
+			mult = 1024 * 1024
+		case "g":
+			mult = 1024 * 1024 * 1024
+		case "t":
+			mult = 1024 * 1024 * 1024 * 1024
+		default:
+			return 0
+		}
+		s = s[:len(s)-1]
+	}
+	var size uint64
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			size = size*10 + uint64(c-'0')
+		}
+	}
+	return size * mult // du 默认 1K 块，mult 已含 1024，直接得字节
 }
 
 // isVirtualMount 判断给定路径是否属于 Linux 虚拟/伪文件系统，不应被下钻扫描。
