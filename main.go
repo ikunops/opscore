@@ -1,9 +1,7 @@
 package main
 
 import (
-	"embed"
 	"flag"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -12,21 +10,19 @@ import (
 	"strings"
 )
 
-//go:embed all:web/dist
-var dist embed.FS
-
 func main() {
 	metrics.Start() // 启动后台指标采集
 
 	// 监听地址(自适应部署):
-	//  - 默认 :9090,避免与常见 nginx 占用的 8080 冲突,无 nginx 时可直接访问。
-	//  - 有 nginx 反代时建议 -addr 127.0.0.1:9090,仅本机监听,由 nginx 对外暴露。
-	//  - 优先级:-addr 参数 > OPCORE_ADDR 环境变量 > 默认 :9090。
-	addr := ":9090"
+	//  - 默认 :8088,避免与 Prometheus(9090)、nginx(8080/8081) 冲突。
+	//  - 有 nginx 反代时建议 -addr 127.0.0.1:8088,仅本机监听,由 nginx 对外暴露。
+	//  - 优先级:-addr 参数 > OPCORE_ADDR 环境变量 > 默认 :8088。
+	addr := ":8088"
 	if env := os.Getenv("OPCORE_ADDR"); env != "" {
 		addr = env
 	}
-	flagAddr := flag.String("addr", "", "监听地址,如 :9090 或 127.0.0.1:9090(默认 :9090,OPCORE_ADDR 可覆盖)")
+	flagAddr := flag.String("addr", "", "监听地址,如 :8088 或 127.0.0.1:8088(默认 :8088,OPCORE_ADDR 可覆盖)")
+	flagDist := flag.String("dist", "./web/dist", "前端静态资源目录(默认 ./web/dist,相对二进制路径)")
 	flag.Parse()
 	if *flagAddr != "" {
 		addr = *flagAddr
@@ -47,16 +43,13 @@ func main() {
 	mux.HandleFunc("/api/core/firewall/audit", handlers.FirewallAudit)
 
 	// ── 前端静态资源(SPA) ──
-	sub, err := fs.Sub(dist, "web/dist")
-	if err != nil {
-		log.Fatal("未找到 web/dist,请先在 web/ 执行 `npm install && npm run build`: ", err)
-	}
-	fileServer := http.FileServer(http.FS(sub))
+	fileServer := http.FileServer(http.Dir(*flagDist))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		p := strings.TrimPrefix(r.URL.Path, "/")
 		// 无扩展名的路径视为前端路由,回退 index.html
 		if p != "" && !strings.Contains(p, ".") {
-			if b, err := fs.ReadFile(sub, "index.html"); err == nil {
+			indexPath := *flagDist + "/index.html"
+			if b, err := os.ReadFile(indexPath); err == nil {
 				w.Header().Set("Content-Type", "text/html; charset=utf-8")
 				w.Write(b)
 				return
