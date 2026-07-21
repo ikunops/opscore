@@ -1,11 +1,13 @@
 # ============================================================
 # OpsCore systemd 单元(开机自启 + 崩溃自动拉起)
+# 运行用户不绑定:
+#   - 不写 User=/Group=,默认以启动者身份运行(通常 root)。
+#   - 想用普通用户跑:systemctl edit opscore 加 User=/Group= 即可,
+#     K8s/CICD 场景下容器内非 root 用户也能直接跑,无需预建账号。
 # 用法:
 #   1. 把二进制放到 /opt/opscore/opscore
-#   2. 建专用低权用户: useradd -r -s /usr/sbin/nologin opscore
-#   3. chown -R opscore:opscore /opt/opscore
-#   4. 拷贝本文件到 /etc/systemd/system/opscore.service
-#   5. systemctl daemon-reload && systemctl enable --now opscore
+#   2. 拷贝本文件到 /etc/systemd/system/opscore.service
+#   3. systemctl daemon-reload && systemctl enable --now opscore
 # ============================================================
 
 [Unit]
@@ -15,26 +17,23 @@ After=network.target
 [Service]
 Type=simple
 # 有 nginx 反代时:仅本机监听
-ExecStart=/opt/opscore/opscore -addr 127.0.0.1:9090
+ExecStart=/opt/opscore/opscore -addr 127.0.0.1:8088 -dist /opt/opscore/web/dist
 # 无 nginx 直连时:监听所有网卡(改这一行即可)
-# ExecStart=/opt/opscore/opscore
-Environment=OPCORE_ADDR=127.0.0.1:9090
+# ExecStart=/opt/opscore/opscore -dist /opt/opscore/web/dist
+Environment=OPCORE_ADDR=127.0.0.1:8088
 
 Restart=on-failure
 RestartSec=3
 
-# 安全:用专用低权用户运行,不要 root
-User=opscore
-Group=opscore
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/opt/opscore
+# 安全加固(可选,systemd 232+ 才支持):
+#   下面两行在新版 systemd 上能进一步限制权限,旧版会被忽略,不影响运行。
+# NoNewPrivileges=true
+# ProtectHome=true
 
-# 注意:防火墙「写入」与服务「启停」需要 root 权限。
-# 若要以非 root 跑 OpsCore,这些高危操作会失败(只读预览不受影响)。
-# 需要完整功能时,可去掉 User/Group 行以 root 运行(不推荐),
-# 或为 systemctl 配置 sudo/polkit 授权。
+# 权限说明(OpsCore 按「当前进程权限」运行,用户无关):
+#   - 只读能力(服务列表/资源/磁盘/日志预览)任意用户均可。
+#   - 写能力(服务启停/防火墙写入)需要 root;非 root 时这些操作会优雅失败并提示。
+#   - 日志查看需要 journal 读权限:把运行用户加入 systemd-journal 组,或以 root 运行。
 
 [Install]
 WantedBy=multi-user.target

@@ -5,8 +5,8 @@
 # 因此必须:privileged + host 网络 + host PID + 挂载宿主关键目录。
 #
 # 端口策略(配合已有 nginx):
-#   - 默认 OPCORE_ADDR=127.0.0.1:9090 → 仅本机监听,由宿主机 nginx 反代对外暴露
-#   - 若不用 nginx、想直连:改成 OPCORE_ADDR=:9090 (host 网络下即宿主 :9090)
+#   - 默认 OPCORE_ADDR=127.0.0.1:8088 → 仅本机监听,由宿主机 nginx 反代对外暴露
+#   - 若不用 nginx、想直连:改成 OPCORE_ADDR=:8088 (host 网络下即宿主 :8088)
 #
 # 用法:
 #   docker compose up -d --build        # 首次构建
@@ -26,8 +26,8 @@ services:
     # host PID:看到宿主真实进程表(PID→进程名识别服务身份的依据)
     pid: host
     environment:
-      # 仅本机监听,交给宿主机 nginx 反代;直连改成 ":9090"
-      - OPCORE_ADDR=127.0.0.1:9090
+      # 仅本机监听,交给宿主机 nginx 反代;直连改成 ":8088"
+      - OPCORE_ADDR=127.0.0.1:8088
     volumes:
       # systemd 单元信息(服务列表/启停)。pid:host 已共享 /proc,这里补 systemd 套接字
       - /run/systemd/system:/run/systemd/system:ro
