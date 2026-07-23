@@ -19,6 +19,8 @@ func CoreModules() []Manifest {
 		{ID: "resources", Name: "系统资源", Icon: "cpu", RoutePath: "/resources", Group: "core", Description: "CPU / 内存 / 磁盘 / 网络 实时多图式可视化"},
 		{ID: "services", Name: "服务发现", Icon: "server", RoutePath: "/services", Group: "core", Description: "运行服务启停 / 重启,查看单元文件与日志位置"},
 		{ID: "network", Name: "防火墙和网络", Icon: "network", RoutePath: "/network", Group: "core", Description: "网络接口 / 监听端口 / 防火墙状态与规则(高危,需确认+审计)"},
+		{ID: "diagnostics", Name: "系统诊断", Icon: "activity", RoutePath: "/diagnostics", Group: "core", Description: "网络诊断(Ping/Trace) / 登录审计 / 系统更新"},
+		{ID: "tasks", Name: "任务与存储", Icon: "database", RoutePath: "/tasks", Group: "core", Description: "定时任务(Crontab) / 磁盘挂载与SMART健康"},
 		{ID: "plugins", Name: "插件中心", Icon: "puzzle", RoutePath: "/plugins", Group: "plugin", Description: "可插拔模块(待接入)"},
 	}
 }

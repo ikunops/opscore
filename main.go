@@ -42,6 +42,20 @@ func main() {
 	mux.HandleFunc("/api/core/firewall/action", handlers.FirewallAction)
 	mux.HandleFunc("/api/core/firewall/audit", handlers.FirewallAudit)
 
+	// ── 网络配置 API ──
+	mux.HandleFunc("/api/core/network/config", handlers.NetConfigHandler)
+
+	// ── 系统诊断 API ──
+	mux.HandleFunc("/api/core/diagnostics", handlers.DiagnosticsInfo)
+	mux.HandleFunc("/api/core/diagnostics/network", handlers.NetworkDiagHandler)
+	mux.HandleFunc("/api/core/diagnostics/login-audit", handlers.LoginAuditHandler)
+	mux.HandleFunc("/api/core/diagnostics/updates", handlers.UpdatesHandler)
+
+	// ── 任务与存储 API ──
+	mux.HandleFunc("/api/core/tasks/crontab", handlers.CrontabHandler)
+	mux.HandleFunc("/api/core/tasks/disks", handlers.DisksHandler)
+	mux.HandleFunc("/api/core/tasks/disks/action", handlers.DiskActionHandler)
+
 	// ── 前端静态资源(SPA) ──
 	fileServer := http.FileServer(http.Dir(*flagDist))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

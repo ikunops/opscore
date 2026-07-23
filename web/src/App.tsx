@@ -5,6 +5,8 @@ import TopBar from './components/TopBar'
 import ResourcesModule from './modules/ResourcesModule'
 import ServicesModule from './modules/ServicesModule'
 import NetworkModule from './modules/NetworkModule'
+import DiagnosticsModule from './modules/DiagnosticsModule'
+import TasksModule from './modules/TasksModule'
 import PluginsModule from './modules/PluginsModule'
 
 interface Manifest {
@@ -77,6 +79,8 @@ export default function App() {
             <Route path="/resources" element={<ResourcesModule />} />
             <Route path="/services" element={<ServicesModule />} />
             <Route path="/network" element={<NetworkModule />} />
+            <Route path="/diagnostics" element={<DiagnosticsModule />} />
+            <Route path="/tasks" element={<TasksModule />} />
             <Route path="/plugins" element={<PluginsModule />} />
             <Route path="*" element={<Navigate to="/resources" replace />} />
           </Routes>
@@ -101,6 +105,18 @@ function icon(name: string) {
         <rect x="2" y="14" width="20" height="8" rx="2" />
         <circle cx="6" cy="6" r="1" fill="currentColor" />
         <circle cx="6" cy="18" r="1" fill="currentColor" />
+      </svg>
+    ),
+    activity: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+      </svg>
+    ),
+    database: (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        <ellipse cx="12" cy="5" rx="9" ry="3" />
+        <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
+        <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
       </svg>
     ),
     network: (
