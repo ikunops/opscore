@@ -145,15 +145,26 @@ body {
 .table-wrap { overflow-x: auto; background: var(--surface-tint); border-radius: 12px; border: 1px solid var(--border); }
 .data-table, .mini-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .data-table { table-layout: fixed; }
-.data-table th:nth-child(1) { width: 13%; }
-.data-table th:nth-child(2) { width: 8%; }
-.data-table th:nth-child(3) { width: 23%; }
-.data-table th:nth-child(4) { width: 5%; }
-.data-table th:nth-child(5) { width: 5%; }
-.data-table th:nth-child(6) { width: 20%; }
-.data-table th:nth-child(7) { width: 18%; }
+.data-table th, .data-table td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.data-table td { max-width: 0; }
+
+/* 服务发现表格 (8列) */
+.data-table th:nth-child(1) { width: 16%; }
+.data-table th:nth-child(2) { width: 10%; }
+.data-table th:nth-child(3) { width: 22%; }
+.data-table th:nth-child(4) { width: 6%; }
+.data-table th:nth-child(5) { width: 6%; }
+.data-table th:nth-child(6) { width: 18%; }
+.data-table th:nth-child(7) { width: 14%; }
 .data-table th:nth-child(8) { width: 8%; }
-.data-table td:nth-child(1) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 网络/防火墙表格 (5列 → 10:25:25:25:15) */
+.net-table th:nth-child(1) { width: 10%; }
+.net-table th:nth-child(2) { width: 25%; }
+.net-table th:nth-child(3) { width: 25%; }
+.net-table th:nth-child(4) { width: 25%; }
+.net-table th:nth-child(5) { width: 15%; }
+.net-table td { max-width: 0; }
 .data-table th, .data-table td, .mini-table th, .mini-table td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
 .data-table th { color: var(--text-dim); font-weight: 600; font-size: 12px; }
 .mini-table th { color: var(--text-dim); font-weight: 600; font-size: 11px; }
@@ -222,6 +233,10 @@ body {
 .drill-name { min-width: 150px; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, monospace; font-size: 12.5px; }
 .drill-pct { min-width: 46px; text-align: right; }
 .drill-size { min-width: 70px; text-align: right; }
+
+/* ── Toast 复制提示 ── */
+.toast-copy { position: fixed; bottom: 28px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 22px; border-radius: 10px; font-size: 13px; z-index: 100; animation: toast-in 0.25s ease; }
+@keyframes toast-in { from { opacity: 0; transform: translateX(-50%) translateY(12px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
 
 /* ── 防火墙模块 ── */
 .status-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

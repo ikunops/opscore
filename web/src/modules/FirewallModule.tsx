@@ -170,7 +170,7 @@ export default function FirewallModule({ embedded = false }: { embedded?: boolea
       {tab === 'rules' && (
         <Card title="现有规则" subtitle="真实读取自后端(netsh / ufw)">
           <div className="table-wrap">
-            <table className="data-table">
+            <table className="data-table net-table">
               <thead>
                 <tr><th>名称</th><th>方向</th><th>动作</th><th>协议</th><th>本地端口</th><th>远端 IP</th></tr>
               </thead>

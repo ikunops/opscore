@@ -44,6 +44,24 @@ export default function ServicesModule() {
   const [statusFilter, setStatusFilter] = useState<'all' | 'running' | 'exited' | 'failed'>('all')
   const [sortKey, setSortKey] = useState<'cpu' | 'mem' | null>(null)
   const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc')
+  const [copied, setCopied] = useState(false)
+
+  const copyCmd = async (cmd: string) => {
+    try {
+      await navigator.clipboard.writeText(cmd)
+    } catch {
+      const ta = document.createElement('textarea')
+      ta.value = cmd
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      document.execCommand('copy')
+      document.body.removeChild(ta)
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
 
   const toggleSort = (key: 'cpu' | 'mem') => {
     if (sortKey !== key) {
@@ -142,9 +160,9 @@ export default function ServicesModule() {
               <tr>
                 <th>名称</th>
                 <th>
-                  状态
-                  <select className="sel sel-xs" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as 'all' | 'running' | 'exited' | 'failed')}>
-                    <option value="all">全部</option>
+                  <select className="sel sel-xs" value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value as 'all' | 'running' | 'exited' | 'failed')}>
+                    <option value="all">状态</option>
                     <option value="running">运行中</option>
                     <option value="exited">已退出</option>
                     <option value="failed">失败</option>
@@ -182,7 +200,7 @@ export default function ServicesModule() {
                   <td className="mono small">{s.isProcess ? `PID ${s.pid}` : (s.unitFile || (s.pid ? `PID ${s.pid}` : '—'))}</td>
                   <td className="mono small dim">
                     {s.logCommand
-                      ? <><button className="btn btn-sm btn-log" onClick={() => setLogTarget(s)}>查看</button> <span style={{ marginLeft: 6 }}>{s.logCommand}</span></>
+                      ? <><button className="btn btn-sm btn-log" onClick={() => setLogTarget(s)}>查看</button> <span style={{ marginLeft: 6, cursor: 'copy' }} title="双击复制命令" onDoubleClick={() => copyCmd(s.logCommand!)}>{s.logCommand}</span></>
                       : '—'}
                   </td>
                   <td>
@@ -203,6 +221,8 @@ export default function ServicesModule() {
       {logTarget && (
         <LogModal service={logTarget} onClose={() => setLogTarget(null)} />
       )}
+
+      {copied && <div className="toast-copy">已复制</div>}
     </div>
   )
 }

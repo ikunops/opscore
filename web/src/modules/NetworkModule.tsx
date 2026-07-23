@@ -72,7 +72,7 @@ export default function NetworkModule() {
             )}
             <Card title="网络接口" subtitle="interface / MTU / 地址">
               <div className="table-wrap">
-                <table className="data-table">
+                <table className="data-table net-table">
                   <thead>
                     <tr><th>接口</th><th>MTU</th><th>地址</th></tr>
                   </thead>
@@ -94,7 +94,7 @@ export default function NetworkModule() {
                 端口常见服务仅作提示；真实身份 = 占用该端口的进程(PID→进程名)。二者一致才标「已确认」。
               </div>
               <div className="table-wrap">
-                <table className="data-table">
+                <table className="data-table net-table">
                   <thead>
                     <tr><th>协议</th><th>本地地址</th><th>识别服务</th><th>真实进程 / PID</th><th>端口提示</th></tr>
                   </thead>
