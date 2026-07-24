@@ -27,6 +27,7 @@ type LogResponse struct {
 // ServiceLogsHandler 返回指定服务的日志。
 // GET /api/core/services/logs?source=journalctl&target=<unit>&lines=100
 // GET /api/core/services/logs?source=file&path=<logfile>&lines=100
+// 有 filter 参数时: 用 journalctl -g / grep 搜全部历史
 func ServiceLogsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -37,6 +38,7 @@ func ServiceLogsHandler(w http.ResponseWriter, r *http.Request) {
 	target := r.URL.Query().Get("target")
 	path := r.URL.Query().Get("path")
 	linesStr := r.URL.Query().Get("lines")
+	filter := r.URL.Query().Get("filter")
 	if linesStr == "" {
 		linesStr = "100"
 	}
@@ -57,7 +59,11 @@ func ServiceLogsHandler(w http.ResponseWriter, r *http.Request) {
 			WriteJSON(w, LogResponse{Source: "journalctl", Warnings: []string{"缺少 target/unit 参数"}})
 			return
 		}
-		resp, err = readJournalctl(target, lines)
+		if filter != "" {
+			resp, err = readJournalctlGrep(target, filter, lines)
+		} else {
+			resp, err = readJournalctl(target, lines)
+		}
 		resp.Source = "journalctl"
 		resp.Target = target
 	case "file":
@@ -65,7 +71,11 @@ func ServiceLogsHandler(w http.ResponseWriter, r *http.Request) {
 			WriteJSON(w, LogResponse{Source: "file", Warnings: []string{"缺少 path 参数"}})
 			return
 		}
-		resp, err = readFileLog(path, lines)
+		if filter != "" {
+			resp, err = readFileGrep(path, filter)
+		} else {
+			resp, err = readFileLog(path, lines)
+		}
 		resp.Source = "file"
 		resp.Target = path
 	default:
@@ -99,6 +109,25 @@ func readJournalctl(unit string, lines int) (LogResponse, error) {
 	return parseLines(string(out)), nil
 }
 
+// readJournalctlGrep 用 journalctl -g 在全部历史中 grep。
+func readJournalctlGrep(unit, filter string, lines int) (LogResponse, error) {
+	cmd := exec.Command("journalctl", "-u", unit, "-g", filter, "-n", strconv.Itoa(lines), "--no-pager", "--output=short-iso", "--reverse")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		msg := string(out)
+		if strings.Contains(msg, "insufficient permissions") ||
+			strings.Contains(msg, "Not permitted") ||
+			strings.Contains(msg, "Failed to search") {
+			return LogResponse{}, errors.New("当前用户无 journal 读权限:请将运行用户加入 systemd-journal 组,或以 root 运行")
+		}
+		if strings.Contains(msg, "Couldn't find") || strings.Contains(msg, "No such") {
+			return LogResponse{}, errors.New("未找到 unit「" + unit + "」,请确认服务名是否正确")
+		}
+		return LogResponse{}, errors.New("journalctl -g 执行失败: " + strings.TrimSpace(msg))
+	}
+	return parseLines(string(out)), nil
+}
+
 // readFileLog 读取日志文件末尾 <lines> 行。
 func readFileLog(path string, lines int) (LogResponse, error) {
 	if !strings.HasPrefix(path, "/var/log/") {
@@ -108,6 +137,20 @@ func readFileLog(path string, lines int) (LogResponse, error) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return LogResponse{}, err
+	}
+	return parseLines(string(out)), nil
+}
+
+// readFileGrep 用 grep -i 在全部文件中搜索。
+func readFileGrep(path, filter string) (LogResponse, error) {
+	if !strings.HasPrefix(path, "/var/log/") {
+		return LogResponse{}, errors.New("只允许读取 /var/log/ 下的日志文件")
+	}
+	cmd := exec.Command("grep", "-i", "--color=never", filter, path)
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		// grep 无匹配时返回 exit 1，不算错误
+		return LogResponse{Lines: []LogEntry{}, Total: 0}, nil
 	}
 	return parseLines(string(out)), nil
 }

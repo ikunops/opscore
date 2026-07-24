@@ -255,15 +255,28 @@ function LogModal({ service, onClose }: { service: ServiceInfo; onClose: () => v
       }
       url = `/api/core/services/logs?source=file&path=${encodeURIComponent(p)}&lines=100`
     }
+    if (filter.trim()) {
+      url += `&filter=${encodeURIComponent(filter.trim())}`
+    }
     try {
       const res = (await getJSON(url)) as LogResponse
-      setLogLines(res.lines || [])
+      const reversed = [...(res.lines || [])].reverse()
+      reversed.forEach((l, i) => { l.num = i + 1 })
+      if (filter.trim()) {
+        setLogLines(reversed)
+      } else {
+        setLogLines(prev => {
+          const lastNum = prev.length > 0 ? prev[prev.length - 1].num : 0
+          const newEntries = reversed.filter(l => l.num > lastNum)
+          return [...prev, ...newEntries]
+        })
+      }
       setWarnings(res.warnings || [])
     } catch {
       setWarnings(['日志获取失败'])
     }
     setLoadingLog(false)
-  }, [tab, filePath, service.name, service.logPaths])
+  }, [tab, filePath, filter, service.name, service.logPaths])
 
   useEffect(() => {
     fetchLog()
@@ -324,7 +337,7 @@ function LogModal({ service, onClose }: { service: ServiceInfo; onClose: () => v
             )}
             <input className="ipt ipt-sm" placeholder="过滤关键词…" value={filter} onChange={(e) => setFilter(e.target.value)} />
             <label className="chk"><input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} /> 自动刷新</label>
-            <button className="btn btn-sm btn-ghost" onClick={() => fetchLog()}>刷新</button>
+            <button className="btn btn-sm btn-ghost" onClick={() => { followBottom.current = true; fetchLog() }}>刷新</button>
           </div>
         </div>
 
