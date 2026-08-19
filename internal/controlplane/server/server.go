@@ -1568,7 +1568,11 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// Same-origin dashboard session login (P22-9): sets the httpOnly + SameSite=
 	// Strict cookie so the SPA needs no CORS and never holds the token in JS.
 	mux.HandleFunc("POST /management/v1/login", s.handleManagementLogin)
-	// Embedded Operational Protection Console SPA (Phase 22.2).
+	// Public login shell (unauthenticated entry point — renders the SPA login
+	// form, exposes no data). The protected console itself is admin-only.
+	mux.HandleFunc("GET /login", s.handleLoginShell)
+	// Embedded Operational Protection Console SPA (Phase 22.2). ADMIN-ONLY per
+	// ADR-050 / R106=B: unauthenticated callers must not receive the shell.
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	return mux
 }

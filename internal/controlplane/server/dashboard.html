@@ -232,7 +232,7 @@ async function login() {
   });
   if (!r.ok) { toast("login failed", "err"); return; }
   toast("signed in", "ok");
-  enterConsole();
+  window.location.href = "/dashboard"; // admin-only surface; cookie is now set
 }
 
 function enterConsole() {
@@ -251,7 +251,7 @@ function leaveConsole() {
 }
 
 $("loginBtn").onclick = login;
-$("logoutBtn").onclick = leaveConsole;
+$("logoutBtn").onclick = () => { window.location.href = "/login"; };
 $("killBtn").onclick = async () => {
   const cap = $("capInput").value.trim();
   if (!cap) { toast("capability id required", "err"); return; }

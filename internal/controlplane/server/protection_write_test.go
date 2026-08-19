@@ -263,17 +263,42 @@ func TestProtectionWriteMux_NotOnExecutionMux(t *testing.T) {
 	}
 }
 
-// TestProtectionWriteMux_Dashboard_ServedOnReadMux: GET /dashboard IS served on
-// :8082 (the management surface) and returns the embedded console SPA.
-func TestProtectionWriteMux_Dashboard_ServedOnReadMux(t *testing.T) {
+// TestProtectionWriteMux_Dashboard_Unauthenticated_401: per ADR-050 / R106=B the
+// console shell is admin-only — an unauthenticated GET /dashboard must be 401.
+func TestProtectionWriteMux_Dashboard_Unauthenticated_401(t *testing.T) {
 	srv, _ := newProtectionTestServerWithAudit(t, true, &recordingAudit{})
 	h := srv.ProtectionReadMux()
 	w := doReqFull(h, http.MethodGet, "/dashboard", "", "", nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /dashboard unauthenticated: want 401, got %d (body=%q)", w.Code, w.Body.String())
+	}
+}
+
+// TestProtectionWriteMux_Dashboard_AuthenticatedAdmin_200: an authenticated admin
+// receives the embedded console SPA.
+func TestProtectionWriteMux_Dashboard_AuthenticatedAdmin_200(t *testing.T) {
+	srv, token := newProtectionTestServerWithAudit(t, true, &recordingAudit{})
+	h := srv.ProtectionReadMux()
+	w := doReqFull(h, http.MethodGet, "/dashboard", token, "", nil)
 	if w.Code != http.StatusOK {
-		t.Fatalf("GET /dashboard on :8082: want 200, got %d", w.Code)
+		t.Fatalf("GET /dashboard admin: want 200, got %d (body=%q)", w.Code, w.Body.String())
 	}
 	if !bytes.Contains(w.Body.Bytes(), []byte("Operational Protection Console")) {
-		t.Fatalf("GET /dashboard should return the protection console SPA")
+		t.Fatalf("GET /dashboard admin should return the protection console SPA")
+	}
+}
+
+// TestProtectionWriteMux_LoginShell_Public_200: the public login shell is the
+// unauthenticated entry point and must NOT be admin-gated.
+func TestProtectionWriteMux_LoginShell_Public_200(t *testing.T) {
+	srv, _ := newProtectionTestServerWithAudit(t, true, &recordingAudit{})
+	h := srv.ProtectionReadMux()
+	w := doReqFull(h, http.MethodGet, "/login", "", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /login (public): want 200, got %d (body=%q)", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("Operational Protection Console")) {
+		t.Fatalf("GET /login should return the console SPA (login form)")
 	}
 }
 
