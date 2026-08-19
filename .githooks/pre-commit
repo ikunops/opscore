@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# OpsCore pre-commit hook. Runs the quality gate before each commit so the
+# two known regressions (gitignored CLI source, broken UI injection) can
+# never reach the repo again.
+#
+# One-time enable:  git config core.hooksPath .githooks
+set -euo pipefail
+GATE="$(git rev-parse --show-toplevel)/scripts/quality-gate.sh"
+if [ -x "$GATE" ]; then
+  "$GATE"
+else
+  echo "WARN: quality-gate.sh not executable; running via bash"
+  bash "$GATE"
+fi

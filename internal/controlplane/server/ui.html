@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OpsCore 控制平面</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--fg:#e6e6e6;--muted:#8b93a1;--acc:#4f8cff;--ok:#3fb950;--warn:#d29922;--err:#f85149;--bd:#262b36}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+  header{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--bd);background:#12151c}
+  header h1{font-size:16px;margin:0}
+  header .sub{color:var(--muted);font-size:12px}
+  header .spacer{flex:1}
+  header input{background:#0c0e12;border:1px solid var(--bd);border-radius:7px;padding:7px 9px;color:var(--fg);font:inherit;width:130px}
+  header button{cursor:pointer;background:var(--acc);border:0;border-radius:7px;padding:7px 14px;color:#fff;font:inherit}
+  header button.ghost{background:#222732}
+  nav{display:flex;gap:4px;padding:10px 20px 0;border-bottom:1px solid var(--bd)}
+  nav button{background:none;border:0;color:var(--muted);padding:9px 14px;cursor:pointer;font:inherit;border-bottom:2px solid transparent}
+  nav button.active{color:var(--fg);border-bottom-color:var(--acc)}
+  main{padding:18px 20px;max-width:1100px}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;margin-bottom:16px}
+  .card h2{font-size:13px;margin:0 0 12px;color:var(--acc);text-transform:uppercase;letter-spacing:.05em}
+  label{display:block;color:var(--muted);font-size:12px;margin:8px 0 4px}
+  input,textarea{width:100%;background:#0c0e12;border:1px solid var(--bd);border-radius:7px;padding:8px;color:var(--fg);font:inherit}
+  textarea{height:70px;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  button{font:inherit}
+  .btn{cursor:pointer;background:var(--acc);border:0;border-radius:7px;padding:8px 14px;color:#fff;margin-top:8px;margin-right:8px}
+  .btn.ghost{background:#222732}
+  .btn.sm{padding:4px 10px;margin:0 4px 0 0;font-size:12px}
+  .btn.danger{background:#3a2326;border:1px solid #5c2b30;color:#ffb3b3}
+  .btn.ok{background:#1c3326;border:1px solid #2c5238;color:#9be6b0}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .row>*{flex:1;min-width:120px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--bd)}
+  th{color:var(--muted);font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  td.mono{font-family:ui-monospace,Consolas,monospace;font-size:12px}
+  .tag{display:inline-block;padding:2px 9px;border-radius:20px;font-size:11px}
+  .tag.active{background:rgba(63,185,80,.15);color:var(--ok)}
+  .tag.inactive{background:rgba(248,81,73,.15);color:var(--err)}
+  .tag.loaded{background:rgba(79,140,255,.15);color:var(--acc)}
+  .banner{background:rgba(210,153,34,.12);border:1px solid #5c4a1f;color:var(--warn);padding:10px 14px;border-radius:8px;font-size:12px;margin-bottom:14px}
+  .muted{color:var(--muted)}
+  pre{background:#0c0e12;border:1px solid var(--bd);border-radius:7px;padding:10px;overflow:auto;max-height:340px;font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;margin:0}
+  #toast{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px;z-index:50}
+  .toast{background:#1b1f27;border:1px solid var(--bd);border-left:3px solid var(--acc);padding:10px 14px;border-radius:8px;font-size:13px;max-width:340px;box-shadow:0 6px 20px rgba(0,0,0,.4)}
+  .toast.ok{border-left-color:var(--ok)}
+  .toast.err{border-left-color:var(--err)}
+  .hidden{display:none}
+  .pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;background:#222732;color:var(--muted);margin-left:8px}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>OpsCore 控制平面</h1>
+    <div class="sub">统一运维控制平面 · 身份 / 权限 / 执行 / 审计</div>
+  </div>
+  <div class="spacer"></div>
+  <input id="user" placeholder="用户名" value="admin">
+  <input id="pass" type="password" placeholder="密码" value="admin">
+  <button id="login">登录</button>
+  <span id="authState" class="pill">未登录</span>
+</header>
+
+<nav>
+  <button data-tab="services" class="active">系统服务</button>
+  <button data-tab="audit">审计日志</button>
+  <button data-tab="console">控制台</button>
+</nav>
+
+<main>
+  <!-- ============ 服务 ============ -->
+  <section id="tab-services">
+    <div id="demoBanner" class="banner hidden">
+      ⚠ 演示模式：下方"目标主机"指向 OpsCore 内置的模拟 Linux 主机（进程内 SSH，返回模拟 systemd 数据）。
+      你无需真实服务器即可体验完整链路：登录 → 鉴权 → 上下文(目标) → SSH → systemctl → 审计。
+      把目标地址改成 <code>192.168.94.20</code> 即可指向真实被管机。
+    </div>
+
+    <div class="card">
+      <h2>目标主机（远程 SSH）</h2>
+      <p class="muted" style="margin:0 0 8px">留空地址 = 在运行 OpsCore 的本机执行；填了就通过 SSH 在该机器执行。演示模式下已预填内置模拟主机。</p>
+      <div class="row">
+        <div><label>地址（如 192.168.94.20）</label><input id="th_addr"></div>
+        <div><label>端口</label><input id="th_port" value="22"></div>
+      </div>
+      <div class="row">
+        <div><label>用户</label><input id="th_user" value="root"></div>
+        <div><label>密码</label><input id="th_pass" type="password"></div>
+      </div>
+      <label style="margin-top:8px"><input type="checkbox" id="th_insecure" checked style="width:auto;vertical-align:middle;margin-right:6px">跳过主机密钥校验（仅测试用）</label>
+      <div><button class="btn" id="refreshSvc">刷新服务列表</button></div>
+    </div>
+
+    <div class="card">
+      <h2>系统服务 <span id="svcCount" class="pill">—</span></h2>
+      <div class="row" style="margin-bottom:12px">
+        <div style="flex:2;min-width:220px"><label>搜索服务名 / 描述</label><input id="svcFilter" placeholder="例如 nginx、ABRT、network..."></div>
+        <div style="flex:1;min-width:120px"><label>活跃状态</label><select id="svcActiveFilter" style="width:100%;background:#0c0e12;border:1px solid var(--bd);border-radius:7px;padding:8px;color:var(--fg);font:inherit">
+          <option value="">全部</option>
+          <option value="active">active</option>
+          <option value="inactive">inactive</option>
+        </select></div>
+        <div style="flex:1;min-width:120px"><label>加载状态</label><select id="svcLoadFilter" style="width:100%;background:#0c0e12;border:1px solid var(--bd);border-radius:7px;padding:8px;color:var(--fg);font:inherit">
+          <option value="">全部</option>
+          <option value="loaded">loaded</option>
+          <option value="not-found">not-found</option>
+        </select></div>
+      </div>
+      <table>
+        <thead><tr><th>服务单元</th><th>加载</th><th>活跃</th><th>子状态</th><th>描述</th><th>操作</th></tr></thead>
+        <tbody id="svcBody"><tr><td colspan="6" class="muted">点击「刷新服务列表」加载目标主机的 systemd 服务。</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 审计 ============ -->
+  <section id="tab-audit" class="hidden">
+    <div class="card">
+      <h2>审计日志</h2>
+      <button class="btn" id="refreshAudit">刷新审计</button>
+      <table style="margin-top:12px">
+        <thead><tr><th>时间</th><th>操作者</th><th>操作</th><th>动作</th><th>目标</th><th>结果</th><th>详情</th></tr></thead>
+        <tbody id="auditBody"><tr><td colspan="7" class="muted">暂无记录。</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 控制台 ============ -->
+  <section id="tab-console" class="hidden">
+    <div class="card">
+      <h2>快速查询</h2>
+      <button class="btn ghost" id="c_me">GET /api/me</button>
+      <button class="btn ghost" id="c_ops">GET /api/operations</button>
+      <button class="btn ghost" id="c_health">GET /api/health</button>
+    </div>
+    <div class="card">
+      <h2>操作执行（plan / run）</h2>
+      <label>操作名（如 system.service.restart）</label>
+      <input id="c_op" value="system.service.restart">
+      <label>参数 JSON</label>
+      <textarea id="c_params">{"name":"nginx"}</textarea>
+      <button class="btn" id="c_plan">POST …/plan（dry-run）</button>
+      <button class="btn" id="c_run">POST …/run（执行）</button>
+    </div>
+    <div class="card">
+      <h2>响应</h2>
+      <pre id="c_out">// 点击上方按钮开始测试</pre>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+window.__OPSCORE__ = /*__OPSCORE_UI_CONFIG__*/{};
+const out = document.getElementById('c_out');
+let access = '', refresh = '';
+
+// ---------- 配置注入 ----------
+const CFG = window.__OPSCORE__ || {};
+if (CFG.demo) document.getElementById('demoBanner').classList.remove('hidden');
+if (CFG.defaultTarget) {
+  const t = CFG.defaultTarget;
+  document.getElementById('th_addr').value = t.address || '';
+  document.getElementById('th_port').value = t.port || 22;
+  document.getElementById('th_user').value = t.user || 'root';
+  document.getElementById('th_pass').value = t.password || '';
+  document.getElementById('th_insecure').checked = !!t.insecure_ignore_host_key;
+}
+
+// ---------- 工具 ----------
+function toast(msg, kind){
+  const el = document.createElement('div');
+  el.className = 'toast ' + (kind||'');
+  el.textContent = msg;
+  document.getElementById('toast').appendChild(el);
+  setTimeout(()=>el.remove(), 4200);
+}
+async function api(method, path, body, auth){
+  const opt = {method, headers:{}};
+  if(body!==undefined){opt.headers['Content-Type']='application/json';opt.body=JSON.stringify(body);}
+  if(auth && access) opt.headers['Authorization']='Bearer '+access;
+  const r = await fetch(path, opt);
+  const txt = await r.text();
+  let j; try{j=JSON.parse(txt);}catch(e){j=txt;}
+  return {status:r.status, body:j};
+}
+function buildTarget(){
+  const addr = document.getElementById('th_addr').value.trim();
+  if(!addr) return undefined; // 本地执行
+  const t = {address:addr, insecure:document.getElementById('th_insecure').checked};
+  const port = parseInt(document.getElementById('th_port').value,10);
+  if(port>0) t.port = port;
+  const u = document.getElementById('th_user').value.trim();
+  if(u) t.user = u;
+  const p = document.getElementById('th_pass').value;
+  if(p) t.password = p;
+  return t;
+}
+function runOp(op, params){
+  const p = Object.assign({}, params);
+  const t = buildTarget();
+  if(t!==undefined) p.target = t;
+  return api('POST','/api/operations/'+op+'/run', p, true);
+}
+
+// ---------- 登录 ----------
+async function doLogin(){
+  const u=document.getElementById('user').value, p=document.getElementById('pass').value;
+  const r = await api('POST','/api/auth/login',{username:u,password:p},false);
+  if(r.status===200 && r.body.access_token){ access=r.body.access_token; refresh=r.body.refresh_token;
+    document.getElementById('authState').textContent='已登录'; document.getElementById('authState').style.color='var(--ok)';
+    toast('登录成功','ok');
+  } else { toast('登录失败：'+(r.body.error||r.status),'err'); }
+}
+document.getElementById('login').onclick = doLogin;
+
+// ---------- 标签页 ----------
+document.querySelectorAll('nav button').forEach(b=>{
+  b.onclick = ()=>{
+    document.querySelectorAll('nav button').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    ['services','audit','console'].forEach(t=>{
+      document.getElementById('tab-'+t).classList.toggle('hidden', t!==b.dataset.tab);
+    });
+  };
+});
+
+// ---------- 服务列表 ----------
+let allServices = [];
+function parseServices(text){
+  const lines = (text||'').split('\n').filter(l=>l.trim());
+  const out=[];
+  for(const l of lines){
+    const m = l.match(/^\s*(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$/);
+    if(m) out.push({unit:m[1], load:m[2], active:m[3], sub:m[4], desc:m[5]});
+  }
+  return out;
+}
+function getServiceFilters(){
+  const q = document.getElementById('svcFilter').value.trim().toLowerCase();
+  const active = document.getElementById('svcActiveFilter').value;
+  const load = document.getElementById('svcLoadFilter').value;
+  return {q, active, load};
+}
+function filterServices(svcs){
+  const f = getServiceFilters();
+  return svcs.filter(s=>{
+    if(f.active && s.active!==f.active) return false;
+    if(f.load && s.load!==f.load) return false;
+    if(f.q && !(s.unit.toLowerCase().includes(f.q) || s.desc.toLowerCase().includes(f.q))) return false;
+    return true;
+  });
+}
+function renderServices(svcs){
+  const tbody = document.getElementById('svcBody');
+  document.getElementById('svcCount').textContent = svcs.length===allServices.length ? svcs.length+' 个' : svcs.length+' / '+allServices.length+' 个';
+  if(svcs.length===0){
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">没有匹配当前筛选条件的服务。</td></tr>';
+    return;
+  }
+  tbody.innerHTML = svcs.map(s=>{
+    const aTag = s.active==='active' ? '<span class="tag active">active</span>' : '<span class="tag inactive">'+s.active+'</span>';
+    return `<tr>
+      <td class="mono">${s.unit}</td>
+      <td><span class="tag loaded">${s.load}</span></td>
+      <td>${aTag}</td>
+      <td>${s.sub}</td>
+      <td>${s.desc}</td>
+      <td>
+        <button class="btn sm ok" data-act="start" data-name="${s.unit}">启动</button>
+        <button class="btn sm danger" data-act="stop" data-name="${s.unit}">停止</button>
+        <button class="btn sm" data-act="restart" data-name="${s.unit}">重启</button>
+      </td></tr>`;
+  }).join('');
+  tbody.querySelectorAll('button[data-act]').forEach(btn=>{
+    btn.onclick = ()=> actOnService(btn.dataset.act, btn.dataset.name);
+  });
+}
+function applyServiceFilters(){
+  renderServices(filterServices(allServices));
+}
+async function refreshServices(){
+  if(!access){ toast('请先登录','err'); return; }
+  const r = await runOp('system.service.list', {});
+  const tbody = document.getElementById('svcBody');
+  if(r.status!==200 || (r.body && !r.body.success)){
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">加载失败：'+(r.body&&r.body.error?r.body.error:r.status)+'</td></tr>';
+    document.getElementById('svcCount').textContent='错误';
+    allServices = [];
+    return;
+  }
+  const text = (r.body.steps && r.body.steps[0] && r.body.steps[0].output) || '';
+  allServices = parseServices(text);
+  applyServiceFilters();
+}
+document.getElementById('svcFilter').oninput = applyServiceFilters;
+document.getElementById('svcActiveFilter').onchange = applyServiceFilters;
+document.getElementById('svcLoadFilter').onchange = applyServiceFilters;
+async function actOnService(act, name){
+  if(!access){ toast('请先登录','err'); return; }
+  const opMap = {start:'system.service.start', stop:'system.service.stop', restart:'system.service.restart'};
+  toast('正在 '+act+' '+name+' …');
+  const r = await runOp(opMap[act], {name});
+  if(r.status===200 && r.body && r.body.success){ toast(act+' '+name+' 成功','ok'); refreshServices(); }
+  else { toast(act+' '+name+' 失败：'+(r.body&&r.body.error?r.body.error:r.status),'err'); }
+}
+document.getElementById('refreshSvc').onclick = refreshServices;
+
+// ---------- 审计 ----------
+async function refreshAudit(){
+  if(!access){ toast('请先登录','err'); return; }
+  const r = await api('GET','/api/audit?limit=50',undefined,true);
+  const tbody=document.getElementById('auditBody');
+  if(r.status!==200){ tbody.innerHTML='<tr><td colspan="7" class="muted">加载失败：'+(r.body.error||r.status)+'</td></tr>'; return; }
+  const evs = (r.body && r.body.events) || [];
+  if(evs.length===0){ tbody.innerHTML='<tr><td colspan="7" class="muted">暂无记录。</td></tr>'; return; }
+  tbody.innerHTML = evs.map(e=>{
+    const ok = e.result==='success'||e.result==='ok';
+    const tag = ok?'<span class="tag active">'+e.result+'</span>':'<span class="tag inactive">'+e.result+'</span>';
+    return `<tr><td class="mono">${e.timestamp||''}</td><td>${e.actor||''}</td><td class="mono">${e.operation||''}</td><td>${e.action||''}</td><td class="mono">${e.target||''}</td><td>${tag}</td><td class="muted">${(e.detail||'').slice(0,80)}</td></tr>`;
+  }).join('');
+}
+document.getElementById('refreshAudit').onclick = refreshAudit;
+
+// ---------- 控制台 ----------
+function cshow(title, ok, data){
+  out.textContent = (ok?'':'✗ ')+title+'\n\n'+(typeof data==='string'?data:JSON.stringify(data,null,2));
+}
+document.getElementById('c_me').onclick = async ()=>{const r=await api('GET','/api/me',undefined,true);cshow('GET /api/me → '+r.status,r.ok,r.body);};
+document.getElementById('c_ops').onclick = async ()=>{const r=await api('GET','/api/operations',undefined,true);cshow('GET /api/operations → '+r.status,r.ok,r.body);};
+document.getElementById('c_health').onclick = async ()=>{const r=await api('GET','/api/health',undefined,false);cshow('GET /api/health → '+r.status,r.ok,r.body);};
+document.getElementById('c_plan').onclick = async ()=>{
+  const op=document.getElementById('c_op').value; let p;
+  try{p=JSON.parse(document.getElementById('c_params').value||'{}');}catch(e){cshow('参数不是合法 JSON',false,String(e));return;}
+  const t=buildTarget(); if(t!==undefined) p.target=t;
+  const r=await api('POST','/api/operations/'+op+'/plan',p,true); cshow('POST …/plan → '+r.status,r.ok,r.body);
+};
+document.getElementById('c_run').onclick = async ()=>{
+  const op=document.getElementById('c_op').value; let p;
+  try{p=JSON.parse(document.getElementById('c_params').value||'{}');}catch(e){cshow('参数不是合法 JSON',false,String(e));return;}
+  const t=buildTarget(); if(t!==undefined) p.target=t;
+  const r=await api('POST','/api/operations/'+op+'/run',p,true); cshow('POST …/run → '+r.status,r.ok,r.body);
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "version": "1",
+  "server": {
+    "listen": ":8080",
+    "probe": ":8081"
+  },
+  "log": {
+    "level": "info",
+    "format": "json"
+  },
+  "storage": {
+    "policyStoreDir": "/var/lib/opscore/policy"
+  }
+}

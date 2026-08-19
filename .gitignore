@@ -1,0 +1,38 @@
+# Build output (anchor to repo root so cmd/opscore/ sources stay tracked)
+/opscore
+/opscore.exe
+/opscore_linux_amd64
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage.out
+*.test
+
+# SQLite (Phase 1.2+)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Quality-gate temp artifacts (scripts/quality-gate.sh)
+.gate_bin
+.gate_ui.html
+.gate.log
+
+# Real deployment config (contains secrets); keep only the .example template in git
+opscore.env
+.gate_bin~
+
+# Phase 20 local runtime artifacts (harness logs + local deploy override)
+opscore-server.err.log
+opscore-server.out.log
+deploy/opscore-local.json

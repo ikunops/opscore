@@ -1,0 +1,29 @@
+[Unit]
+Description=OpsCore Server (single-node, read-surface deployment)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Sole composition root (ADR-032 A-1). Single-node topology; the multi-node seam
+# stays inert (A-8). This unit only wraps the existing cmd/opscore-server binary —
+# it introduces NO second production wiring path.
+ExecStart=/usr/local/bin/opscore-server -config /etc/opscore/opscore.json
+# Graceful shutdown: SIGTERM triggers harness.Shutdown which drains in-flight
+# reads and flushes the policy store (A-4). Never an Execution Cancel/Apply.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+# Run as a dedicated non-root user with restrictive perms on the data dir (§3.5).
+User=opscore
+Group=opscore
+# Hardening: this process is a read-surface deployment, never a Control Plane.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/opscore
+StateDirectory=opscore
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
