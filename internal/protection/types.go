@@ -46,6 +46,12 @@ const (
 	ActionConcurrencyExceeded = "protection.concurrency_exceeded"
 	ActionRateLimited         = "protection.rate_limited"
 	ActionTimeout             = "protection.timeout"
+
+	// Phase 22.2 operator-initiated kill vocabulary (P22-3). Distinct from the
+	// Gate's automatic protection.killed / protection.principal_killed so operator
+	// kills/releases are separately filterable audit evidence.
+	ActionOperatorKill   = "protection.kill"
+	ActionOperatorRelease = "protection.release"
 )
 
 // FailureEvidenceReader is the breaker's sole read dependency (R21-12). The

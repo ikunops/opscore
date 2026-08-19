@@ -15,6 +15,26 @@ type KillStore struct {
 	store           KillPersistence
 	state           KillStoreState
 	clock           func() time.Time
+	// opMeta records operator-initiated kill attribution (who/why/when) for the
+	// dashboard read surface. It is a runtime projection only — the authoritative
+	// kill decision is the `killed` bool (persisted); opMeta is reconstructed from
+	// the audit trail after restart. Phase 22.2.
+	opMeta map[string]operatorKillMeta
+}
+
+// operatorKillMeta is the attribution of an operator-initiated kill (Phase 22.2).
+type operatorKillMeta struct {
+	Operator string
+	Reason   string
+	At       time.Time
+}
+
+// OperatorKillEntry projects operator-kill attribution for the read surface.
+type OperatorKillEntry struct {
+	CapabilityID string
+	Operator     string
+	Reason       string
+	At           time.Time
 }
 
 // NewKillStore builds an uninitialized kill store around a persistence backend.
@@ -28,6 +48,7 @@ func NewKillStore(store KillPersistence, clock func() time.Time) *KillStore {
 		principalKilled: make(map[string]bool),
 		state:           KillStateUninitialized,
 		clock:           clock,
+		opMeta:          make(map[string]operatorKillMeta),
 	}
 }
 
@@ -111,6 +132,48 @@ func (ks *KillStore) SetPrincipalKilled(hash string, killed bool) error {
 // List returns the persisted kill entries for the read surface.
 func (ks *KillStore) List() ([]KillEntry, error) {
 	return ks.store.ListKills()
+}
+
+// RecordOperatorKill sets the capability kill flag (single owner, persisted) and
+// records operator attribution in opMeta (Phase 22.2). The Gate continues to see
+// the kill via IsKilled; opMeta is dashboard-only attribution.
+func (ks *KillStore) RecordOperatorKill(capID, operator, reason string) error {
+	if err := ks.SetKilled(capID, true); err != nil {
+		return err
+	}
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	ks.opMeta[capID] = operatorKillMeta{Operator: operator, Reason: reason, At: ks.clock()}
+	return nil
+}
+
+// ClearOperatorKill removes the operator kill flag (Phase 22.2 P22-4: this does
+// NOT restore execution — the Gate re-evaluates on next admission). opMeta is
+// dropped; the audit trail retains the who/why permanently.
+func (ks *KillStore) ClearOperatorKill(capID string) error {
+	if err := ks.SetKilled(capID, false); err != nil {
+		return err
+	}
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	delete(ks.opMeta, capID)
+	return nil
+}
+
+// ListOperatorKills returns operator-kill attribution for the read surface.
+func (ks *KillStore) ListOperatorKills() []OperatorKillEntry {
+	ks.mu.RLock()
+	defer ks.mu.RUnlock()
+	out := make([]OperatorKillEntry, 0, len(ks.opMeta))
+	for capID, m := range ks.opMeta {
+		out = append(out, OperatorKillEntry{
+			CapabilityID: capID,
+			Operator:     m.Operator,
+			Reason:       m.Reason,
+			At:           m.At,
+		})
+	}
+	return out
 }
 
 // Now returns the current time (injectable clock wrapper, used by adapters).

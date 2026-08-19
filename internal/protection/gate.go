@@ -199,6 +199,14 @@ func (g *Gate) ListKills() ([]KillEntry, error) {
 	return g.kills.List()
 }
 
+// KillStore returns the kill store the Gate reads (Phase 22.2 P22-2: operator
+// mutations MUST write through this same single owner, never a second KillState).
+func (g *Gate) KillStore() *KillStore { return g.kills }
+
+// Audit returns the audit writer the Gate uses, so operator-initiated
+// kill/release observations are recorded on the same audit stream.
+func (g *Gate) Audit() AuditWriter { return g.audit }
+
 // SnapshotMetrics returns exact counters (R21-7).
 func (g *Gate) SnapshotMetrics() Metrics {
 	return Metrics{

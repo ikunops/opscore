@@ -318,10 +318,16 @@ type tokenPair struct {
 
 func (s *Server) subject(r *http.Request) (string, error) {
 	hdr := r.Header.Get("Authorization")
-	if !strings.HasPrefix(hdr, "Bearer ") {
-		return "", errors.New("missing bearer token")
+	if strings.HasPrefix(hdr, "Bearer ") {
+		return s.auth.Authenticate(strings.TrimPrefix(hdr, "Bearer "))
 	}
-	return s.auth.Authenticate(strings.TrimPrefix(hdr, "Bearer "))
+	// P22-9 fallback: the httpOnly + SameSite=Strict session cookie set by
+	// POST /management/v1/login (or /api/auth/login). The SPA path uses this so
+	// the token never lives in JS. Bearer remains the API-client contract.
+	if ck, err := r.Cookie(sessionCookieName); err == nil && ck.Value != "" {
+		return s.auth.Authenticate(ck.Value)
+	}
+	return "", errors.New("missing bearer token or session cookie")
 }
 
 func (s *Server) coreCtx(r *http.Request, username string, target core.TargetHost, parent context.Context) core.Context {
@@ -1498,9 +1504,21 @@ func (s *Server) handleProtectionKills(w http.ResponseWriter, r *http.Request) {
 			"killed_by":      k.KilledBy,
 		})
 	}
+	// Phase 22.2 operator attribution (who/why/when) — dashboard-only, derived
+	// from KillStore.opMeta, never authoritative for admission.
+	opOut := make([]map[string]any, 0)
+	for _, ok := range s.gate.KillStore().ListOperatorKills() {
+		opOut = append(opOut, map[string]any{
+			"capability_id": ok.CapabilityID,
+			"operator":      ok.Operator,
+			"reason":        ok.Reason,
+			"at":            ok.At,
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"state": s.gate.KillState().String(),
-		"kills": out,
+		"state":         s.gate.KillState().String(),
+		"kills":         out,
+		"operator_kills": opOut,
 	})
 }
 
@@ -1540,8 +1558,18 @@ func (s *Server) handleProtectionMetrics(w http.ResponseWriter, r *http.Request)
 // harness :8082 read-surface (no gate) would report always-zero "fake green".
 func (s *Server) ProtectionReadMux() http.Handler {
 	mux := http.NewServeMux()
+	// Read surface (R21-1, colocated with the gate).
 	mux.HandleFunc("GET /management/v1/protection/kills", s.handleProtectionKills)
 	mux.HandleFunc("GET /management/v1/protection/metrics", s.handleProtectionMetrics)
+	// Phase 22.2 write surface — the SINGLE mutation seam (P22-2), admin-only
+	// and CSRF fail-closed (P22-9). Same-origin only; :8080 never serves these.
+	mux.HandleFunc("POST /management/v1/protection/kills", s.handleProtectionKill)
+	mux.HandleFunc("POST /management/v1/protection/kills/{id}/release", s.handleProtectionRelease)
+	// Same-origin dashboard session login (P22-9): sets the httpOnly + SameSite=
+	// Strict cookie so the SPA needs no CORS and never holds the token in JS.
+	mux.HandleFunc("POST /management/v1/login", s.handleManagementLogin)
+	// Embedded Operational Protection Console SPA (Phase 22.2).
+	mux.HandleFunc("GET /dashboard", s.handleDashboard)
 	return mux
 }
 
