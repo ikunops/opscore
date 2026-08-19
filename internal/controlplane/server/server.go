@@ -612,7 +612,13 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	// reject the gate has already appended the protection.* audit row; we only
 	// surface the HTTP status.
 	var adm *protection.Admission
-	parentCtx := r.Context()
+	// Detach a long-running execution from the HTTP request lifecycle on the
+	// gate-disabled path: keep the request's values but stop the request's
+	// cancellation from killing the execution. The gate-enabled path re-derives
+	// its deadline from the request via Gate.Check (DeadlineContext), so the
+	// gate still owns timeout/cancel semantics. This fixes executions started
+	// over HTTP being cancelled the moment the request handler returns.
+	parentCtx := context.WithoutCancel(r.Context())
 	if s.gate != nil {
 		a, rej := s.gate.Check(r.Context(), opName, username)
 		if rej != nil {
@@ -761,7 +767,13 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 	if params == nil {
 		params = map[string]any{}
 	}
-	parentCtx := r.Context()
+	// Detach a long-running execution from the HTTP request lifecycle on the
+	// gate-disabled path: keep the request's values but stop the request's
+	// cancellation from killing the execution. The gate-enabled path re-derives
+	// its deadline from the request via Gate.Check (DeadlineContext), so the
+	// gate still owns timeout/cancel semantics. This fixes executions started
+	// over HTTP being cancelled the moment the request handler returns.
+	parentCtx := context.WithoutCancel(r.Context())
 	if adm != nil {
 		pc, cancel := adm.DeadlineContext(r.Context())
 		parentCtx = pc
@@ -1125,7 +1137,13 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 	// SUBMISSION concurrency, not in-flight duration (R21-14; async runtime
 	// lifecycle hooks for in-flight bounding are a documented follow-up).
 	var adm *protection.Admission
-	parentCtx := r.Context()
+	// Detach a long-running execution from the HTTP request lifecycle on the
+	// gate-disabled path: keep the request's values but stop the request's
+	// cancellation from killing the execution. The gate-enabled path re-derives
+	// its deadline from the request via Gate.Check (DeadlineContext), so the
+	// gate still owns timeout/cancel semantics. This fixes executions started
+	// over HTTP being cancelled the moment the request handler returns.
+	parentCtx := context.WithoutCancel(r.Context())
 	if s.gate != nil {
 		a, rej := s.gate.Check(r.Context(), body.Op, username)
 		if rej != nil {

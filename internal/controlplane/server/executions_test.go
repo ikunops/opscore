@@ -102,7 +102,12 @@ func TestExecutions_CancelFlow(t *testing.T) {
 
 	// Poll until a RUNNING execution appears, grab its id.
 	var execID string
-	for i := 0; i < 200; i++ {
+	// Poll for a RUNNING execution. The window is deliberately generous (10s):
+	// on a loaded dev host the runtime may take >1s to surface the execution
+	// in the RUNNING state, and the run context is detached from the HTTP
+	// request (context.WithoutCancel) so it is not killed when the handler
+	// returns — it must stay RUNNING until the explicit cancel below.
+	for i := 0; i < 500; i++ {
 		rec := doJSON(t, h, "GET", "/api/executions", token, nil)
 		var body struct {
 			Executions []struct {
@@ -116,7 +121,7 @@ func TestExecutions_CancelFlow(t *testing.T) {
 				break
 			}
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond)
 	}
 	if execID == "" {
 		t.Fatal("no RUNNING execution appeared")
