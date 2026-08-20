@@ -207,11 +207,13 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger) *protection.
 		logger.Warn("protection kill store bootstrap failed — fail closed (all capabilities killed)", "err", err)
 	}
 
-	// Phase 23.2 Resource Quota Protection (ADR-051). QuotaStore owns DEFINITIONS
-	// only (R23-3); consumption lives in the evidence source (R23-3). Until live
-	// telemetry is wired into the evidence reader, every definition reads Unknown
-	// ⇒ fail-closed per R23-1 (evidence unavailable ⇒ reject, never substitute
-	// zero/default — R23-4). This is the conservative default posture.
+	// Phase 23.2 Resource Quota Protection (ADR-051, incl. erratum). QuotaStore
+	// owns DEFINITIONS only (R23-3); consumption lives in the evidence source
+	// (R23-3). Three-state admission: absent definition ⇒ NotConfigured (no
+	// constraint, admit); definition present + evidence unknown/errored ⇒ Unknown
+	// ⇒ fail-closed reject (R23-1/R23-4); complete evidence over ceiling ⇒
+	// Evaluated ⇒ reject. Until live telemetry is wired into the evidence reader,
+	// every defined capability reads Unknown ⇒ fail-closed (conservative default).
 	var quotaPersist protection.QuotaPersistence
 	if s, ok := stor.(*sqlite.SQLiteStorage); ok {
 		quotaPersist = sqlite.NewQuotaStore(s.DB())

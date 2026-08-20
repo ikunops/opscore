@@ -131,13 +131,17 @@ func (g *Gate) Check(ctx context.Context, capID string, principal string) (*Admi
 		return nil, &Reject{Action: ActionConcurrencyExceeded, HTTPStatus: 503}
 	}
 
-	// 4b. Quota admission (Phase 23.2). Runs AFTER concurrency admit, BEFORE rate.
-	// Only when a definition exists for (capability, principal) (R23-4: an absent
-	// definition means NO quota constraint ⇒ pass). When a definition exists:
-	//   - an incomplete or errored evidence reading is Unknown ⇒ fail-closed
-	//     reject (R23-1/R23-4: never substitute zero/default for unavailable
-	//     evidence);
-	//   - observed usage over the ceiling ⇒ quota_exceeded reject.
+	// 4b. Quota admission (Phase 23.2, ADR-051 erratum). Runs AFTER concurrency
+	// admit, BEFORE rate. Three-state semantics (NOT two-state):
+	//   • NotConfigured — no quota definition exists for (capability, principal):
+	//       ⇒ no quota constraint, continue the Gate (admit). This is OPTIONAL
+	//       protection, NOT a global allowlist; absence ≠ Unknown.
+	//   • Unknown — a definition exists BUT its evidence is missing/incomplete
+	//       (errored read, !Complete) ⇒ fail-closed reject
+	//       protection.quota_evidence_unavailable (R23-1/R23-4: never substitute
+	//       zero/default for unavailable evidence).
+	//   • Evaluated — a definition exists AND evidence is complete:
+	//       observed usage over the ceiling ⇒ reject protection.quota_exceeded.
 	// Quota rejection is admission-only (R23-2): it NEVER terminates an in-flight
 	// execution. On reject we roll back the concurrency slot taken in step 4.
 	if g.quotas != nil && g.evidence != nil {

@@ -11,9 +11,14 @@ import (
 // Phase 23.2 Resource Quota Protection unit tests (ADR-051 / R23-1..R23-4).
 //
 // Locks the invariant that QuotaStore owns DEFINITIONS only (R23-3), the Gate
-// consults the evidence source for consumption (never QuotaStore), an absent
-// definition admits, and an Unknown/incomplete evidence reading fails CLOSED
-// (R23-1/R23-4) — never substituting zero/default for unavailable evidence.
+// consults the evidence source for consumption (never QuotaStore), and the
+// ADR-051 three-state quota admission:
+//   • NotConfigured — absent definition ⇒ no constraint, admit (NOT Unknown);
+//   • Unknown       — definition present + evidence missing/incomplete ⇒ fail-closed
+//                     reject (R23-1/R23-4), never substituting zero/default;
+//   • Evaluated     — definition present + complete evidence over ceiling ⇒ reject.
+// An absent definition admits and an Unknown evidence reading fails CLOSED —
+// these are deliberately distinct states.
 // ---------------------------------------------------------------------------
 
 // memQuotaPersist is an in-memory QuotaPersistence for tests.
@@ -153,14 +158,16 @@ func TestQuotaExceeded_CeilingSemantics(t *testing.T) {
 	}
 }
 
-// TestGateQuota_AbsentDefinitionAdmits: with no quota definition the gate applies
-// NO quota constraint ⇒ admit (R23-4: absent definition ⇒ no constraint).
-func TestGateQuota_AbsentDefinitionAdmits(t *testing.T) {
+// TestGateQuota_NotConfigured_Admits: with no quota definition the gate is in
+// the NotConfigured state ⇒ NO quota constraint ⇒ admit. This is NOT Unknown —
+// absence of configuration is distinct from unavailability of evidence. (ADR-051
+// erratum: NotConfigured ≠ Unknown.)
+func TestGateQuota_NotConfigured_Admits(t *testing.T) {
 	qs := NewQuotaStore(newMemQuotaPersist(), nil)
 	g := New(Config{Quotas: qs, Evidence: &fakeEvidence{}, Audit: &recAudit{}})
 	adm, rej := g.Check(context.Background(), "exec", "alice")
 	if rej != nil {
-		t.Fatalf("absent definition must admit, got reject %+v", rej)
+		t.Fatalf("NotConfigured (absent definition) must admit, got reject %+v", rej)
 	}
 	adm.Release()
 }
