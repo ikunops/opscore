@@ -206,6 +206,24 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger) *protection.
 	if err := ks.Bootstrap(); err != nil {
 		logger.Warn("protection kill store bootstrap failed — fail closed (all capabilities killed)", "err", err)
 	}
+
+	// Phase 23.2 Resource Quota Protection (ADR-051). QuotaStore owns DEFINITIONS
+	// only (R23-3); consumption lives in the evidence source (R23-3). Until live
+	// telemetry is wired into the evidence reader, every definition reads Unknown
+	// ⇒ fail-closed per R23-1 (evidence unavailable ⇒ reject, never substitute
+	// zero/default — R23-4). This is the conservative default posture.
+	var quotaPersist protection.QuotaPersistence
+	if s, ok := stor.(*sqlite.SQLiteStorage); ok {
+		quotaPersist = sqlite.NewQuotaStore(s.DB())
+	} else {
+		quotaPersist = memory.NewQuotaStore()
+	}
+	qs := protection.NewQuotaStore(quotaPersist, time.Now)
+	if err := qs.Bootstrap(); err != nil {
+		logger.Warn("protection quota store bootstrap failed — definitions treated as absent (no quota enforcement)", "err", err)
+	}
+	evidence := memory.NewQuotaEvidenceReader()
+
 	return protection.New(protection.Config{
 		KillStore: ks,
 		Breaker: protection.NewBreakerSet(
@@ -215,6 +233,8 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger) *protection.
 		),
 		Sem:     protection.NewSemaphoreSet(8),
 		Buckets: protection.NewTokenBucketSet(protection.TokenBucketConfig{Capacity: 100, Refill: 10}, time.Now),
+		Quotas:  qs,
+		Evidence: evidence,
 		Audit:   &storageAuditWriter{store: stor.Audit()},
 		Timeout: protection.NewTimeoutConfig(),
 	})

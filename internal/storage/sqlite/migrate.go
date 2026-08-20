@@ -141,6 +141,22 @@ CREATE TABLE IF NOT EXISTS principal_kill_state (
   killed_by     TEXT
 );
 `},
+	// v7 (Phase 23.2 / ADR-051 §4): quota DEFINITIONS only (R23-3). Current
+	// consumption is owned exclusively by the evidence source
+	// (QuotaEvidenceReader) and is NEVER stored here. The table is additive.
+	// principal == '' denotes the capability-wide default that applies to every
+	// principal lacking a principal-specific row (QuotaStore.GetDefinition
+	// precedence). rss_bytes / cpu_secs == 0 means "unlimited" for that
+	// dimension (QuotaExceeded treats a zero field as unlimited).
+	{Version: 7, Name: "quota_definitions", Up: `
+CREATE TABLE IF NOT EXISTS quota_definition (
+  capability_id TEXT NOT NULL,
+  principal     TEXT NOT NULL DEFAULT '',
+  rss_bytes     BIGINT NOT NULL DEFAULT 0,
+  cpu_secs      REAL NOT NULL DEFAULT 0,
+  PRIMARY KEY (capability_id, principal)
+);
+`},
 }
 
 // Ensure brings the database up to the latest migration version, recording each

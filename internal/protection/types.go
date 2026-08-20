@@ -50,8 +50,15 @@ const (
 	// Phase 22.2 operator-initiated kill vocabulary (P22-3). Distinct from the
 	// Gate's automatic protection.killed / protection.principal_killed so operator
 	// kills/releases are separately filterable audit evidence.
-	ActionOperatorKill   = "protection.kill"
+	ActionOperatorKill    = "protection.kill"
 	ActionOperatorRelease = "protection.release"
+
+	// Phase 23 Resource Quota Protection vocabulary (R23-*). Distinct from the
+	// automatic reject actions so quota decisions are separately filterable.
+	ActionQuotaExceeded            = "protection.quota_exceeded"
+	ActionQuotaEvidenceUnavailable = "protection.quota_evidence_unavailable"
+	ActionQuotaSet                 = "protection.quota_set"
+	ActionQuotaClear               = "protection.quota_clear"
 )
 
 // FailureEvidenceReader is the breaker's sole read dependency (R21-12). The
@@ -136,4 +143,11 @@ type Metrics struct {
 	ConcurrencyExceeded int64
 	RateLimited         int64
 	AuditWriteFailed    int64
+
+	// Phase 23 quota counters. QuotaEvidenceUnavailable is the Unknown→reject
+	// path (R23-1/R23-4) and MUST stay separate from QuotaExceeded: "we know you
+	// are over the ceiling" and "we cannot know your usage" are different
+	// operational facts and are diagnosed differently.
+	QuotaExceeded            int64
+	QuotaEvidenceUnavailable int64
 }

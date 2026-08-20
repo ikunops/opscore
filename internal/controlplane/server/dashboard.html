@@ -139,7 +139,7 @@
       <div class="logo">O</div>
       <div>
         <h1>Operational Protection Console</h1>
-        <div class="sub">OpsCore · Phase 22.2 — kill observability &amp; control</div>
+        <div class="sub">OpsCore · Phase 22.2 / 23.2 — kill observability &amp; resource quota</div>
       </div>
     </div>
     <div style="display:flex; gap:10px; align-items:center;">
@@ -188,6 +188,23 @@
     <div class="glass panel">
       <h2>🧾 Operator attribution</h2>
       <div id="opKills"><span class="sub">no operator-initiated kills yet</span></div>
+    </div>
+
+    <div class="glass panel">
+      <h2>📊 Resource quota protection <span class="pill off">Phase 23.2</span></h2>
+      <div class="row">
+        <input id="qCap" class="grow" placeholder="capability id  (e.g. execute.shell)" />
+        <input id="qPrincipal" class="grow" placeholder="principal  (blank = capability-wide)" />
+        <input id="qRSS" class="grow" type="number" min="0" placeholder="RSS bytes  (0 = unlimited)" />
+        <input id="qCPU" class="grow" type="number" min="0" step="0.1" placeholder="CPU secs  (0 = unlimited)" />
+        <button class="magnetic" id="qSetBtn">Set quota</button>
+      </div>
+      <div class="hint">Definitions only (R23-3): consumption is owned by the evidence source, never stored or echoed here. Until live telemetry is wired, any definition reads as Unknown ⇒ new admissions are fail-closed (R23-1/R23-4).</div>
+      <table id="quotaTable" class="hidden" style="margin-top:14px;">
+        <thead><tr><th>Capability</th><th>Principal</th><th>RSS</th><th>CPU secs</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="quotaEmpty" class="hint">no quota definitions configured</div>
     </div>
   </section>
 </div>
@@ -252,6 +269,31 @@ function leaveConsole() {
 
 $("loginBtn").onclick = login;
 $("logoutBtn").onclick = () => { window.location.href = "/login"; };
+$("qSetBtn").onclick = async () => {
+  const capability = $("qCap").value.trim();
+  if (!capability) { toast("capability id required", "err"); return; }
+  const principal = $("qPrincipal").value.trim();
+  const rss = parseInt($("qRSS").value || "0", 10) || 0;
+  const cpu = parseFloat($("qCPU").value || "0") || 0;
+  const r = await api("/management/v1/protection/quotas", {
+    method: "POST", body: JSON.stringify({ capability, principal, rss_bytes: rss, cpu_secs: cpu }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok) toast(j.degraded ? "quota set (audit degraded)" : "quota set " + capability, j.degraded ? "err" : "ok");
+  else toast(j.error || "quota set failed", "err");
+  $("qCap").value = ""; $("qPrincipal").value = ""; $("qRSS").value = ""; $("qCPU").value = "";
+  refresh();
+};
+
+async function clearQuota(capability, principal) {
+  const r = await api("/management/v1/protection/quotas", {
+    method: "DELETE", body: JSON.stringify({ capability, principal }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok) toast(j.degraded ? "quota cleared (audit degraded)" : "quota cleared " + capability, j.degraded ? "err" : "ok");
+  else toast(j.error || "quota clear failed", "err");
+  refresh();
+}
 $("killBtn").onclick = async () => {
   const cap = $("capInput").value.trim();
   if (!cap) { toast("capability id required", "err"); return; }
@@ -278,18 +320,39 @@ async function release(cap) {
 }
 
 async function refresh() {
-  let kills, metrics;
+  let kills, metrics, quotas;
   try {
-    const [rk, rm] = await Promise.all([
+    const [rk, rm, rq] = await Promise.all([
       api("/management/v1/protection/kills", { method: "GET" }),
       api("/management/v1/protection/metrics", { method: "GET" }),
+      api("/management/v1/protection/quotas", { method: "GET" }),
     ]);
     if (rk.status === 401 || rm.status === 401) { leaveConsole(); toast("session expired — sign in again", "err"); return; }
     kills = await rk.json();
     metrics = await rm.json();
+    quotas = await rq.json().catch(() => ({}));
   } catch (e) { return; }
   renderMetrics(metrics);
   renderKills(kills);
+  renderQuotas(quotas);
+}
+
+function renderQuotas(q) {
+  if (!q) return;
+  const rows = q.quotas || [];
+  const tbl = $("quotaTable");
+  const empty = $("quotaEmpty");
+  if (!rows.length) { tbl.classList.add("hidden"); empty.classList.remove("hidden"); return; }
+  empty.classList.add("hidden");
+  tbl.classList.remove("hidden");
+  tbl.querySelector("tbody").innerHTML = rows.map((d) => `
+    <tr>
+      <td><code>${esc(d.capability)}</code></td>
+      <td>${d.principal ? esc(d.principal) : '<span class="sub">all principals</span>'}</td>
+      <td>${d.rss_bytes ? esc(String(d.rss_bytes)) : "unlimited"}</td>
+      <td>${d.cpu_secs ? esc(String(d.cpu_secs)) : "unlimited"}</td>
+      <td><button class="ghost-btn" onclick="clearQuota('${esc(d.capability)}','${esc(d.principal || "")}')">clear</button></td>
+    </tr>`).join("");
 }
 
 function renderMetrics(m) {
@@ -300,6 +363,8 @@ function renderMetrics(m) {
     ["principal_killed", "Principal killed", "danger"],
     ["circuit_open", "Circuit open", "accent"],
     ["concurrency_exceeded", "Concurrency", ""],
+    ["quota_exceeded", "Quota exceeded", "danger"],
+    ["quota_evidence_unavailable", "Quota evidence n/a", "accent"],
     ["rate_limited", "Rate limited", ""],
     ["audit_write_failed", "Audit write fail", "danger"],
     ["breaker_unknown", "Breaker unknown", ""],

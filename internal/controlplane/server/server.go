@@ -1539,14 +1539,16 @@ func (s *Server) handleProtectionMetrics(w http.ResponseWriter, r *http.Request)
 	}
 	m := s.gate.SnapshotMetrics()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"admitted":             m.Admitted,
-		"killed":               m.Killed,
-		"principal_killed":     m.PrincipalKilled,
-		"circuit_open":         m.CircuitOpen,
-		"breaker_unknown":      m.BreakerUnknown,
-		"concurrency_exceeded": m.ConcurrencyExceeded,
-		"rate_limited":         m.RateLimited,
-		"audit_write_failed":   m.AuditWriteFailed,
+		"admitted":                m.Admitted,
+		"killed":                  m.Killed,
+		"principal_killed":        m.PrincipalKilled,
+		"circuit_open":            m.CircuitOpen,
+		"breaker_unknown":         m.BreakerUnknown,
+		"concurrency_exceeded":    m.ConcurrencyExceeded,
+		"quota_exceeded":          m.QuotaExceeded,
+		"quota_evidence_unavailable": m.QuotaEvidenceUnavailable,
+		"rate_limited":            m.RateLimited,
+		"audit_write_failed":      m.AuditWriteFailed,
 	})
 }
 
@@ -1561,6 +1563,13 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// Read surface (R21-1, colocated with the gate).
 	mux.HandleFunc("GET /management/v1/protection/kills", s.handleProtectionKills)
 	mux.HandleFunc("GET /management/v1/protection/metrics", s.handleProtectionMetrics)
+	// Phase 23.2 Resource Quota Protection read + write surface (R23-3 single
+	// owner; R23-4 definitions-only, no consumption projected). Admin-only; the
+	// write routes are additionally CSRF fail-closed (P22-9 analog). :8080
+	// never serves these.
+	mux.HandleFunc("GET /management/v1/protection/quotas", s.handleProtectionQuotas)
+	mux.HandleFunc("POST /management/v1/protection/quotas", s.handleProtectionQuotaSet)
+	mux.HandleFunc("DELETE /management/v1/protection/quotas", s.handleProtectionQuotaClear)
 	// Phase 22.2 write surface — the SINGLE mutation seam (P22-2), admin-only
 	// and CSRF fail-closed (P22-9). Same-origin only; :8080 never serves these.
 	mux.HandleFunc("POST /management/v1/protection/kills", s.handleProtectionKill)
