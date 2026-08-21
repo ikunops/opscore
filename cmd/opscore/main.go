@@ -192,10 +192,27 @@ func (r *auditFailureReader) RecentFailures(capabilityID string, window time.Dur
 	return protection.FailureWindow{Count: count, Truncated: page.Truncated}, nil
 }
 
+// protectionBundle groups the Phase 21 Operational Protection Gate with the
+// Phase 24.2 observability projections (decision-log sink, rate history,
+// declarative alert tracker). The composition root owns all of them and wires
+// them together so the Gate emits provenance and the off-path ticker feeds the
+// rate history + alert tracker (R24-4 Observation Non-Interference: the ticker
+// never touches the Gate decision path).
+type protectionBundle struct {
+	gate         *protection.Gate
+	provenance   *protection.RecordingProvenanceSink
+	rateHistory  *protection.RateHistory
+	alertTracker *protection.AlertTracker
+	alertPolicy  protection.AlertPolicy
+}
+
 // buildProtectionGate constructs the Phase 21 Operational Protection Gate for
-// the active storage backend. The kill store is backend-specific (sqlite or
-// in-memory); the breaker/rate/timeout are backend-agnostic.
-func buildProtectionGate(stor storage.Storage, logger *slog.Logger) *protection.Gate {
+// the active storage backend, plus the Phase 24.2 observability projection
+// components. The kill store is backend-specific (sqlite or in-memory); the
+// breaker/rate/timeout are backend-agnostic. The provenance sink is bounded and
+// non-blocking (R24-4/R24-7); the rate history + alert tracker are off-path
+// read projections (R24-5 Projection Only, never a Source of Truth).
+func buildProtectionGate(stor storage.Storage, logger *slog.Logger) protectionBundle {
 	var killPersist protection.KillPersistence
 	if s, ok := stor.(*sqlite.SQLiteStorage); ok {
 		killPersist = sqlite.NewProtectionStore(s.DB())
@@ -226,20 +243,34 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger) *protection.
 	}
 	evidence := memory.NewQuotaEvidenceReader()
 
-	return protection.New(protection.Config{
+	// Phase 24.2 observability projections.
+	sink := protection.NewRecordingProvenanceSink(4096) // bounded, non-blocking
+	rateHistory := protection.NewRateHistory(time.Minute, 120)
+	alertTracker := protection.NewAlertTracker()
+	alertPolicy := protection.DefaultAlertPolicy()
+
+	gate := protection.New(protection.Config{
 		KillStore: ks,
 		Breaker: protection.NewBreakerSet(
 			&auditFailureReader{store: stor.Audit(), now: time.Now},
 			protection.DefaultBreakerConfig(),
 			time.Now,
 		),
-		Sem:     protection.NewSemaphoreSet(8),
-		Buckets: protection.NewTokenBucketSet(protection.TokenBucketConfig{Capacity: 100, Refill: 10}, time.Now),
-		Quotas:  qs,
-		Evidence: evidence,
-		Audit:   &storageAuditWriter{store: stor.Audit()},
-		Timeout: protection.NewTimeoutConfig(),
+		Sem:       protection.NewSemaphoreSet(8),
+		Buckets:   protection.NewTokenBucketSet(protection.TokenBucketConfig{Capacity: 100, Refill: 10}, time.Now),
+		Quotas:    qs,
+		Evidence:  evidence,
+		Audit:     &storageAuditWriter{store: stor.Audit()},
+		Timeout:   protection.NewTimeoutConfig(),
+		Provenance: sink,
 	})
+	return protectionBundle{
+		gate:         gate,
+		provenance:   sink,
+		rateHistory:  rateHistory,
+		alertTracker: alertTracker,
+		alertPolicy:  alertPolicy,
+	}
 }
 
 // loadConfigFile reads a minimal KEY=VALUE config (one per line; # starts a
@@ -453,6 +484,7 @@ func cmdServe(args []string) {
 		}
 		logger.Info("default SSH target configured", "host", *tHost, "port", *tPort, "user", *tUser, "insecure", *tInsecure)
 	}
+	bundle := buildProtectionGate(stor, logger)
 	srv, err := server.New(server.Config{
 		Storage:        stor,
 		Dispatcher:     dispatcher,
@@ -466,12 +498,39 @@ func cmdServe(args []string) {
 		UseSudo:        *tSudo && !demoOn,
 		AllowRegister:  *allowRegister,
 		BootstrapAdmin: &server.BootstrapAdmin{Username: *adminUser, Password: *adminPass},
-		Gate:           buildProtectionGate(stor, logger),
+		Gate:          bundle.gate,
+		AlertTracker:  bundle.alertTracker,
+		AlertPolicy:   bundle.alertPolicy,
 	})
 	if err != nil {
 		logger.Error("server init failed", "err", err)
 		os.Exit(1)
 	}
+
+	// Phase 24.2 observability projection feeder (R24-4 Observation
+	// Non-Interference: off the Gate decision path — a background ticker only
+	// READS exact counters and folds them into the rate history + alert tracker;
+	// it never influences an admission). The rate history + alert tracker are
+	// read projections (R24-5 Projection Only), not a Source of Truth.
+	go func() {
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for range tick.C {
+			now := time.Now()
+			metrics := bundle.gate.SnapshotMetrics()
+			// Feed the read projection first (R24-5: the history is what
+			// WindowDelta derives from); then compute the declarative alert
+			// condition over the trailing window.
+			bundle.rateHistory.Record(now, metrics)
+			delta, ok := bundle.rateHistory.WindowDelta(bundle.alertPolicy.Window, now)
+			if !ok {
+				// Insufficient history to derive a confident delta; do not fire.
+				continue
+			}
+			cond := protection.ComputeAlertCondition(delta, bundle.alertPolicy)
+			bundle.alertTracker.Observe(cond, now)
+		}
+	}()
 
 	// Phase 21 (R21-1 / ADR-048 B1 fix): the Protection management read surface
 	// lives on :8082, colocated with the gate (this Control Plane process owns

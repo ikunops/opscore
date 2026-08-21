@@ -40,6 +40,7 @@ type ProtectionEvent struct {
 // stream can filter by `action LIKE 'protection.%'` to see protection pressure.
 const (
 	ActionKilled              = "protection.killed"
+	ActionAdmit               = "protection.admit"
 	ActionPrincipalKilled     = "protection.principal_killed"
 	ActionCircuitOpen         = "protection.circuit_open"
 	ActionBreakerUnknown      = "protection.breaker_unknown"

@@ -2,8 +2,12 @@ package protection
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"sync/atomic"
 	"time"
+
+	"github.com/YuDong999/opscore/internal/tracing"
 )
 
 // Gate is the sole protection entry point. It composes the guards in a fixed
@@ -24,6 +28,11 @@ type Gate struct {
 	salt     []byte
 	clock    func() time.Time
 	counters *counters
+	// provenance, when set, receives decision-time provenance records (Phase
+	// 24.2 / R24-1). Nil disables provenance entirely and leaves Check
+	// byte-for-byte equivalent to before Phase 24.2 (R24-4: Observation
+	// Non-Interference — a nil sink changes nothing).
+	provenance ProvenanceSink
 }
 
 type counters struct {
@@ -51,6 +60,9 @@ type Config struct {
 	Timeout   *TimeoutConfig
 	Salt      []byte
 	Clock     func() time.Time
+	// Provenance, when set, receives decision-time provenance records (Phase
+	// 24.2). Nil disables provenance emission (behavior identical to pre-24.2).
+	Provenance ProvenanceSink
 }
 
 // New builds a Gate from its components.
@@ -73,9 +85,10 @@ func New(cfg Config) *Gate {
 		evidence: cfg.Evidence,
 		audit:    cfg.Audit,
 		timeout:  cfg.Timeout,
-		salt:     cfg.Salt,
-		clock:    cfg.Clock,
-		counters: &counters{},
+		salt:      cfg.Salt,
+		clock:     cfg.Clock,
+		counters:  &counters{},
+		provenance: cfg.Provenance,
 	}
 }
 
@@ -98,6 +111,7 @@ func (g *Gate) Check(ctx context.Context, capID string, principal string) (*Admi
 	if g.kills != nil && g.kills.IsKilled(capID) {
 		g.counters.killed.Add(1)
 		g.auditWrite(ctx, ProtectionEvent{Action: ActionKilled, CapID: capID, Principal: hash, Timestamp: now})
+		g.emitDecision(ctx, now, capID, hash, "kill", "reject", ActionKilled, "", "", "kill-switch active")
 		return nil, &Reject{Action: ActionKilled, HTTPStatus: 403}
 	}
 
@@ -105,12 +119,13 @@ func (g *Gate) Check(ctx context.Context, capID string, principal string) (*Admi
 	if g.kills != nil && g.kills.IsPrincipalKilled(hash) {
 		g.counters.principalKilled.Add(1)
 		g.auditWrite(ctx, ProtectionEvent{Action: ActionPrincipalKilled, CapID: capID, Principal: hash, Timestamp: now})
+		g.emitDecision(ctx, now, capID, hash, "principal_kill", "reject", ActionPrincipalKilled, "", "", "principal kill-switch active")
 		return nil, &Reject{Action: ActionPrincipalKilled, HTTPStatus: 403}
 	}
 
 	// 3. Circuit breaker (may be Unknown → fail closed).
 	if g.breaker != nil {
-		state, _, err := g.breaker.Evaluate(capID, now)
+		state, eff, err := g.breaker.Evaluate(capID, now)
 		if state == BreakerOpen || state == BreakerUnknown || err != nil {
 			action := ActionCircuitOpen
 			c := &g.counters.circuitOpen
@@ -120,15 +135,19 @@ func (g *Gate) Check(ctx context.Context, capID string, principal string) (*Admi
 			}
 			c.Add(1)
 			g.auditWrite(ctx, ProtectionEvent{Action: action, CapID: capID, Principal: hash, Timestamp: now})
+			g.emitDecision(ctx, now, capID, hash, "breaker", "reject", action,
+				strconv.Itoa(g.breaker.FailureThreshold()), strconv.Itoa(eff), state.String())
 			return nil, &Reject{Action: action, HTTPStatus: 503}
 		}
 	}
 
 	// 4. Concurrency cap (admit before consuming tokens).
 	if g.sem != nil && !g.sem.Acquire(capID) {
-		g.counters.concurrencyExceeded.Add(1)
-		g.auditWrite(ctx, ProtectionEvent{Action: ActionConcurrencyExceeded, CapID: capID, Principal: hash, Timestamp: now})
-		return nil, &Reject{Action: ActionConcurrencyExceeded, HTTPStatus: 503}
+			g.counters.concurrencyExceeded.Add(1)
+			g.auditWrite(ctx, ProtectionEvent{Action: ActionConcurrencyExceeded, CapID: capID, Principal: hash, Timestamp: now})
+			g.emitDecision(ctx, now, capID, hash, "concurrency", "reject", ActionConcurrencyExceeded,
+				strconv.Itoa(g.sem.Cap(capID)), "exhausted", "concurrency cap reached")
+			return nil, &Reject{Action: ActionConcurrencyExceeded, HTTPStatus: 503}
 	}
 
 	// 4b. Quota admission (Phase 23.2, ADR-051 erratum). Runs AFTER concurrency
@@ -153,6 +172,8 @@ func (g *Gate) Check(ctx context.Context, capID string, principal string) (*Admi
 				}
 				g.counters.quotaEvidenceUnavailable.Add(1)
 				g.auditWrite(ctx, ProtectionEvent{Action: ActionQuotaEvidenceUnavailable, CapID: capID, Principal: hash, Timestamp: now})
+				g.emitDecision(ctx, now, capID, hash, "quota", "reject", ActionQuotaEvidenceUnavailable,
+					"defined", "unavailable", "quota evidence missing/incomplete")
 				return nil, &Reject{Action: ActionQuotaEvidenceUnavailable, HTTPStatus: 503}
 			}
 			if QuotaExceeded(def, usage) {
@@ -161,6 +182,10 @@ func (g *Gate) Check(ctx context.Context, capID string, principal string) (*Admi
 				}
 				g.counters.quotaExceeded.Add(1)
 				g.auditWrite(ctx, ProtectionEvent{Action: ActionQuotaExceeded, CapID: capID, Principal: hash, Timestamp: now})
+				g.emitDecision(ctx, now, capID, hash, "quota", "reject", ActionQuotaExceeded,
+					fmt.Sprintf("rss=%d", def.RSSBytes),
+					fmt.Sprintf("rss=%d", usage.RSSBytes),
+					"quota ceiling breached")
 				return nil, &Reject{Action: ActionQuotaExceeded, HTTPStatus: 503}
 			}
 		}
@@ -173,11 +198,14 @@ func (g *Gate) Check(ctx context.Context, capID string, principal string) (*Admi
 		}
 		g.counters.rateLimited.Add(1)
 		g.auditWrite(ctx, ProtectionEvent{Action: ActionRateLimited, CapID: capID, Principal: hash, Timestamp: now})
+		g.emitDecision(ctx, now, capID, hash, "rate", "reject", ActionRateLimited,
+			strconv.Itoa(int(g.buckets.Capacity())), "exhausted", "rate bucket empty")
 		return nil, &Reject{Action: ActionRateLimited, HTTPStatus: 429}
 	}
 
 	// 6. Timeout is applied to the returned context, not checked as a gate.
 	g.counters.admitted.Add(1)
+	g.emitDecision(ctx, now, capID, hash, "admit", "admit", ActionAdmit, "", "", "admitted")
 	a := &Admission{
 		capID: capID,
 		gate:  g,
@@ -286,4 +314,39 @@ func (g *Gate) auditWrite(ctx context.Context, ev ProtectionEvent) {
 	if err := g.audit.WriteEvent(ctx, ev); err != nil {
 		g.counters.auditWriteFailed.Add(1)
 	}
+}
+
+// emitDecision records decision-time provenance (R24-1) for a single Gate
+// decision. It is a no-op when no provenance sink is configured (nil ⇒
+// behavior identical to pre-24.2). It is non-blocking and never changes the
+// decision already made (R24-4 Observation Non-Interference): only an advisory
+// observation is emitted. Latency is measured as wall-clock since Gate entry.
+func (g *Gate) emitDecision(ctx context.Context, entry time.Time, capID, hash, guard, decision, action, threshold, observed, detail string) {
+	if g.provenance == nil {
+		return
+	}
+	g.provenance.Emit(ctx, DecisionProvenance{
+		TraceID:       tracing.TraceFromContext(ctx),
+		CapabilityID:  capID,
+		PrincipalHash: hash,
+		Guard:         guard,
+		Decision:      decision,
+		Action:        action,
+		Threshold:     threshold,
+		Observed:      observed,
+		Detail:        detail,
+		LatencyMicros: g.clock().Sub(entry).Microseconds(),
+		At:            entry,
+	})
+}
+
+// ProvenanceStore returns the decision-log read projection if a provenance
+// sink implementing ProvenanceStore was configured, else nil (R24-5 Projection
+// Only: the read surface reads the projection, never treats it as a Source of
+// Truth, and never reconstructs decisions after the fact).
+func (g *Gate) ProvenanceStore() ProvenanceStore {
+	if ps, ok := g.provenance.(ProvenanceStore); ok {
+		return ps
+	}
+	return nil
 }

@@ -49,6 +49,14 @@ func NewTokenBucketSet(cfg TokenBucketConfig, clock func() time.Time) *TokenBuck
 	}
 }
 
+// Capacity returns the configured bucket capacity (read-side accessor for
+// decision-time provenance evidence, R24-1).
+func (tbs *TokenBucketSet) Capacity() float64 { return tbs.cfg.Capacity }
+
+// Refill returns the configured refill rate in tokens/second (read-side
+// accessor for decision-time provenance evidence, R24-1).
+func (tbs *TokenBucketSet) Refill() float64 { return tbs.cfg.Refill }
+
 // Take consumes a token for (capID, hash). Returns true if a token was
 // available, false if the bucket is empty. Pure arithmetic, no goroutine, no
 // blocking wait (R93 accepted: reject does not wait).

@@ -88,6 +88,12 @@ func NewBreakerSet(reader FailureEvidenceReader, cfg BreakerConfig, clock func()
 	}
 }
 
+// FailureThreshold returns the configured consecutive-failure threshold. It is
+// the read-side accessor used to record decision-time provenance evidence
+// (R24-1): the provenance log reports the threshold that informed a breaker
+// decision, but never re-evaluates the breaker.
+func (bs *BreakerSet) FailureThreshold() int { return bs.cfg.FailureThreshold }
+
 func (bs *BreakerSet) get(capID string) *circuitBreaker {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()

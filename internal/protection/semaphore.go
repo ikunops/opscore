@@ -34,6 +34,10 @@ func (ss *SemaphoreSet) SetCap(capID string, cap int) {
 	ss.mu.Unlock()
 }
 
+// Cap returns the configured concurrency cap for capID (read-side accessor for
+// decision-time provenance evidence, R24-1). It never mutates the set.
+func (ss *SemaphoreSet) Cap(capID string) int { return ss.cap(capID) }
+
 func (ss *SemaphoreSet) cap(capID string) int {
 	if c, ok := ss.caps[capID]; ok {
 		return c

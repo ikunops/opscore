@@ -90,6 +90,12 @@ type Config struct {
 	// fixed order AFTER authn+authz. Nil disables protection so test servers and
 	// minimal deployments can run ungated; Serve mode always provides a Gate.
 	Gate *protection.Gate
+	// AlertTracker holds the Phase 24.2 declarative alert state (R24-3:
+	// Alerting Declarative — the server computes + exposes only, never
+	// transports or triggers). Nil disables the /alerts read surface.
+	AlertTracker *protection.AlertTracker
+	// AlertPolicy is the declarative alert threshold config (Phase 24.2).
+	AlertPolicy protection.AlertPolicy
 	// HostStore, when set, enables the Host Registry: operations may reference
 	// a named host ("target": "web-01") instead of a full inline connection
 	// spec, and /api/hosts CRUD manages the registry. Nil disables both.
@@ -146,6 +152,10 @@ type Server struct {
 	wsHub *WSHub
 	// gate is the optional Phase 21 Operational Protection entry point.
 	gate *protection.Gate
+	// alertTracker holds the Phase 24.2 declarative alert state.
+	alertTracker *protection.AlertTracker
+	// alertPolicy is the Phase 24.2 declarative alert threshold config.
+	alertPolicy protection.AlertPolicy
 }
 
 // New builds a Server and, if configured, bootstraps the admin user.
@@ -184,6 +194,8 @@ func New(cfg Config) (*Server, error) {
 		bus:           bus,
 		wsHub:         hub,
 		gate:          cfg.Gate,
+		alertTracker:  cfg.AlertTracker,
+		alertPolicy:   cfg.AlertPolicy,
 	}
 	if cfg.BootstrapAdmin != nil {
 		if err := s.bootstrapAdmin(cfg.BootstrapAdmin); err != nil {
@@ -1583,6 +1595,14 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// Embedded Operational Protection Console SPA (Phase 22.2). ADMIN-ONLY per
 	// ADR-050 / R106=B: unauthenticated callers must not receive the shell.
 	mux.HandleFunc("GET /dashboard", s.handleDashboard)
+	// Phase 24.2 Protection Observability Hardening — read-only surfaces:
+	//   • /decisions  — decision-log projection (R24-1/R24-5), carries only the
+	//     principal hash + advisory refs (R24-7 secret boundary), with explicit
+	//     completeness/truncation signals.
+	//   • /alerts     — declarative alert state (R24-3): computed + exposed only.
+	// Both admin-only and registered ONLY here (:8082), never on :8080 (R21-1).
+	mux.HandleFunc("GET /management/v1/protection/decisions", s.handleProtectionDecisions)
+	mux.HandleFunc("GET /management/v1/protection/alerts", s.handleProtectionAlerts)
 	return mux
 }
 
