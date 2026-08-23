@@ -130,6 +130,22 @@
   .state-dot { width: 9px; height: 9px; border-radius: 50%; display:inline-block; }
   .state-ready { background: var(--ok); }
   .state-failed, .state-uninitialized { background: var(--danger); }
+
+  /* Phase 22.x — decision log, alert state, evidence integrity */
+  .prov-banner {
+    margin-top: 22px; padding: 14px 18px; border-radius: var(--radius);
+    border: 1px solid var(--card-border); background: var(--card);
+    backdrop-filter: blur(18px) saturate(150%); -webkit-backdrop-filter: blur(18px) saturate(150%);
+    font-size: 13px; display: flex; align-items: center; gap: 10px;
+  }
+  .prov-banner.ok { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  .prov-banner.warn { border-color: color-mix(in srgb, var(--danger) 50%, transparent); }
+  .prov-banner .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); flex: none; }
+  .prov-banner.warn .dot { background: var(--danger); }
+  .mono { font-variant-numeric: tabular-nums; }
+  .empty-row { color: var(--muted); font-size: 12.5px; padding: 10px 0; }
+  .firing-on { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
+  .firing-off { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
 </style>
 </head>
 <body>
@@ -165,6 +181,12 @@
   <!-- CONSOLE -->
   <section id="consoleView" class="hidden">
     <div class="grid" id="metrics"></div>
+
+    <!-- Phase 22.x — Evidence integrity banner (Phase 24 provenance completeness) -->
+    <div id="provBanner" class="prov-banner ok">
+      <span class="dot"></span>
+      <span id="provText"><span class="sub">loading provenance completeness…</span></span>
+    </div>
 
     <div class="glass panel">
       <h2>⛔ Operator kill</h2>
@@ -205,6 +227,23 @@
         <tbody></tbody>
       </table>
       <div id="quotaEmpty" class="hint">no quota definitions configured</div>
+    </div>
+
+    <!-- Phase 22.x — Protection decision log (Phase 24 read projection) -->
+    <div class="glass panel">
+      <h2>🧠 Protection decisions <span class="pill off">Phase 24</span></h2>
+      <div class="hint">Read-only projection of Gate decisions (decision-time provenance). No secrets. Provenance loss is reported honestly.</div>
+      <table id="decisionsTable" class="hidden" style="margin-top:12px;">
+        <thead><tr><th>At</th><th>Capability</th><th>Guard</th><th>Decision</th><th>Action</th><th>Latency</th><th>Detail</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="decisionsEmpty" class="empty-row">no decisions recorded yet</div>
+    </div>
+
+    <!-- Phase 22.x — Unknown-rate alert state (Phase 24 read projection) -->
+    <div class="glass panel">
+      <h2>🚨 Unknown-rate alert <span class="pill off">Phase 24</span></h2>
+      <div id="alertState"><span class="sub">loading…</span></div>
     </div>
   </section>
 </div>
@@ -320,21 +359,28 @@ async function release(cap) {
 }
 
 async function refresh() {
-  let kills, metrics, quotas;
+  let kills, metrics, quotas, decisions, alerts;
   try {
-    const [rk, rm, rq] = await Promise.all([
+    const [rk, rm, rq, rd, ra] = await Promise.all([
       api("/management/v1/protection/kills", { method: "GET" }),
       api("/management/v1/protection/metrics", { method: "GET" }),
       api("/management/v1/protection/quotas", { method: "GET" }),
+      api("/management/v1/protection/decisions", { method: "GET" }),
+      api("/management/v1/protection/alerts", { method: "GET" }),
     ]);
     if (rk.status === 401 || rm.status === 401) { leaveConsole(); toast("session expired — sign in again", "err"); return; }
     kills = await rk.json();
     metrics = await rm.json();
     quotas = await rq.json().catch(() => ({}));
+    decisions = await rd.json().catch(() => ({}));   // 401/404 -> {} -> safe empty render
+    alerts = await ra.json().catch(() => ({}));
   } catch (e) { return; }
   renderMetrics(metrics);
   renderKills(kills);
   renderQuotas(quotas);
+  renderDecisions(decisions);
+  renderAlerts(alerts);
+  renderEvidenceIntegrity(decisions);
 }
 
 function renderQuotas(q) {
@@ -398,6 +444,74 @@ function renderKills(k) {
         op.map((o) => `<tr><td><code>${esc(o.capability_id)}</code></td><td>${esc(o.operator)}</td><td>${esc(o.reason)}</td><td>${new Date(o.at).toLocaleString()}</td></tr>`).join("")
       }</tbody></table>`
     : `<span class="sub">no operator-initiated kills yet</span>`;
+}
+
+function renderDecisions(d) {
+  if (!d) return;
+  const list = d.decisions || [];
+  const tbl = $("decisionsTable");
+  const empty = $("decisionsEmpty");
+  if (!list.length) { tbl.classList.add("hidden"); empty.classList.remove("hidden"); return; }
+  empty.classList.add("hidden"); tbl.classList.remove("hidden");
+  const sorted = list.slice().sort((a, b) => (b.at || "").localeCompare(a.at || "")); // newest first
+  tbl.querySelector("tbody").innerHTML = sorted.map((x) => {
+    const decision = x.decision == null ? "—" : x.decision;
+    const action = x.action == null ? "—" : x.action;
+    const guard = esc(x.guard == null ? "—" : x.guard);
+    const cap = esc(x.capability_id == null ? "—" : x.capability_id);
+    const at = x.at ? new Date(x.at).toLocaleString() : "—";
+    const lat = x.latency_micros != null ? (x.latency_micros / 1000).toFixed(1) + " ms" : "—";
+    const detail = esc(x.detail == null ? "—" : x.detail);
+    const dcls = decision === "deny" ? "on" : "off";
+    const acls = action === "protection.admit" ? "off" : "on";
+    return `<tr>
+      <td class="mono">${at}</td>
+      <td><code>${cap}</code></td>
+      <td>${guard}</td>
+      <td><span class="pill ${dcls}">${esc(decision)}</span></td>
+      <td><span class="pill ${acls}">${esc(action)}</span></td>
+      <td class="mono">${lat}</td>
+      <td>${detail}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderAlerts(a) {
+  if (!a) return;
+  const firing = a.firing === true;
+  const since = a.since ? new Date(a.since).toLocaleString() : "—";
+  const ur = a.unknown_rate == null ? "unavailable" : a.unknown_rate; // missing -> NOT 0
+  const thr = a.threshold == null ? "—" : a.threshold;
+  const win = a.window_seconds == null ? "—" : a.window_seconds + "s";
+  $("alertState").innerHTML = `
+    <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+      <span class="pill ${firing ? "firing-on" : "firing-off"}">${firing ? "FIRING" : "stable"}</span>
+      <span class="sub">unknown-rate: <b class="mono">${ur}</b></span>
+      <span class="sub">threshold: <b class="mono">${thr}</b></span>
+      <span class="sub">window: <b class="mono">${win}</b></span>
+      ${firing ? `<span class="sub">since: <b class="mono">${since}</b></span>` : ""}
+    </div>`;
+}
+
+function renderEvidenceIntegrity(d) {
+  const banner = $("provBanner");
+  const txt = $("provText");
+  if (!d || !d.provenance_stats) {                       // missing -> unknown, NEVER "0 dropped"
+    banner.className = "prov-banner warn";
+    txt.innerHTML = `<b>Evidence completeness unknown</b> — provenance_stats not provided by server.`;
+    return;
+  }
+  const ps = d.provenance_stats;
+  const cap = ps.capacity == null ? "?" : ps.capacity;
+  const buf = ps.buffered == null ? "?" : ps.buffered;
+  const dropped = ps.dropped == null ? "?" : ps.dropped;
+  if (ps.truncated === true) {                           // overflow -> honest partial
+    banner.className = "prov-banner warn";
+    txt.innerHTML = `<b>⚠ Provenance incomplete</b> — ring buffer overflowed. capacity <span class="mono">${cap}</span>, buffered <span class="mono">${buf}</span>, <b class="mono">dropped ${dropped}</b> oldest entries. Decision log is partial.`;
+    return;
+  }
+  banner.className = "prov-banner ok";
+  txt.innerHTML = `Provenance complete — capacity <span class="mono">${cap}</span>, buffered <span class="mono">${buf}</span>, dropped <span class="mono">${dropped}</span>.`;
 }
 
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
