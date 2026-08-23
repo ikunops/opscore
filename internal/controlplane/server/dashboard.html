@@ -245,6 +245,39 @@
       <h2>🚨 Unknown-rate alert <span class="pill off">Phase 24</span></h2>
       <div id="alertState"><span class="sub">loading…</span></div>
     </div>
+
+    <!-- Phase 26 — Alert investigation (pure local projection, no new backend) -->
+    <div class="glass panel">
+      <h2>🔍 Investigate alert <span class="pill off">Phase 26</span></h2>
+      <div class="hint">
+        Read-only local projection of Gate decisions — filter <code>guard ∈ {breaker, quota} ∧ decision = reject</code>
+        within the alert window. Lists <b>observed contributors</b>; it shows correlation, never asserts a root cause.
+      </div>
+      <div id="investBanner" class="prov-banner ok" style="margin-top:14px;">
+        <span class="dot"></span>
+        <span id="investText"><span class="sub">loading…</span></span>
+      </div>
+      <div class="row" style="margin-top:16px; gap:20px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:300px;">
+          <div class="sub" style="margin-bottom:8px; font-weight:600;">Top observed capability contributors</div>
+          <table id="investCapTable" class="hidden">
+            <thead><tr><th>Capability</th><th>Observed</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div id="investCapEmpty" class="empty-row">no observed breaker/quota rejections</div>
+          <div class="hint">“→ kill form” only fills the operator kill input above — it never auto-submits a kill.</div>
+        </div>
+        <div style="flex:1; min-width:300px;">
+          <div class="sub" style="margin-bottom:8px; font-weight:600;">Top observed principal references</div>
+          <table id="investPrincipalTable" class="hidden">
+            <thead><tr><th>Principal (opaque)</th><th>Observed</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <div id="investPrincipalEmpty" class="empty-row">no principal references observed</div>
+          <div class="hint"><code>principal_hash</code> is an opaque evidence reference only — never a kill target.</div>
+        </div>
+      </div>
+    </div>
   </section>
 </div>
 
@@ -381,6 +414,7 @@ async function refresh() {
   renderDecisions(decisions);
   renderAlerts(alerts);
   renderEvidenceIntegrity(decisions);
+  renderInvestigate(decisions, alerts);
 }
 
 function renderQuotas(q) {
@@ -515,6 +549,111 @@ function renderEvidenceIntegrity(d) {
 }
 
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
+
+// Strict RFC3339 parse: invalid -> null (never silently "hit"). Returns null on parse failure
+// so callers can exclude (bad at) or skip the filter (bad since) instead of defaulting to true.
+function parseTime(s) {
+  if (!s || typeof s !== "string") return null;
+  const t = new Date(s);
+  return isNaN(t.getTime()) ? null : t;
+}
+
+// Phase 26 — pure front-end investigation projection (R26-3: no API/Gate/audit/server state).
+function renderInvestigate(d, a) {
+  const banner = $("investBanner");
+  const txt = $("investText");
+  const capTbl = $("investCapTable"), capEmpty = $("investCapEmpty");
+  const pTbl = $("investPrincipalTable"), pEmpty = $("investPrincipalEmpty");
+
+  if (!d || !Array.isArray(d.decisions)) {
+    banner.className = "prov-banner warn";
+    txt.innerHTML = `<b>Investigate unavailable</b> — decision log not provided.`;
+    capTbl.classList.add("hidden"); pTbl.classList.add("hidden");
+    capEmpty.classList.remove("hidden"); pEmpty.classList.remove("hidden");
+    return;
+  }
+
+  const alertsObj = a || {};
+  const firing = alertsObj.firing === true;
+  const sinceRaw = (alertsObj.since && typeof alertsObj.since === "string") ? alertsObj.since : "";
+  const sinceT = sinceRaw ? parseTime(sinceRaw) : null; // invalid since -> no lower bound (degrade)
+
+  // R26-1 — evidence completeness: dropped>0 or truncated => incomplete, never "Top causes".
+  const ps = d.provenance_stats;
+  let incomplete = false;
+  if (ps) {
+    if (ps.truncated === true) incomplete = true;
+    if (ps.dropped != null && ps.dropped > 0) incomplete = true;
+  }
+
+  // R26-3 / Scope filter predicate: guard ∈ {breaker,quota} ∧ decision=reject ∧ at≥since
+  const observed = (d.decisions || []).filter((x) => {
+    if (x.guard !== "breaker" && x.guard !== "quota") return false;
+    if (x.decision !== "reject") return false;
+    const atT = parseTime(x.at);
+    if (atT === null) return false;              // invalid at -> exclude from observed set
+    if (sinceT && atT < sinceT) return false;    // time window (only if since is valid)
+    return true;
+  });
+
+  // Aggregate; skip empty capability_id / principal_hash -> no fake "<empty>" contributor.
+  const byCap = new Map();
+  const byPrincipal = new Map();
+  for (const x of observed) {
+    const cap = (x.capability_id && String(x.capability_id).trim()) ? String(x.capability_id) : null;
+    const ph = (x.principal_hash && String(x.principal_hash).trim()) ? String(x.principal_hash) : null;
+    if (cap) byCap.set(cap, (byCap.get(cap) || 0) + 1);
+    if (ph) byPrincipal.set(ph, (byPrincipal.get(ph) || 0) + 1);
+  }
+  const topCaps = [...byCap.entries()].sort((p, q) => q[1] - p[1]).slice(0, 5);
+  const topPrincipals = [...byPrincipal.entries()].sort((p, q) => q[1] - p[1]).slice(0, 5);
+
+  // Banner — honest observed-correlation wording, no causality claim.
+  const sinceLabel = sinceRaw
+    ? (sinceT ? new Date(sinceRaw).toLocaleString() : "(unparseable since — ignored)")
+    : "all time (no lower bound)";
+  banner.className = "prov-banner " + (incomplete ? "warn" : "ok");
+  let head = firing
+    ? `<b>Alert firing</b> — `
+    : `<b>Alert not firing</b> — `;
+  head += `observed <b class="mono">${observed.length}</b> breaker/quota rejection(s) since <b class="mono">${esc(sinceLabel)}</b>.`;
+  if (incomplete) {
+    const dropped = ps.dropped == null ? "?" : ps.dropped;
+    head += ` <span style="color:var(--danger);">Evidence incomplete — provenance overflowed (dropped <b class="mono">${dropped}</b>). Counts are partial, not full history.</span>`;
+  }
+  head += ` These are <b>observed correlations</b>, not root causes.`;
+  txt.innerHTML = head;
+
+  // Capability contributors (opaque-to-kill: only fills the existing kill input).
+  if (!topCaps.length) { capTbl.classList.add("hidden"); capEmpty.classList.remove("hidden"); }
+  else {
+    capEmpty.classList.add("hidden"); capTbl.classList.remove("hidden");
+    capTbl.querySelector("tbody").innerHTML = topCaps.map(([cap, n]) => `
+      <tr>
+        <td><code>${esc(cap)}</code></td>
+        <td class="mono">${n}</td>
+        <td><button class="ghost-btn" onclick="investFillKill('${esc(cap)}')">→ kill form</button></td>
+      </tr>`).join("");
+  }
+
+  // Principal references — opaque only, NO kill action (R26-2).
+  if (!topPrincipals.length) { pTbl.classList.add("hidden"); pEmpty.classList.remove("hidden"); }
+  else {
+    pEmpty.classList.add("hidden"); pTbl.classList.remove("hidden");
+    pTbl.querySelector("tbody").innerHTML = topPrincipals.map(([ph, n]) => `
+      <tr>
+        <td><code title="opaque evidence reference">${esc(ph)}</code></td>
+        <td class="mono">${n}</td>
+      </tr>`).join("");
+  }
+}
+
+// R26-2 — fills (does NOT submit) the operator kill input; only capability_id is a valid kill target.
+function investFillKill(cap) {
+  $("capInput").value = cap;
+  toast("capability filled into kill form — operator must confirm", "ok");
+  $("capInput").focus();
+}
 
 // On load, probe whether we already have a session cookie.
 (async function init() {
