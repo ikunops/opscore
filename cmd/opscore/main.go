@@ -39,6 +39,38 @@ import (
 	"github.com/YuDong999/opscore/internal/storage/sqlite"
 )
 
+// validateBootstrapAdminPassword reports whether the supplied bootstrap admin
+// credentials satisfy the admission policy for non-demo + persistent deployments.
+// reason is one of the policy-category constants below and is NEVER the credential
+// itself (no leak of password / partial / hash / secret). When gateApplies is false
+// (demo or memory mode) the policy is exempt and the function returns ok=true.
+//
+// Phase 27 (P1-1): the default bootstrap password is well-known (admin / change-me),
+// so any real deployment must supply a non-default, reasonably long password.
+// Length >= 12 is a HARD FIRST BARRIER only — it is NOT a credential-strength
+// guarantee (no dictionary / entropy / HIBP / blacklist logic in Phase 27).
+func validateBootstrapAdminPassword(user, pass string, gateApplies bool) (ok bool, reason string) {
+	if !gateApplies {
+		return true, ""
+	}
+	norm := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+	if norm(pass) == "" {
+		return false, "empty"
+	}
+	for _, k := range []string{"admin", "change-me", "change-me-in-prod"} {
+		if norm(pass) == norm(k) {
+			return false, "known-default"
+		}
+	}
+	if norm(pass) == norm(user) {
+		return false, "username-equals"
+	}
+	if len(pass) < 12 {
+		return false, "too-short"
+	}
+	return true, ""
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		printUsage()
@@ -403,6 +435,20 @@ func cmdServe(args []string) {
 	const defaultJWTSecret = "change-me-in-prod"
 	if *jwtSecret == defaultJWTSecret && !*demoMode && *storageKind != "memory" {
 		logger.Error("refusing to start: --jwt-secret is still the insecure default; set a strong secret for non-demo / non-memory deployments")
+		os.Exit(1)
+	}
+
+	// Security gate (P1-1): the default bootstrap admin password is well-known
+	// (admin / change-me). Refuse to start in any non-trivial mode (persistent
+	// storage or non-demo) until a non-default, reasonably long password is
+	// supplied. Demo + memory (local debugging) is exempt — same exemption
+	// semantics as the JWT secret gate above. Length >= 12 is a HARD FIRST
+	// BARRIER only; it is NOT a credential-strength guarantee (Phase 27).
+	adminOk, adminReason := validateBootstrapAdminPassword(*adminUser, *adminPass, !*demoMode && *storageKind != "memory")
+	if !adminOk {
+		// reason is a policy-category constant (empty|known-default|username-equals|
+		// too-short) — never the credential itself. No secret leakage.
+		logger.Error("refusing to start: --admin-pass does not meet policy; persistent non-demo deployments require a non-default password of at least 12 characters", "reason", adminReason)
 		os.Exit(1)
 	}
 
