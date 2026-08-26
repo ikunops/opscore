@@ -1,8 +1,12 @@
 package server
 
 import (
+	"encoding/csv"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/YuDong999/opscore/internal/protection"
@@ -119,4 +123,127 @@ func (s *Server) handleProtectionAlerts(w http.ResponseWriter, r *http.Request) 
 		"threshold":      st.Threshold,
 		"window_seconds": int64(s.alertPolicy.Window.Seconds()),
 	})
+}
+
+// handleProtectionDecisionsExport (Phase 28) exposes a STATIC RETENTION SNAPSHOT
+// of the provenance store for audit export. It is the SAME read projection as
+// /decisions, extended to return the FULL buffered buffer (Recent(capacity),
+// not the default limit=100) and to serialize it as JSON or CSV.
+//
+// Honesty boundary (R24-7 / R127-fix-1): the export is a CURRENT RETENTION
+// SNAPSHOT of the bounded in-memory ring — NOT a complete forensic history.
+// The envelope therefore carries export_completeness = "current-retention-snapshot"
+// plus the raw capacity/buffered/dropped/truncated from store.Stats() unchanged.
+//
+// Completeness is never recomputed (R127-fix-2 / I3): an export omission is NOT
+// a new provenance loss. CSV trailing '#' lines are export-format metadata
+// (R127-fix-3 / I4), not data rows; consumers may ignore them.
+//
+// Surface/freeze (R127 / I5): registered ONLY on :8082 — never :8080, never
+// external/v1, no frozen packages, no go.mod change. Projection only (I6):
+// ProvenanceStore -> serialization -> JSON/CSV; no Gate re-evaluation, no Audit.
+func (s *Server) handleProtectionDecisionsExport(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.gate == nil {
+		writeError(w, http.StatusNotFound, "protection not enabled")
+		return
+	}
+	store := s.gate.ProvenanceStore()
+	if store == nil {
+		writeError(w, http.StatusNotFound, "provenance not enabled")
+		return
+	}
+
+	// Full retention snapshot: Recent(capacity) returns ALL buffered records.
+	stats := store.Stats()
+	recs := store.Recent(stats.Capacity)
+
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if format == "" {
+		format = "json"
+	}
+	switch format {
+	case "json":
+		s.writeDecisionsExportJSON(w, recs, stats)
+	case "csv":
+		s.writeDecisionsExportCSV(w, recs, stats)
+	default:
+		writeError(w, http.StatusBadRequest, "unsupported format (use json|csv)")
+	}
+}
+
+func (s *Server) writeDecisionsExportJSON(w http.ResponseWriter, recs []protection.DecisionProvenance, stats protection.ProvenanceStats) {
+	out := make([]map[string]any, 0, len(recs))
+	for _, p := range recs {
+		out = append(out, map[string]any{
+			"trace_id":       p.TraceID,
+			"capability_id":  p.CapabilityID,
+			"principal_hash": p.PrincipalHash,
+			"guard":          p.Guard,
+			"decision":       p.Decision,
+			"action":         p.Action,
+			"threshold":      p.Threshold,
+			"observed":       p.Observed,
+			"detail":         p.Detail,
+			"latency_micros": p.LatencyMicros,
+			"at":             p.At,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"schema":              "provenance/export/v1",
+		"exported_at":         time.Now().UTC().Format(time.RFC3339),
+		"export_completeness": "current-retention-snapshot",
+		"decisions":           out,
+		"provenance_stats": map[string]any{
+			"capacity":  stats.Capacity,
+			"buffered":  stats.Buffered,
+			"dropped":   stats.Dropped,
+			"truncated": stats.Truncated,
+		},
+	})
+}
+
+func (s *Server) writeDecisionsExportCSV(w http.ResponseWriter, recs []protection.DecisionProvenance, stats protection.ProvenanceStats) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=decisions-export-%s.csv", time.Now().UTC().Format("20060102T150405Z")))
+	w.WriteHeader(http.StatusOK)
+
+	cw := csv.NewWriter(w)
+	cw.Write([]string{"trace_id", "capability_id", "principal_hash", "guard", "decision", "action", "threshold", "observed", "detail", "latency_micros", "at"})
+	for _, p := range recs {
+		cw.Write([]string{
+			p.TraceID,
+			p.CapabilityID,
+			p.PrincipalHash,
+			p.Guard,
+			p.Decision,
+			p.Action,
+			p.Threshold,
+			p.Observed,
+			p.Detail,
+			strconv.FormatInt(p.LatencyMicros, 10),
+			p.At.Format(time.RFC3339),
+		})
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		return // headers already sent; nothing safe to do
+	}
+	// Machine-readable metadata (R127-fix-3 / I4): leading '#' lines are
+	// export-format metadata, NOT data rows; consumers may ignore them.
+	io.WriteString(w, "# schema=provenance/export/v1\n")
+	io.WriteString(w, fmt.Sprintf("# exported_at=%s\n", time.Now().UTC().Format(time.RFC3339)))
+	io.WriteString(w, "# export_completeness=current-retention-snapshot\n")
+	io.WriteString(w, fmt.Sprintf("# capacity=%d\n", stats.Capacity))
+	io.WriteString(w, fmt.Sprintf("# buffered=%d\n", stats.Buffered))
+	io.WriteString(w, fmt.Sprintf("# dropped=%d\n", stats.Dropped))
+	io.WriteString(w, fmt.Sprintf("# truncated=%v\n", stats.Truncated))
 }

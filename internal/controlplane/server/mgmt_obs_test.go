@@ -191,3 +191,125 @@ func TestProtectionObs_Alerts_Unauthenticated_401(t *testing.T) {
 		t.Fatalf("alerts unauth: want 401 got %d (body=%q)", w.Code, w.Body.String())
 	}
 }
+
+// --- /decisions/export (Phase 28) -----------------------------------------
+
+func TestProtectionObs_Export_Admin200_JSON(t *testing.T) {
+	srv, token, sink := newObsTestServer(t, true)
+	sink.Emit(context.Background(), protection.DecisionProvenance{
+		TraceID: "trace-1", CapabilityID: "cap-x", PrincipalHash: "hash-y",
+		Guard: "breaker", Decision: "reject", Action: protection.ActionBreakerUnknown,
+		Threshold: "3", Observed: "5", Detail: "open", At: time.Now(),
+	})
+	h := srv.ProtectionReadMux()
+	w := doReq(h, http.MethodGet, "/management/v1/protection/decisions/export?format=json", token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("export json admin: want 200 got %d (body=%q)", w.Code, w.Body.String())
+	}
+	var body struct {
+		Schema             string           `json:"schema"`
+		ExportedAt         string           `json:"exported_at"`
+		ExportCompleteness string           `json:"export_completeness"`
+		Decisions          []map[string]any `json:"decisions"`
+		ProvenanceStats    map[string]any   `json:"provenance_stats"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode export json: %v (body=%q)", err, w.Body.String())
+	}
+	if body.Schema != "provenance/export/v1" {
+		t.Fatalf("schema want provenance/export/v1 got %q", body.Schema)
+	}
+	if body.ExportCompleteness != "current-retention-snapshot" {
+		t.Fatalf("completeness want current-retention-snapshot got %q", body.ExportCompleteness)
+	}
+	if body.ExportedAt == "" {
+		t.Fatal("exported_at must be set")
+	}
+	if len(body.Decisions) != 1 {
+		t.Fatalf("want 1 decision got %d", len(body.Decisions))
+	}
+	if body.Decisions[0]["capability_id"] != "cap-x" {
+		t.Fatalf("unexpected decision: %+v", body.Decisions[0])
+	}
+	if body.ProvenanceStats["capacity"] != float64(4096) {
+		t.Fatalf("capacity want 4096 got %v", body.ProvenanceStats["capacity"])
+	}
+}
+
+func TestProtectionObs_Export_Admin200_CSV(t *testing.T) {
+	srv, token, sink := newObsTestServer(t, true)
+	sink.Emit(context.Background(), protection.DecisionProvenance{
+		TraceID: "trace-1", CapabilityID: "cap-x", PrincipalHash: "hash-y",
+		Guard: "breaker", Decision: "reject", Action: protection.ActionBreakerUnknown,
+		Threshold: "3", Observed: "5", Detail: "open", LatencyMicros: 1234, At: time.Now(),
+	})
+	h := srv.ProtectionReadMux()
+	w := doReq(h, http.MethodGet, "/management/v1/protection/decisions/export?format=csv", token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("export csv admin: want 200 got %d (body=%q)", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/csv") {
+		t.Fatalf("Content-Type want text/csv got %q", ct)
+	}
+	if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, "attachment") {
+		t.Fatalf("Content-Disposition want attachment got %q", cd)
+	}
+	body := w.Body.String()
+	lines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+	if len(lines) < 3 { // header + >=1 data + >=1 metadata
+		t.Fatalf("csv too short: %q", body)
+	}
+	if !strings.HasPrefix(lines[0], "trace_id,capability_id,principal_hash,guard,decision,action,threshold,observed,detail,latency_micros,at") {
+		t.Fatalf("csv header mismatch: %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "cap-x") {
+		t.Fatalf("csv data row missing capability: %q", lines[1])
+	}
+	if !strings.Contains(body, "# schema=provenance/export/v1") {
+		t.Fatalf("csv missing metadata schema line: %q", body)
+	}
+	if !strings.Contains(body, "# export_completeness=current-retention-snapshot") {
+		t.Fatalf("csv missing completeness metadata: %q", body)
+	}
+	if !strings.Contains(body, "# capacity=4096") {
+		t.Fatalf("csv missing capacity metadata: %q", body)
+	}
+}
+
+func TestProtectionObs_Export_GateNil_404(t *testing.T) {
+	srv, token, _ := newObsTestServer(t, false)
+	h := srv.ProtectionReadMux()
+	w := doReq(h, http.MethodGet, "/management/v1/protection/decisions/export", token)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("gate==nil export: want 404 got %d (body=%q)", w.Code, w.Body.String())
+	}
+}
+
+func TestProtectionObs_Export_Unauthenticated_401(t *testing.T) {
+	srv, _, _ := newObsTestServer(t, true)
+	h := srv.ProtectionReadMux()
+	w := doReq(h, http.MethodGet, "/management/v1/protection/decisions/export", "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("export unauth: want 401 got %d (body=%q)", w.Code, w.Body.String())
+	}
+}
+
+func TestProtectionObs_Export_UnknownFormat_400(t *testing.T) {
+	srv, token, _ := newObsTestServer(t, true)
+	h := srv.ProtectionReadMux()
+	w := doReq(h, http.MethodGet, "/management/v1/protection/decisions/export?format=xml", token)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("export bad format: want 400 got %d (body=%q)", w.Code, w.Body.String())
+	}
+}
+
+// Export must stay on :8082 only (I5 / R21-1 / R127): the execution mux (:8080)
+// must NOT serve the export route.
+func TestProtectionObs_Export_NotOnExecutionMux(t *testing.T) {
+	srv, token, _ := newObsTestServer(t, true)
+	exec := srv.Handler()
+	w := doReq(exec, http.MethodGet, "/management/v1/protection/decisions/export", token)
+	if strings.Contains(w.Body.String(), "provenance/export/v1") {
+		t.Fatalf(":8080 leaked export handler; route must stay on :8082 only")
+	}
+}

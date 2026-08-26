@@ -233,6 +233,10 @@
     <div class="glass panel">
       <h2>🧠 Protection decisions <span class="pill off">Phase 24</span></h2>
       <div class="hint">Read-only projection of Gate decisions (decision-time provenance). No secrets. Provenance loss is reported honestly.</div>
+      <div class="row" style="margin-top:12px; gap:12px;">
+        <button class="magnetic" id="exportBtn">⬇ Export retained decisions (CSV)</button>
+        <span class="hint" style="margin:0;">Static retention snapshot — current buffered buffer, not full history.</span>
+      </div>
       <table id="decisionsTable" class="hidden" style="margin-top:12px;">
         <thead><tr><th>At</th><th>Capability</th><th>Guard</th><th>Decision</th><th>Action</th><th>Latency</th><th>Detail</th></tr></thead>
         <tbody></tbody>
@@ -381,6 +385,25 @@ $("killBtn").onclick = async () => {
   } else {
     toast(j.error || "kill failed", "err");
   }
+};
+
+// Phase 28 — Export retained decisions (CSV). Static retention snapshot only;
+// reuses the existing auth cookie. Does NOT mutate any server state.
+$("exportBtn").onclick = async () => {
+  try {
+    const r = await fetch("/management/v1/protection/decisions/export?format=csv", {
+      method: "GET", credentials: "same-origin",
+    });
+    if (r.status === 401) { leaveConsole(); toast("session expired — sign in again", "err"); return; }
+    if (!r.ok) { toast("export failed (" + r.status + ")", "err"); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "decisions-export.csv";
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    toast("export downloaded (retained snapshot)", "ok");
+  } catch (e) { toast("export failed", "err"); }
 };
 
 async function release(cap) {
