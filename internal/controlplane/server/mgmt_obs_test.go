@@ -192,6 +192,90 @@ func TestProtectionObs_Alerts_Unauthenticated_401(t *testing.T) {
 	}
 }
 
+// --- /alerts/history (Phase 29) -------------------------------------------
+
+// TestProtectionObs_AlertsHistory_Admin200 drives two genuine edges into the
+// tracker and proves the read-only projection exposes them NEWEST-FIRST with
+// honest completeness (P29-M1/M2/S1/S2).
+func TestProtectionObs_AlertsHistory_Admin200(t *testing.T) {
+	srv, token, _ := newObsTestServer(t, true)
+	// Drive edges into the tracker (mirrors the background ticker).
+	srv.alertTracker.Observe(protection.AlertCondition{Firing: true, UnknownRate: 70, Threshold: 50, Window: time.Minute}, time.Now())
+	srv.alertTracker.Observe(protection.AlertCondition{Firing: false, UnknownRate: 0, Threshold: 50, Window: time.Minute}, time.Now().Add(time.Second))
+	h := srv.ProtectionReadMux()
+	w := doReq(h, http.MethodGet, "/management/v1/protection/alerts/history", token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("alerts/history admin: want 200 got %d (body=%q)", w.Code, w.Body.String())
+	}
+	var body struct {
+		Transitions []struct {
+			At          string `json:"at"`
+			From        bool   `json:"from"`
+			To          bool   `json:"to"`
+			Kind        string `json:"kind"`
+			UnknownRate int64  `json:"unknown_rate"`
+			Threshold   int64  `json:"threshold"`
+		} `json:"transitions"`
+		HistoryStats map[string]any `json:"history_stats"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode alerts/history: %v (body=%q)", err, w.Body.String())
+	}
+	if len(body.Transitions) != 2 {
+		t.Fatalf("want 2 transitions, got %d: %s", len(body.Transitions), w.Body.String())
+	}
+	// P29-S2: NEWEST-FIRST — the CLEAR edge (last observed) is at [0].
+	if body.Transitions[0].Kind != "CLEAR" || body.Transitions[1].Kind != "FIRING" {
+		t.Fatalf("P29-S2: expected [CLEAR, FIRING] newest-first, got %q/%q",
+			body.Transitions[0].Kind, body.Transitions[1].Kind)
+	}
+	// P29-S1: At is RFC3339 observation time.
+	if _, err := time.Parse(time.RFC3339, body.Transitions[0].At); err != nil {
+		t.Fatalf("P29-S1: At must be RFC3339, got %q", body.Transitions[0].At)
+	}
+	// P29-M1: full ring, no overflow -> truncated=false; capacity exposed.
+	hs := body.HistoryStats
+	if hs["truncated"] != false {
+		t.Fatalf("P29-M1: no overflow must be truncated=false, got %v", hs["truncated"])
+	}
+	if hs["capacity"] == nil || hs["retained"] == nil || hs["dropped"] == nil {
+		t.Fatalf("P29-M1: history_stats must expose capacity/retained/dropped, got %+v", hs)
+	}
+}
+
+func TestProtectionObs_AlertsHistory_GateNil_404(t *testing.T) {
+	srv, token, _ := newObsTestServer(t, false)
+	h := srv.ProtectionReadMux()
+	w := doReq(h, http.MethodGet, "/management/v1/protection/alerts/history", token)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("gate==nil alerts/history: want 404 got %d (body=%q)", w.Code, w.Body.String())
+	}
+}
+
+func TestProtectionObs_AlertsHistory_Unauthenticated_401(t *testing.T) {
+	srv, _, _ := newObsTestServer(t, true)
+	h := srv.ProtectionReadMux()
+	w := doReq(h, http.MethodGet, "/management/v1/protection/alerts/history", "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("alerts/history unauth: want 401 got %d (body=%q)", w.Code, w.Body.String())
+	}
+}
+
+// TestProtectionObs_AlertsHistory_NotOnExecutionMux locks I1: the transition
+// history read surface must live ONLY on :8082, never on the :8080 execution
+// mux (R21-1).
+func TestProtectionObs_AlertsHistory_NotOnExecutionMux(t *testing.T) {
+	srv, token, _ := newObsTestServer(t, true)
+	exec := srv.Handler()
+	w := doReq(exec, http.MethodGet, "/management/v1/protection/alerts/history", token)
+	if strings.Contains(w.Body.String(), "transitions") {
+		t.Fatalf(":8080 leaked alerts/history handler (returned JSON); route must stay on :8082 only")
+	}
+	if !strings.Contains(w.Body.String(), "<!doctype") {
+		t.Fatalf(":8080 expected console SPA fallback; body=%q", w.Body.String())
+	}
+}
+
 // --- /decisions/export (Phase 28) -----------------------------------------
 
 func TestProtectionObs_Export_Admin200_JSON(t *testing.T) {

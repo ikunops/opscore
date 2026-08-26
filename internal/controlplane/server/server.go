@@ -1603,6 +1603,11 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// Both admin-only and registered ONLY here (:8082), never on :8080 (R21-1).
 	mux.HandleFunc("GET /management/v1/protection/decisions", s.handleProtectionDecisions)
 	mux.HandleFunc("GET /management/v1/protection/alerts", s.handleProtectionAlerts)
+	// Phase 29 Alert Firing/Transition History — READ-ONLY projection of the
+	// AlertTracker transition ring (R24-5 Projection Only; never re-evaluates,
+	// never triggers, never writes Audit). Reuses /alerts auth + 404 envelope.
+	// Registered ONLY here (:8082), never :8080 / external-v1 (R21-1 / P29).
+	mux.HandleFunc("GET /management/v1/protection/alerts/history", s.handleProtectionAlertsHistory)
 	// Phase 28 Trace Retention/Export — STATIC RETENTION SNAPSHOT of the
 	// provenance store for audit export. Same read projection as /decisions,
 	// extended to the FULL buffered buffer and serialized as JSON/CSV.

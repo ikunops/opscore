@@ -248,6 +248,9 @@
     <div class="glass panel">
       <h2>🚨 Unknown-rate alert <span class="pill off">Phase 24</span></h2>
       <div id="alertState"><span class="sub">loading…</span></div>
+      <!-- Phase 29 — Recent alert transitions (read-only edge log) -->
+      <div class="hint" style="margin-top:14px;">Recent alert transitions <span class="sub">(observation-time edge log, memory-only)</span>:</div>
+      <div id="recentTransitions"><span class="sub">loading…</span></div>
     </div>
 
     <!-- Phase 26 — Alert investigation (pure local projection, no new backend) -->
@@ -417,12 +420,13 @@ async function release(cap) {
 async function refresh() {
   let kills, metrics, quotas, decisions, alerts;
   try {
-    const [rk, rm, rq, rd, ra] = await Promise.all([
+    const [rk, rm, rq, rd, ra, rh] = await Promise.all([
       api("/management/v1/protection/kills", { method: "GET" }),
       api("/management/v1/protection/metrics", { method: "GET" }),
       api("/management/v1/protection/quotas", { method: "GET" }),
       api("/management/v1/protection/decisions", { method: "GET" }),
       api("/management/v1/protection/alerts", { method: "GET" }),
+      api("/management/v1/protection/alerts/history", { method: "GET" }),
     ]);
     if (rk.status === 401 || rm.status === 401) { leaveConsole(); toast("session expired — sign in again", "err"); return; }
     kills = await rk.json();
@@ -430,6 +434,7 @@ async function refresh() {
     quotas = await rq.json().catch(() => ({}));
     decisions = await rd.json().catch(() => ({}));   // 401/404 -> {} -> safe empty render
     alerts = await ra.json().catch(() => ({}));
+    history = await rh.json().catch(() => ({}));      // 401/404 -> {} -> safe empty render
   } catch (e) { return; }
   renderMetrics(metrics);
   renderKills(kills);
@@ -438,6 +443,7 @@ async function refresh() {
   renderAlerts(alerts);
   renderEvidenceIntegrity(decisions);
   renderInvestigate(decisions, alerts);
+  renderAlertTransitions(history);
 }
 
 function renderQuotas(q) {
@@ -548,6 +554,45 @@ function renderAlerts(a) {
       <span class="sub">window: <b class="mono">${win}</b></span>
       ${firing ? `<span class="sub">since: <b class="mono">${since}</b></span>` : ""}
     </div>`;
+}
+
+function renderAlertTransitions(h) {
+  const box = $("recentTransitions");
+  if (!h || !Array.isArray(h.transitions)) {
+    box.innerHTML = '<span class="sub">no transitions recorded yet</span>';
+    return;
+  }
+  const txns = h.transitions;                 // NEWEST-FIRST (P29-S2); take the most recent N
+  const N = 10;
+  const recent = txns.slice(0, N);
+  const hs = h.history_stats || {};
+  if (recent.length === 0) {
+    box.innerHTML = '<span class="sub">no alert transitions observed yet</span>';
+    return;
+  }
+  // Honest retention banner (P29-M1 / R24-7): truncated ONLY when overflow dropped records.
+  let banner = "";
+  if (hs.truncated === true) {
+    const dropped = hs.dropped == null ? "?" : hs.dropped;
+    const retained = hs.retained == null ? "?" : hs.retained;
+    const cap = hs.capacity == null ? "?" : hs.capacity;
+    banner = `<div class="prov-banner warn" style="margin-bottom:12px;"><span class="dot"></span><span><b>Transition history incomplete</b> — ${dropped} record(s) dropped (retained ${retained}/${cap}).</span></div>`;
+  } else if (hs.retained === hs.capacity && hs.dropped === 0) {
+    banner = `<div class="prov-banner ok" style="margin-bottom:12px;"><span class="dot"></span><span>${hs.retained} retained, no overflow — window full but no history dropped.</span></div>`;
+  }
+  const rows = recent.map((t) => {
+    const cls = t.kind === "FIRING" ? "firing-on" : "firing-off";
+    const when = t.at ? new Date(t.at).toLocaleString() : "—";
+    const ur = t.unknown_rate == null ? "—" : String(t.unknown_rate);
+    const thr = t.threshold == null ? "—" : String(t.threshold);
+    return `<div style="display:flex; align-items:center; gap:10px; padding:5px 0; border-bottom:1px solid rgba(255,255,255,.05);">
+        <span class="pill ${cls}">${esc(t.kind)}</span>
+        <span class="mono sub">${esc(when)}</span>
+        <span class="sub">unknown-rate <b>${esc(ur)}</b> / threshold <b>${esc(thr)}</b></span>
+      </div>`;
+  }).join("");
+  const more = txns.length > N ? `<div class="hint" style="margin-top:8px;">showing ${N} of ${txns.length} retained transitions</div>` : "";
+  box.innerHTML = banner + rows + more;
 }
 
 function renderEvidenceIntegrity(d) {

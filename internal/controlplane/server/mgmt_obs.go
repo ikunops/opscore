@@ -125,6 +125,63 @@ func (s *Server) handleProtectionAlerts(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// handleProtectionAlertsHistory (Phase 29) exposes the bounded alert-transition
+// ring as a READ-ONLY projection (R24-5). It reuses the EXACT auth + 404 envelope
+// of /alerts: it never re-evaluates the alert, never triggers anything, and never
+// becomes a Source of Truth. Truncated follows P29-M1 (true ONLY when overflow
+// dropped records: dropped>0), never merely because the ring reached capacity.
+func (s *Server) handleProtectionAlertsHistory(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.gate == nil || s.alertTracker == nil {
+		writeError(w, http.StatusNotFound, "protection not enabled")
+		return
+	}
+
+	txns := s.alertTracker.Transitions() // copy (P29-I6), NEWEST-FIRST (P29-S2)
+	out := make([]map[string]any, 0, len(txns))
+	for _, t := range txns {
+		out = append(out, map[string]any{
+			"at":            t.At.Format(time.RFC3339), // observation time (P29-S1)
+			"from":          t.From,
+			"to":            t.To,
+			"kind":          transitionKind(t.From, t.To), // "FIRING" | "CLEAR"
+			"unknown_rate":  t.UnknownRate,
+			"threshold":     t.Threshold,
+		})
+	}
+	hs := s.alertTracker.HistoryStats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"transitions": out,
+		"history_stats": map[string]any{
+			"capacity":  hs.Capacity,
+			"retained":  hs.Retained,
+			"dropped":   hs.Dropped,
+			"truncated": hs.Truncated, // P29-M1
+		},
+	})
+}
+
+// transitionKind maps an edge (from,to) to its semantic label. Only the two
+// genuine edges are named; anything else falls back to "unknown" (defensive —
+// the ring should never hold a non-edge, but the API stays self-describing).
+func transitionKind(from, to bool) string {
+	if !from && to {
+		return "FIRING"
+	}
+	if from && !to {
+		return "CLEAR"
+	}
+	return "unknown"
+}
+
 // handleProtectionDecisionsExport (Phase 28) exposes a STATIC RETENTION SNAPSHOT
 // of the provenance store for audit export. It is the SAME read projection as
 // /decisions, extended to return the FULL buffered buffer (Recent(capacity),
