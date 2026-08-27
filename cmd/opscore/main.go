@@ -244,7 +244,7 @@ type protectionBundle struct {
 // breaker/rate/timeout are backend-agnostic. The provenance sink is bounded and
 // non-blocking (R24-4/R24-7); the rate history + alert tracker are off-path
 // read projections (R24-5 Projection Only, never a Source of Truth).
-func buildProtectionGate(stor storage.Storage, logger *slog.Logger) protectionBundle {
+func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPath string) protectionBundle {
 	var killPersist protection.KillPersistence
 	if s, ok := stor.(*sqlite.SQLiteStorage); ok {
 		killPersist = sqlite.NewProtectionStore(s.DB())
@@ -278,7 +278,22 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger) protectionBu
 	// Phase 24.2 observability projections.
 	sink := protection.NewRecordingProvenanceSink(4096) // bounded, non-blocking
 	rateHistory := protection.NewRateHistory(time.Minute, 120)
-	alertTracker := protection.NewAlertTracker()
+	// Phase 30: durable, cross-restart alert-transition retention. The store is
+	// attached only when a path is provided (non-memory storage); a failure to
+	// open the store degrades to in-memory (no retention) rather than crashing
+	// the control plane (best-effort durability, P30-I6).
+	var alertTracker *protection.AlertTracker
+	if transitionPath != "" {
+		ts, err := server.NewFileBackedTransitionStore(transitionPath)
+		if err != nil {
+			logger.Warn("alert transition persistence unavailable — falling back to in-memory (no cross-restart retention)", "err", err, "path", transitionPath)
+			alertTracker = protection.NewAlertTracker()
+		} else {
+			alertTracker = protection.NewAlertTrackerWithStore(ts)
+		}
+	} else {
+		alertTracker = protection.NewAlertTracker()
+	}
 	alertPolicy := protection.DefaultAlertPolicy()
 
 	gate := protection.New(protection.Config{
@@ -530,7 +545,13 @@ func cmdServe(args []string) {
 		}
 		logger.Info("default SSH target configured", "host", *tHost, "port", *tPort, "user", *tUser, "insecure", *tInsecure)
 	}
-	bundle := buildProtectionGate(stor, logger)
+	// Phase 30: persist alert-transition history only when storage is durable
+	// (non-memory). The sibling JSONL file lives next to the sqlite DB.
+	transitionPath := ""
+	if *storageKind != "memory" {
+		transitionPath = *dbPath + ".alert-transitions.jsonl"
+	}
+	bundle := buildProtectionGate(stor, logger, transitionPath)
 	srv, err := server.New(server.Config{
 		Storage:        stor,
 		Dispatcher:     dispatcher,

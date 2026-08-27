@@ -1,6 +1,8 @@
 package protection
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -168,3 +170,126 @@ func TestAlertTracker_HistoryStats_TruncatedOnOverflow(t *testing.T) {
 		t.Fatalf("transitions length must remain capped at capacity, got %d", len(tr.Transitions()))
 	}
 }
+
+// ---- Phase 30: durable, cross-restart retention --------------------------
+
+// fakeStore is a test double for AlertTransitionStore. It returns a preset Load
+// result and records Append calls so tests can assert persistence behavior
+// without touching the filesystem.
+type fakeStore struct {
+	loadResult TransitionLoadResult
+	appended   []AlertTransition
+}
+
+func (f *fakeStore) Append(ctx context.Context, t AlertTransition) error {
+	f.appended = append(f.appended, t)
+	return nil
+}
+func (f *fakeStore) Load(ctx context.Context) TransitionLoadResult { return f.loadResult }
+func (f *fakeStore) Close() error                                 { return nil }
+
+// TestAlertTracker_P30_RestartReconstruction (T1) proves P30-I7: after a clean
+// non-empty Load, current firing reconstructs from the last transition's To, and
+// the runtime ring is seeded with the MOST RECENT transitions (not replayed, so
+// Dropped stays 0).
+func TestAlertTracker_P30_RestartReconstruction(t *testing.T) {
+	store := &fakeStore{loadResult: TransitionLoadResult{
+		Transitions: []AlertTransition{
+			{At: time.Now(), From: false, To: true, UnknownRate: 70, Threshold: 50}, // FIRING
+			{At: time.Now(), From: true, To: false, UnknownRate: 0, Threshold: 50},  // CLEAR
+		},
+	}}
+	tr := NewAlertTrackerWithStore(store)
+
+	// P30-I7: firing reconstructs from last.To (false).
+	if tr.State().Firing {
+		t.Fatal("firing must reconstruct from last transition To=false")
+	}
+	// Ring seeded with both; newest-first: [CLEAR, FIRING].
+	txns := tr.Transitions()
+	if len(txns) != 2 {
+		t.Fatalf("want 2 seeded transitions, got %d", len(txns))
+	}
+	if txns[0].From != true || txns[0].To != false {
+		t.Fatalf("newest must be CLEAR (true->false), got %+v", txns[0])
+	}
+	if txns[1].From != false || txns[1].To != true {
+		t.Fatalf("oldest must be FIRING (false->true), got %+v", txns[1])
+	}
+	hs := tr.HistoryStats()
+	if !hs.Available {
+		t.Fatal("Available must be true after clean load")
+	}
+	if hs.LoadError {
+		t.Fatal("LoadError must be false after clean load")
+	}
+	if hs.Dropped != 0 {
+		t.Fatalf("seeding must NOT inflate Dropped, got %d", hs.Dropped)
+	}
+	// A new rising edge persists exactly one transition.
+	tr.Observe(AlertCondition{Firing: true, UnknownRate: 80, Threshold: 50, Window: time.Minute}, time.Now())
+	if len(store.appended) != 1 {
+		t.Fatalf("persist exactly 1 append on new edge, got %d", len(store.appended))
+	}
+}
+
+// TestAlertTracker_P30_LoadFailureHonesty (T4) proves P30-I11: a Load error is
+// NOT "no history". The next Observe establishes a baseline (no synthetic edge,
+// no append), and HistoryStats exposes load_error=true / available=false. A
+// subsequent genuine edge then records + persists normally.
+func TestAlertTracker_P30_LoadFailureHonesty(t *testing.T) {
+	store := &fakeStore{loadResult: TransitionLoadResult{LoadErr: errors.New("disk gone")}}
+	tr := NewAlertTrackerWithStore(store)
+
+	hs := tr.HistoryStats()
+	if !hs.LoadError {
+		t.Fatal("LoadError must be true on failed load")
+	}
+	if hs.Available {
+		t.Fatal("Available must be false on failed load")
+	}
+	// First Observe(true) after a failed load -> baseline, NO synthetic edge.
+	st := tr.Observe(AlertCondition{Firing: true, UnknownRate: 70, Threshold: 50, Window: time.Minute}, time.Now())
+	if !st.Firing {
+		t.Fatal("baseline must set firing=true")
+	}
+	if len(tr.Transitions()) != 0 {
+		t.Fatalf("no synthetic transition after failed load, got %d", len(tr.Transitions()))
+	}
+	if len(store.appended) != 0 {
+		t.Fatalf("no append on baseline, got %d", len(store.appended))
+	}
+	// A genuine falling edge now records + persists.
+	tr.Observe(AlertCondition{Firing: false, UnknownRate: 0, Threshold: 50, Window: time.Minute}, time.Now())
+	if len(tr.Transitions()) != 1 {
+		t.Fatalf("want 1 transition after real edge, got %d", len(tr.Transitions()))
+	}
+	if len(store.appended) != 1 {
+		t.Fatalf("want 1 append after real edge, got %d", len(store.appended))
+	}
+}
+
+// TestAlertTracker_P30_MemoryNil (T7) proves memory mode (store=nil) keeps the
+// Phase 29 behavior: available, no load error, no persistence, ring only.
+func TestAlertTracker_P30_MemoryNil(t *testing.T) {
+	tr := NewAlertTracker()
+	hs := tr.HistoryStats()
+	if !hs.Available {
+		t.Fatal("memory mode must be available")
+	}
+	if hs.LoadError {
+		t.Fatal("memory mode must have no load error")
+	}
+	now := time.Now()
+	// First false -> no transition (classic P29-M2).
+	tr.Observe(AlertCondition{Firing: false, UnknownRate: 0, Threshold: 50, Window: time.Minute}, now)
+	if len(tr.Transitions()) != 0 {
+		t.Fatalf("memory mode: first false must produce no transition, got %d", len(tr.Transitions()))
+	}
+	// Rising -> FIRING, retained in ring.
+	tr.Observe(AlertCondition{Firing: true, UnknownRate: 70, Threshold: 50, Window: time.Minute}, now.Add(time.Second))
+	if len(tr.Transitions()) != 1 {
+		t.Fatalf("memory mode: want 1 transition, got %d", len(tr.Transitions()))
+	}
+}
+

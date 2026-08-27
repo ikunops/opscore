@@ -140,8 +140,10 @@
   }
   .prov-banner.ok { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
   .prov-banner.warn { border-color: color-mix(in srgb, var(--danger) 50%, transparent); }
+  .prov-banner.broken { border-color: color-mix(in srgb, var(--danger) 70%, transparent); background: color-mix(in srgb, var(--danger) 12%, var(--card)); }
   .prov-banner .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); flex: none; }
   .prov-banner.warn .dot { background: var(--danger); }
+  .prov-banner.broken .dot { background: var(--danger); }
   .mono { font-variant-numeric: tabular-nums; }
   .empty-row { color: var(--muted); font-size: 12.5px; padding: 10px 0; }
   .firing-on { background: color-mix(in srgb, var(--danger) 20%, transparent); color: var(--danger); }
@@ -248,8 +250,8 @@
     <div class="glass panel">
       <h2>🚨 Unknown-rate alert <span class="pill off">Phase 24</span></h2>
       <div id="alertState"><span class="sub">loading…</span></div>
-      <!-- Phase 29 — Recent alert transitions (read-only edge log) -->
-      <div class="hint" style="margin-top:14px;">Recent alert transitions <span class="sub">(observation-time edge log, memory-only)</span>:</div>
+      <!-- Phase 29 + Phase 30 — Recent alert transitions (read-only edge log, persisted across restart) -->
+      <div class="hint" style="margin-top:14px;">Recent alert transitions <span class="sub">(observation-time edge log, persisted across restart)</span>:</div>
       <div id="recentTransitions"><span class="sub">loading…</span></div>
     </div>
 
@@ -570,14 +572,23 @@ function renderAlertTransitions(h) {
     box.innerHTML = '<span class="sub">no alert transitions observed yet</span>';
     return;
   }
-  // Honest retention banner (P29-M1 / R24-7): truncated ONLY when overflow dropped records.
+  // Honest retention banner (P29-M1 / Phase 30 / R24-7). Priority = most
+  // severe honesty signal first; NEVER present a false-clean state.
   let banner = "";
-  if (hs.truncated === true) {
-    const dropped = hs.dropped == null ? "?" : hs.dropped;
+  if (hs.retention_meta_inconsistent === true) {
+    // P30-I10: metadata untrustworthy -> say so, never coerce to clean.
+    banner = `<div class="prov-banner broken" style="margin-bottom:12px;"><span class="dot"></span><span><b>⚠ Retention metadata inconsistent</b> — history may be incomplete; the durable record's integrity could not be verified.</span></div>`;
+  } else if (hs.load_error === true || hs.available === false) {
+    // P30-I11: load failed -> unknown prior state, NOT "no history".
+    banner = `<div class="prov-banner broken" style="margin-bottom:12px;"><span class="dot"></span><span><b>⚠ History unavailable</b> — the durable transition log failed to load. Prior alert history is unknown (not absent).</span></div>`;
+  } else if (hs.truncated === true) {
+    const dropped = hs.dropped == null ? "?" : hs.dropped;          // runtime ring overflow
+    const fileDropped = hs.file_dropped == null ? 0 : hs.file_dropped; // durable eviction
     const retained = hs.retained == null ? "?" : hs.retained;
     const cap = hs.capacity == null ? "?" : hs.capacity;
-    banner = `<div class="prov-banner warn" style="margin-bottom:12px;"><span class="dot"></span><span><b>Transition history incomplete</b> — ${dropped} record(s) dropped (retained ${retained}/${cap}).</span></div>`;
-  } else if (hs.retained === hs.capacity && hs.dropped === 0) {
+    const fileNote = fileDropped > 0 ? `, ${fileDropped} evicted from durable store` : "";
+    banner = `<div class="prov-banner warn" style="margin-bottom:12px;"><span class="dot"></span><span><b>Transition history incomplete</b> — ${dropped} runtime record(s) dropped${fileNote} (retained ${retained}/${cap}).</span></div>`;
+  } else if (hs.retained === hs.capacity && (hs.dropped == null ? 0 : hs.dropped) === 0 && (hs.file_dropped == null ? 0 : hs.file_dropped) === 0) {
     banner = `<div class="prov-banner ok" style="margin-bottom:12px;"><span class="dot"></span><span>${hs.retained} retained, no overflow — window full but no history dropped.</span></div>`;
   }
   const rows = recent.map((t) => {

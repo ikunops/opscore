@@ -145,7 +145,17 @@ func (s *Server) handleProtectionAlertsHistory(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	limit := 10 // default "recent N" for the dashboard panel
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, e := strconv.Atoi(v); e == nil && n > 0 {
+			limit = n
+		}
+	}
+
 	txns := s.alertTracker.Transitions() // copy (P29-I6), NEWEST-FIRST (P29-S2)
+	if limit < len(txns) {
+		txns = txns[:limit] // take the most recent N (newest-first)
+	}
 	out := make([]map[string]any, 0, len(txns))
 	for _, t := range txns {
 		out = append(out, map[string]any{
@@ -161,10 +171,14 @@ func (s *Server) handleProtectionAlertsHistory(w http.ResponseWriter, r *http.Re
 	writeJSON(w, http.StatusOK, map[string]any{
 		"transitions": out,
 		"history_stats": map[string]any{
-			"capacity":  hs.Capacity,
-			"retained":  hs.Retained,
-			"dropped":   hs.Dropped,
-			"truncated": hs.Truncated, // P29-M1
+			"capacity":                    hs.Capacity,
+			"retained":                    hs.Retained,
+			"dropped":                     hs.Dropped,
+			"truncated":                   hs.Truncated, // P29-M1 / Phase 30
+			"file_dropped":                hs.FileDropped,
+			"retention_meta_inconsistent": hs.RetentionMetaInconsistent, // P30-I10
+			"available":                   hs.Available,                 // P30-I11
+			"load_error":                  hs.LoadError,                 // P30-I11
 		},
 	})
 }
