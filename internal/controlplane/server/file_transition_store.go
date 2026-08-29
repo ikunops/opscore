@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -324,6 +326,87 @@ func (s *FileBackedTransitionStore) evictLocked() error {
 // file per-operation, so there is no persistent handle to release.
 func (s *FileBackedTransitionStore) Close() error { return nil }
 
+// durableReadMaxBytes is the durable-read byte budget (P31-I3). It is enforced
+// via Stat BEFORE any read: a budget that only applies after the file has been
+// pulled into memory is not a budget at all.
+const durableReadMaxBytes = 8 << 20 // 8 MiB
+
+// ErrDurableBudgetExceeded is returned when the durable transition file exceeds
+// the read budget. It is a sentinel so the handler can report the specific
+// reason instead of a generic error (P31-I4 honesty).
+var ErrDurableBudgetExceeded = errors.New("durable transition read budget exceeded")
+
+// ReadRecent implements protection.AlertTransitionStore (Phase 31). It performs
+// a BOUNDED durable read projection: up to n persisted transitions returned
+// NEWEST-FIRST. It is NOT a replay and NEVER re-evaluates the alert (P31-I2).
+//
+// Bounds (P31-I3), each enforced BEFORE the work it limits:
+//   - ctx is honoured first (the handler applies a 2s deadline)
+//   - n is clamped to [1, min(DurableReadMaxLimit, FileTransitionCapacity)]
+//   - the file size is checked against durableReadMaxBytes via Stat, before reading
+//
+// Corruption semantics come from the SAME scan() used by startup Load (P31-I5):
+// there is exactly ONE definition of "corrupt" for the durable file, so a
+// startup Load and a deep read can never disagree about the same bytes.
+//
+// The result is taken from the durable dataset directly and is NEVER routed
+// through the 256-entry runtime ring — doing so would silently degrade this
+// read surface back to the Phase 29 cap (R141 implementation constraint).
+func (s *FileBackedTransitionStore) ReadRecent(ctx context.Context, n int) protection.TransitionReadResult {
+	if err := ctx.Err(); err != nil {
+		return protection.TransitionReadResult{LoadErr: err}
+	}
+	if n <= 0 {
+		return protection.TransitionReadResult{}
+	}
+	if n > protection.DurableReadMaxLimit {
+		n = protection.DurableReadMaxLimit
+	}
+	if int64(n) > protection.FileTransitionCapacity {
+		n = int(protection.FileTransitionCapacity)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.openErr != nil {
+		return protection.TransitionReadResult{LoadErr: s.openErr}
+	}
+	if st, err := os.Stat(s.path); err == nil && st.Size() > durableReadMaxBytes {
+		return protection.TransitionReadResult{
+			LoadErr: fmt.Errorf("%w: %d bytes > %d", ErrDurableBudgetExceeded, st.Size(), durableReadMaxBytes),
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return protection.TransitionReadResult{LoadErr: err}
+	}
+
+	txns, fd, metaInc, corrupt, err := s.scan()
+	if err != nil {
+		return protection.TransitionReadResult{LoadErr: err}
+	}
+	if corrupt {
+		// Corrupt durable history is never served as authoritative data.
+		return protection.TransitionReadResult{Corrupt: true}
+	}
+
+	// Take the newest n from the durable dataset, then reverse to NEWEST-FIRST.
+	start := 0
+	if len(txns) > n {
+		start = len(txns) - n
+	}
+	sel := txns[start:]
+	out := make([]protection.AlertTransition, 0, len(sel))
+	for i := len(sel) - 1; i >= 0; i-- {
+		out = append(out, sel[i])
+	}
+	return protection.TransitionReadResult{
+		Transitions:                out,
+		FileDropped:                fd,
+		RetentionMetaInconsistent: metaInc,
+	}
+}
+
 // FailedTransitionStore is a DEGRADED protection.AlertTransitionStore used when
 // the durable transition file could not be opened at all (P30-I11-impl).
 //
@@ -353,6 +436,12 @@ func (s *FailedTransitionStore) Append(ctx context.Context, t protection.AlertTr
 // instead of pretending the durable history was empty (P30-I11).
 func (s *FailedTransitionStore) Load(ctx context.Context) protection.TransitionLoadResult {
 	return protection.TransitionLoadResult{LoadErr: s.err}
+}
+
+// ReadRecent reports the same failure (P31-I9): a degraded store must never
+// look like "durable history exists but is empty".
+func (s *FailedTransitionStore) ReadRecent(ctx context.Context, n int) protection.TransitionReadResult {
+	return protection.TransitionReadResult{LoadErr: s.err}
 }
 
 // Close implements protection.AlertTransitionStore.

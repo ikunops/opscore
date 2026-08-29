@@ -96,6 +96,12 @@ type Config struct {
 	AlertTracker *protection.AlertTracker
 	// AlertPolicy is the declarative alert threshold config (Phase 24.2).
 	AlertPolicy protection.AlertPolicy
+	// TransitionStore is the optional durable alert-transition store (Phase 31).
+	// When non-nil, GET /alerts/history?source=durable serves a BOUNDED read
+	// projection from it. This is a READ-ONLY reference: the Server never
+	// becomes a second authority over the store — the AlertTracker keeps owning
+	// the write path and the startup load (P31-I6).
+	TransitionStore protection.AlertTransitionStore
 	// HostStore, when set, enables the Host Registry: operations may reference
 	// a named host ("target": "web-01") instead of a full inline connection
 	// spec, and /api/hosts CRUD manages the registry. Nil disables both.
@@ -154,6 +160,10 @@ type Server struct {
 	gate *protection.Gate
 	// alertTracker holds the Phase 24.2 declarative alert state.
 	alertTracker *protection.AlertTracker
+	// transitionStore is the optional durable store used ONLY for the
+	// Phase 31 bounded read projection (?source=durable). It is the same
+	// instance the tracker writes through; the Server never owns its state.
+	transitionStore protection.AlertTransitionStore
 	// alertPolicy is the Phase 24.2 declarative alert threshold config.
 	alertPolicy protection.AlertPolicy
 }
@@ -196,6 +206,7 @@ func New(cfg Config) (*Server, error) {
 		gate:          cfg.Gate,
 		alertTracker:  cfg.AlertTracker,
 		alertPolicy:   cfg.AlertPolicy,
+		transitionStore: cfg.TransitionStore,
 	}
 	if cfg.BootstrapAdmin != nil {
 		if err := s.bootstrapAdmin(cfg.BootstrapAdmin); err != nil {

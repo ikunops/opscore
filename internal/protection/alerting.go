@@ -127,9 +127,28 @@ type AlertTransitionStore interface {
 	Append(ctx context.Context, t AlertTransition) error
 	// Load recovers persisted transitions + honest completeness metadata.
 	Load(ctx context.Context) TransitionLoadResult
+	// ReadRecent (Phase 31, P31-I6) is a BOUNDED durable READ projection: it
+	// returns up to n persisted transitions, NEWEST-FIRST, under the caller's
+	// read budget. It is NOT a replay and NEVER re-evaluates the alert
+	// (P31-I2). It reports the same honesty signals as Load (P31-I5).
+	ReadRecent(ctx context.Context, n int) TransitionReadResult
 	// Close releases durable resources.
 	Close() error
 }
+
+// TransitionReadResult is the result of a bounded durable read projection
+// (Phase 31). It is deliberately an ALIAS of TransitionLoadResult, not a new
+// struct: the durable deep-read and the startup Load face the same file with
+// the same corruption semantics, so they MUST share one honesty vocabulary
+// (P31-I5). Two separate structs would eventually drift into "startup says
+// clean / deep-read says corrupt", which is itself a false-clean source.
+type TransitionReadResult = TransitionLoadResult
+
+// DurableReadMaxLimit is the maximum number of persisted transitions a single
+// durable read may return (P31-I3). It is a protocol-level cap shared by the
+// handler's clamp and the store's defensive clamp, so the two can never
+// disagree about what "bounded" means.
+const DurableReadMaxLimit = 1000
 
 // TransitionHistoryStats is the honest completeness block for the transition
 // history (R24-7 provenance loss honesty, P29-M1). Truncated is true ONLY when

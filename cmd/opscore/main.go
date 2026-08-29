@@ -236,6 +236,10 @@ type protectionBundle struct {
 	rateHistory  *protection.RateHistory
 	alertTracker *protection.AlertTracker
 	alertPolicy  protection.AlertPolicy
+	// transitionStore is the durable alert-transition store (nil in memory
+	// mode). Shared: the tracker owns writes, the server reads it for the
+	// Phase 31 bounded durable projection (P31-I6).
+	transitionStore protection.AlertTransitionStore
 }
 
 // buildProtectionGate constructs the Phase 21 Operational Protection Gate for
@@ -287,12 +291,19 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPa
 	// tracker is instead wired to a degraded store that reports the failure, so
 	// the read API exposes load_error=true / available=false.
 	var alertTracker *protection.AlertTracker
+	// transitionStore is the SAME instance the tracker writes through. The
+	// server holds it read-only for the Phase 31 ?source=durable projection
+	// (P31-I6); it never becomes a second authority over the store.
+	var transitionStore protection.AlertTransitionStore
 	if transitionPath != "" {
 		ts, err := server.NewFileBackedTransitionStore(transitionPath)
 		if err != nil {
 			logger.Warn("alert transition persistence unavailable — history reported as unavailable (NOT silently in-memory)", "err", err, "path", transitionPath)
-			alertTracker = protection.NewAlertTrackerWithStore(server.NewFailedTransitionStore(transitionPath, err))
+			fs := server.NewFailedTransitionStore(transitionPath, err)
+			transitionStore = fs
+			alertTracker = protection.NewAlertTrackerWithStore(fs)
 		} else {
+			transitionStore = ts
 			alertTracker = protection.NewAlertTrackerWithStore(ts)
 		}
 	} else {
@@ -316,11 +327,12 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPa
 		Provenance: sink,
 	})
 	return protectionBundle{
-		gate:         gate,
-		provenance:   sink,
-		rateHistory:  rateHistory,
-		alertTracker: alertTracker,
-		alertPolicy:  alertPolicy,
+		gate:            gate,
+		provenance:      sink,
+		rateHistory:     rateHistory,
+		alertTracker:    alertTracker,
+		alertPolicy:     alertPolicy,
+		transitionStore: transitionStore,
 	}
 }
 
@@ -569,9 +581,10 @@ func cmdServe(args []string) {
 		UseSudo:        *tSudo && !demoOn,
 		AllowRegister:  *allowRegister,
 		BootstrapAdmin: &server.BootstrapAdmin{Username: *adminUser, Password: *adminPass},
-		Gate:          bundle.gate,
-		AlertTracker:  bundle.alertTracker,
-		AlertPolicy:   bundle.alertPolicy,
+		Gate:            bundle.gate,
+		AlertTracker:    bundle.alertTracker,
+		AlertPolicy:     bundle.alertPolicy,
+		TransitionStore: bundle.transitionStore,
 	})
 	if err != nil {
 		logger.Error("server init failed", "err", err)

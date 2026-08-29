@@ -188,6 +188,27 @@ func (f *fakeStore) Append(ctx context.Context, t AlertTransition) error {
 func (f *fakeStore) Load(ctx context.Context) TransitionLoadResult { return f.loadResult }
 func (f *fakeStore) Close() error                                 { return nil }
 
+// ReadRecent (Phase 31) serves the bounded durable read projection from the
+// same preset data, NEWEST-FIRST (P31-I5). The double intentionally shares
+// Load's honesty vocabulary — including its error/corruption signals — because
+// that sharing is precisely the invariant under test.
+func (f *fakeStore) ReadRecent(ctx context.Context, n int) TransitionReadResult {
+	res := f.loadResult // copy: same honesty signals as Load (P31-I5)
+	if res.LoadErr != nil || res.Corrupt {
+		return res
+	}
+	txns := res.Transitions
+	if n > 0 && n < len(txns) {
+		txns = txns[len(txns)-n:]
+	}
+	out := make([]AlertTransition, 0, len(txns))
+	for i := len(txns) - 1; i >= 0; i-- {
+		out = append(out, txns[i])
+	}
+	res.Transitions = out
+	return res
+}
+
 // TestAlertTracker_P30_RestartReconstruction (T1) proves P30-I7: after a clean
 // non-empty Load, current firing reconstructs from the last transition's To, and
 // the runtime ring is seeded with the MOST RECENT transitions (not replayed, so
