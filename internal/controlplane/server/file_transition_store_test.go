@@ -141,6 +141,37 @@ func TestFileBackedTransitionStore_TrailingPartialLine(t *testing.T) {
 	}
 }
 
+// TestFileBackedTransitionStore_TrailingCorruptLineWithTerminator (P30-I12,
+// R138 blocker) proves the trailing-partial exemption is NOT over-broad: a
+// corrupt final line that was FULLY WRITTEN (it carries a line terminator) is
+// not a crash partial write, so it must be reported as corruption rather than
+// silently recovered.
+func TestFileBackedTransitionStore_TrailingCorruptLineWithTerminator(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tx.jsonl")
+	firing := "{\"at\":\"2020-01-01T00:00:00Z\",\"from\":false,\"to\":true,\"unknown_rate\":70,\"threshold\":50}"
+	// NOTE the trailing "\n": the corrupt line is complete, i.e. fully written.
+	seeded := "{\"_meta\":true,\"file_dropped\":0}\n" + firing + "\n" + "<<<CORRUPT>>>\n"
+	if err := os.WriteFile(path, []byte(seeded), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	s, err := NewFileBackedTransitionStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	res := s.Load(context.Background())
+	if !res.Corrupt {
+		t.Fatal("P30-I12: a fully-written corrupt final line must set Corrupt=true (only a NON-terminated tail is a partial write)")
+	}
+	tr := protection.NewAlertTrackerWithStore(s)
+	st := tr.HistoryStats()
+	if !st.HistoryCorrupt {
+		t.Fatal("P30-I12: tracker must expose HistoryCorrupt=true")
+	}
+	if st.Available {
+		t.Fatal("P30-I12: Available must be false — corrupted history is never clean")
+	}
+}
+
 // TestFileBackedTransitionStore_MiddleCorruption (P30-I12) proves a corrupt
 // line in the MIDDLE of durable history is never silently skipped: the store
 // must raise the corruption signal rather than `continue`-ing and presenting the

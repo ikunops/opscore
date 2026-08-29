@@ -105,11 +105,14 @@ func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, erro
 // retentionMetaInconsistent, corrupt, hardErr). It also updates s.count and
 // s.fileDropped in memory.
 //
-// P30-I12 recovery rule — ONLY a trailing partial line may be recovered
-// silently (ADR-053 crash partial-write). Any unparseable line that is NOT the
-// last non-empty one means durable history genuinely lost records, so it is
-// signalled as corruption instead of being `continue`-d over; presenting the
-// surviving remainder as normal history would be a new false-clean risk.
+// P30-I12 recovery rule — ONLY a provably-incomplete trailing write may be
+// recovered silently (ADR-053 crash partial-write). "Provably incomplete" means
+// the raw file does NOT end with a line terminator. A corrupt line that was
+// fully written (terminator present) is NOT a partial write and is reported as
+// corruption. Any unparseable line that is not such a trailing write means
+// durable history genuinely lost records, so it is signalled instead of being
+// `continue`-d over; presenting the surviving remainder as normal history would
+// be a new false-clean risk.
 func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransition, fileDropped int64, metaInconsistent bool, corrupt bool, hardErr error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
@@ -120,13 +123,22 @@ func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransi
 		}
 		return nil, 0, false, false, err
 	}
-	raw := strings.TrimRight(string(data), "\n")
-	if raw == "" {
+	// P30-I12: a genuine crash partial write is INCOMPLETE — by definition it
+	// has NO line terminator. That distinction must be taken from the RAW bytes
+	// BEFORE trimming: TrimRight would erase it, making a fully-written but
+	// corrupt final line ("<<<CORRUPT>>>\n") indistinguishable from a partial
+	// write, and both would be recovered silently. Only when the file does not
+	// end with "\n" is the final line provably a partial write.
+	raw := string(data)
+	partialTrailing := len(raw) > 0 && !strings.HasSuffix(raw, "\n")
+
+	trimmed := strings.TrimRight(raw, "\n")
+	if trimmed == "" {
 		s.count = 0
 		s.fileDropped = 0
 		return nil, 0, false, false, nil
 	}
-	lines := strings.Split(raw, "\n")
+	lines := strings.Split(trimmed, "\n")
 
 	// Line 1 is the metadata SLOT. Three cases (P30-I10):
 	//   (a) parses as a meta record          -> consume it, metadata consistent.
@@ -167,9 +179,10 @@ func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransi
 	for i, ln := range txLines {
 		var t protection.AlertTransition
 		if err := json.Unmarshal([]byte(ln), &t); err != nil || t.At.IsZero() {
-			if i == last {
-				// ADR-053: a trailing partial write is the ONLY legitimate
-				// unparseable line — silent recovery is authorized here.
+			if i == last && partialTrailing {
+				// ADR-053: the final line carries NO terminator, so it really is
+				// an incomplete trailing write — silent recovery is the
+				// authorized behavior here, and only here.
 				continue
 			}
 			// P30-I12: corruption mid-history. Stop and signal; never present
