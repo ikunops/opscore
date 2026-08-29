@@ -179,6 +179,7 @@ func (s *Server) handleProtectionAlertsHistory(w http.ResponseWriter, r *http.Re
 			"retention_meta_inconsistent": hs.RetentionMetaInconsistent, // P30-I10
 			"available":                   hs.Available,                 // P30-I11
 			"load_error":                  hs.LoadError,                 // P30-I11
+			"history_corrupt":             hs.HistoryCorrupt,            // P30-I12
 		},
 	})
 }

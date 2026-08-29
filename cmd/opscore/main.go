@@ -279,15 +279,19 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPa
 	sink := protection.NewRecordingProvenanceSink(4096) // bounded, non-blocking
 	rateHistory := protection.NewRateHistory(time.Minute, 120)
 	// Phase 30: durable, cross-restart alert-transition retention. The store is
-	// attached only when a path is provided (non-memory storage); a failure to
-	// open the store degrades to in-memory (no retention) rather than crashing
-	// the control plane (best-effort durability, P30-I6).
+	// attached only when a path is provided (non-memory storage).
+	//
+	// P30-I11-impl: a failure to open the store must NOT degrade to a clean
+	// in-memory tracker — that would turn "persisted history is unreadable"
+	// into "there is no history", the exact false-clean P30-I11 forbids. The
+	// tracker is instead wired to a degraded store that reports the failure, so
+	// the read API exposes load_error=true / available=false.
 	var alertTracker *protection.AlertTracker
 	if transitionPath != "" {
 		ts, err := server.NewFileBackedTransitionStore(transitionPath)
 		if err != nil {
-			logger.Warn("alert transition persistence unavailable — falling back to in-memory (no cross-restart retention)", "err", err, "path", transitionPath)
-			alertTracker = protection.NewAlertTracker()
+			logger.Warn("alert transition persistence unavailable — history reported as unavailable (NOT silently in-memory)", "err", err, "path", transitionPath)
+			alertTracker = protection.NewAlertTrackerWithStore(server.NewFailedTransitionStore(transitionPath, err))
 		} else {
 			alertTracker = protection.NewAlertTrackerWithStore(ts)
 		}

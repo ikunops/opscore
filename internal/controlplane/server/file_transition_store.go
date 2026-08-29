@@ -41,11 +41,26 @@ type FileBackedTransitionStore struct {
 
 	count       int64 // in-memory mirror of on-disk transition-line count
 	fileDropped int64 // in-memory mirror of persisted eviction count
+
+	// openErr captures a hard I/O failure encountered while mirroring the
+	// counters during construction (P30-I11-impl). It is NOT reported as a
+	// construction error: the store is still handed to the tracker, and Load()
+	// surfaces the failure so the read API can expose
+	// load_error / available=false instead of silently downgrading the tracker
+	// to a clean in-memory one ("unreadable history" must never become
+	// "no history").
+	openErr error
 }
 
 // NewFileBackedTransitionStore opens (creating and writing the metadata line if
 // the file is new) the durable transition file. The parent directory is created
-// if needed. It scans the file to mirror count/fileDropped in memory.
+// if needed.
+//
+// P30-I11-impl: OPEN and LOAD are separate lifecycles. This constructor only
+// performs SETUP (mkdir / open / write the metadata line) and a best-effort
+// counter mirror; content-level failures (unreadable file, corruption) are
+// remembered and reported by Load(), never turned into a constructor error.
+// Only a genuine setup failure returns an error.
 func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, error) {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -74,37 +89,53 @@ func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, erro
 	f.Close()
 
 	s := &FileBackedTransitionStore{path: path}
-	if _, _, _, err := s.scan(); err != nil {
-		return nil, err
+	// Best-effort counter mirror (needed so eviction keeps the durable cap).
+	// A failure here is remembered, NOT returned: Load() reports it honestly.
+	txns, fd, _, _, err := s.scan()
+	if err != nil {
+		s.openErr = err // P30-I11-impl: degrade through Load, never silently
+		return s, nil
 	}
+	s.count = int64(len(txns))
+	s.fileDropped = fd
 	return s, nil
 }
 
 // scan reads the file and returns (transitions, fileDropped,
-// retentionMetaInconsistent, hardErr). It also updates s.count and s.fileDropped
-// in memory. Best-effort: an unparseable transition line is skipped (recovered
-// around); only a hard I/O error is reported via hardErr (mapped to LoadErr).
-func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransition, fileDropped int64, metaInconsistent bool, hardErr error) {
+// retentionMetaInconsistent, corrupt, hardErr). It also updates s.count and
+// s.fileDropped in memory.
+//
+// P30-I12 recovery rule — ONLY a trailing partial line may be recovered
+// silently (ADR-053 crash partial-write). Any unparseable line that is NOT the
+// last non-empty one means durable history genuinely lost records, so it is
+// signalled as corruption instead of being `continue`-d over; presenting the
+// surviving remainder as normal history would be a new false-clean risk.
+func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransition, fileDropped int64, metaInconsistent bool, corrupt bool, hardErr error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.count = 0
 			s.fileDropped = 0
-			return nil, 0, false, nil
+			return nil, 0, false, false, nil
 		}
-		return nil, 0, false, err
+		return nil, 0, false, false, err
 	}
 	raw := strings.TrimRight(string(data), "\n")
 	if raw == "" {
 		s.count = 0
 		s.fileDropped = 0
-		return nil, 0, false, nil
+		return nil, 0, false, false, nil
 	}
 	lines := strings.Split(raw, "\n")
 
-	// Line 1 is the metadata record (when we wrote it). If it parses as meta,
-	// consume it; otherwise the whole file is treated as transitions and the
-	// metadata is marked inconsistent (honest, P30-I10).
+	// Line 1 is the metadata SLOT. Three cases (P30-I10):
+	//   (a) parses as a meta record          -> consume it, metadata consistent.
+	//   (b) parses as a genuine transition   -> a legacy / metadata-less file:
+	//       keep it as a transition and mark metadata inconsistent.
+	//   (c) neither                          -> a CORRUPT metadata slot: consume
+	//       it (never re-judge it as a transition line below) and mark metadata
+	//       inconsistent. This keeps garbage-meta files recoverable without
+	//       misfiring the P30-I12 corruption detector.
 	start := 0
 	if len(lines) > 0 {
 		var m fileMetaRecord
@@ -112,38 +143,59 @@ func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransi
 			fileDropped = m.FileDropped
 			start = 1
 		} else {
-			metaInconsistent = true // line1 is not a valid meta record
+			var probe protection.AlertTransition
+			isTransition := json.Unmarshal([]byte(lines[0]), &probe) == nil && !probe.At.IsZero()
+			metaInconsistent = true
+			if !isTransition {
+				start = 1 // corrupt meta slot: consume, do not treat as transition
+			}
 		}
 	}
 
-	transitions = make([]protection.AlertTransition, 0, len(lines)-start)
+	// Collect the non-empty transition lines first, so "trailing" is judged
+	// against the LAST NON-EMPTY line (a trailing blank must not mask it).
+	txLines := make([]string, 0, len(lines))
 	for _, ln := range lines[start:] {
-		if ln == "" {
+		if strings.TrimSpace(ln) == "" {
 			continue
 		}
+		txLines = append(txLines, ln)
+	}
+
+	transitions = make([]protection.AlertTransition, 0, len(txLines))
+	last := len(txLines) - 1
+	for i, ln := range txLines {
 		var t protection.AlertTransition
-		if err := json.Unmarshal([]byte(ln), &t); err != nil {
-			continue // skip unparseable transition line (best-effort recovery)
-		}
-		// Reject lines that are not genuine transitions: a real edge always
-		// carries an observation time. This discards stray/meta-looking lines
-		// that happen to be valid JSON but carry no edge (e.g. a corrupted or
-		// misplaced meta record).
-		if t.At.IsZero() {
-			continue
+		if err := json.Unmarshal([]byte(ln), &t); err != nil || t.At.IsZero() {
+			if i == last {
+				// ADR-053: a trailing partial write is the ONLY legitimate
+				// unparseable line — silent recovery is authorized here.
+				continue
+			}
+			// P30-I12: corruption mid-history. Stop and signal; never present
+			// the remainder as normal history without a corruption marker.
+			s.count = int64(len(txLines)) // keep the eviction mirror sane
+			return nil, 0, metaInconsistent, true, nil
 		}
 		transitions = append(transitions, t)
 	}
 	s.count = int64(len(transitions))
 	s.fileDropped = fileDropped
-	return transitions, fileDropped, metaInconsistent, nil
+	return transitions, fileDropped, metaInconsistent, false, nil
 }
 
 // Load implements protection.AlertTransitionStore.
 func (s *FileBackedTransitionStore) Load(ctx context.Context) protection.TransitionLoadResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	txns, fd, inconsistent, err := s.scan()
+	if s.openErr != nil {
+		// P30-I11-impl: the durable file could not be read at all. Report it
+		// honestly instead of letting the caller fall back to a clean
+		// in-memory tracker (which would turn "unreadable history" into
+		// "no history").
+		return protection.TransitionLoadResult{LoadErr: s.openErr}
+	}
+	txns, fd, inconsistent, corrupt, err := s.scan()
 	if err != nil {
 		return protection.TransitionLoadResult{LoadErr: err}
 	}
@@ -151,6 +203,7 @@ func (s *FileBackedTransitionStore) Load(ctx context.Context) protection.Transit
 		Transitions:                txns,
 		FileDropped:                fd,
 		RetentionMetaInconsistent: inconsistent,
+		Corrupt:                    corrupt, // P30-I12
 	}
 }
 
@@ -257,3 +310,37 @@ func (s *FileBackedTransitionStore) evictLocked() error {
 // Close implements protection.AlertTransitionStore. The store opens/closes the
 // file per-operation, so there is no persistent handle to release.
 func (s *FileBackedTransitionStore) Close() error { return nil }
+
+// FailedTransitionStore is a DEGRADED protection.AlertTransitionStore used when
+// the durable transition file could not be opened at all (P30-I11-impl).
+//
+// It exists so the wiring can hand the tracker a NON-NIL store that reports the
+// failure: the tracker then exposes load_error=true / available=false over the
+// read API. Without it, the wiring would fall back to a clean in-memory
+// tracker and an unreadable persisted history would become indistinguishable
+// from "there is no history" — exactly the false-clean P30-I11 forbids.
+type FailedTransitionStore struct {
+	path string
+	err  error
+}
+
+// NewFailedTransitionStore builds a degraded store that reports err from every
+// operation. It NEVER returns nil, so the tracker stays honestly degraded.
+func NewFailedTransitionStore(path string, err error) *FailedTransitionStore {
+	return &FailedTransitionStore{path: path, err: err}
+}
+
+// Append reports the failure (P30-I6 best-effort): durability is unavailable,
+// but the caller keeps serving on the live ring.
+func (s *FailedTransitionStore) Append(ctx context.Context, t protection.AlertTransition) error {
+	return s.err
+}
+
+// Load always reports the failure, so the tracker marks history unavailable
+// instead of pretending the durable history was empty (P30-I11).
+func (s *FailedTransitionStore) Load(ctx context.Context) protection.TransitionLoadResult {
+	return protection.TransitionLoadResult{LoadErr: s.err}
+}
+
+// Close implements protection.AlertTransitionStore.
+func (s *FailedTransitionStore) Close() error { return nil }

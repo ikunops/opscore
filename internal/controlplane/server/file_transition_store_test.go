@@ -113,6 +113,113 @@ func TestFileBackedTransitionStore_MetaInconsistent(t *testing.T) {
 	}
 }
 
+// TestFileBackedTransitionStore_TrailingPartialLine (P30-I12 counter-case)
+// proves ADR-053 recovery is preserved: a partial line left by a crash at the
+// very END of the file (without a trailing newline) is silently recovered — the
+// valid records before it are still returned and the store stays CLEAN.
+func TestFileBackedTransitionStore_TrailingPartialLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tx.jsonl")
+	good := "{\"at\":\"2020-01-01T00:00:00Z\",\"from\":false,\"to\":true,\"unknown_rate\":1,\"threshold\":50}"
+	// No trailing newline: the last line is a truncated (partial) write.
+	seeded := "{\"_meta\":true,\"file_dropped\":0}\n" + good + "\n" + "{\"at\":\"2020-01-02T00:00:0"
+	if err := os.WriteFile(path, []byte(seeded), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	s, err := NewFileBackedTransitionStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	res := s.Load(context.Background())
+	if res.LoadErr != nil {
+		t.Fatalf("trailing partial line must not be a load error: %v", res.LoadErr)
+	}
+	if res.Corrupt {
+		t.Fatal("P30-I12: trailing partial line must NOT be flagged corrupt")
+	}
+	if len(res.Transitions) != 1 {
+		t.Fatalf("want 1 recovered transition, got %d", len(res.Transitions))
+	}
+}
+
+// TestFileBackedTransitionStore_MiddleCorruption (P30-I12) proves a corrupt
+// line in the MIDDLE of durable history is never silently skipped: the store
+// must raise the corruption signal rather than `continue`-ing and presenting the
+// surviving remainder as normal history.
+func TestFileBackedTransitionStore_MiddleCorruption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tx.jsonl")
+	firing := "{\"at\":\"2020-01-01T00:00:00Z\",\"from\":false,\"to\":true,\"unknown_rate\":70,\"threshold\":50}"
+	clear := "{\"at\":\"2020-01-02T00:00:00Z\",\"from\":true,\"to\":false,\"unknown_rate\":0,\"threshold\":50}"
+	seeded := "{\"_meta\":true,\"file_dropped\":0}\n" + firing + "\n" + "<<<CORRUPT>>>\n" + clear + "\n"
+	if err := os.WriteFile(path, []byte(seeded), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	s, err := NewFileBackedTransitionStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	res := s.Load(context.Background())
+	if !res.Corrupt {
+		t.Fatal("P30-I12: middle-line corruption must set Corrupt=true (never silent)")
+	}
+
+	// The tracker wired on top must degrade, not present a false-clean history.
+	tr := protection.NewAlertTrackerWithStore(s)
+	st := tr.HistoryStats()
+	if !st.HistoryCorrupt {
+		t.Fatal("P30-I12: tracker must expose HistoryCorrupt=true")
+	}
+	if st.Available {
+		t.Fatal("P30-I12: Available must be false on corruption (never clean)")
+	}
+	if len(tr.Transitions()) != 0 {
+		t.Fatalf("P30-I12: no history should be served as authoritative when corrupt, got %d", len(tr.Transitions()))
+	}
+	// Degraded baseline: the first Observe must NOT emit a synthetic edge.
+	tr.Observe(protection.AlertCondition{Firing: true, UnknownRate: 70, Threshold: 50, Window: time.Minute}, time.Now())
+	if n := len(tr.Transitions()); n != 0 {
+		t.Fatalf("P30-I12: first Observe after corruption must establish baseline without a synthetic edge, got %d transitions", n)
+	}
+}
+
+// TestFileBackedTransitionStore_LoadHardError (P30-I11-impl) proves a durable
+// file that cannot be READ at all surfaces as a load failure reaching the
+// tracker/API — it must never be downgraded to a clean in-memory tracker, which
+// would make an unreadable persisted history look like "no history".
+func TestFileBackedTransitionStore_LoadHardError(t *testing.T) {
+	// A directory is not readable as a file, so os.ReadFile fails hard.
+	dir := filepath.Join(t.TempDir(), "not-a-file.jsonl")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("seed dir: %v", err)
+	}
+	s, err := NewFileBackedTransitionStore(dir)
+	if err == nil {
+		// Construction may succeed (open/mkdir worked) or fail; either way the
+		// resulting tracker must be degraded, never clean.
+		_ = s
+	}
+	var store protection.AlertTransitionStore = s
+	if err != nil {
+		store = NewFailedTransitionStore(dir, err) // what main.go now wires
+	}
+	res := store.Load(context.Background())
+	if res.LoadErr == nil {
+		t.Fatal("P30-I11-impl: an unreadable durable path must surface LoadErr")
+	}
+	tr := protection.NewAlertTrackerWithStore(store)
+	st := tr.HistoryStats()
+	if st.Available {
+		t.Fatal("P30-I11-impl: Available must be false when the durable load failed")
+	}
+	if !st.LoadError {
+		t.Fatal("P30-I11-impl: LoadError must be true and reach the read API")
+	}
+	// Degraded baseline, not a synthetic FIRING edge.
+	tr.Observe(protection.AlertCondition{Firing: true, UnknownRate: 70, Threshold: 50, Window: time.Minute}, time.Now())
+	if n := len(tr.Transitions()); n != 0 {
+		t.Fatalf("P30-I11-impl: first Observe after load failure must not emit a synthetic edge, got %d", n)
+	}
+}
+
 // TestProtectionObs_AlertsHistory_FileBackedPersistence (T6, Phase 30) proves
 // the wired file-backed tracker (a) exposes the extended history_stats fields
 // over the read API, and (b) survives a simulated restart: a new tracker built

@@ -100,12 +100,18 @@ type AlertTransition struct {
 //   - RetentionMetaInconsistent: true when the durable metadata record could not
 //     be parsed (so FileDropped is itself untrustworthy) — surfaced honestly,
 //     never coerced to 0 / false-clean (P30-I10).
-//   - LoadErr: non-nil on any I/O/permission/corruption failure. A load failure
+//   - Corrupt: true when a NON-TRAILING transition line could not be parsed
+//     (P30-I12). Only a trailing partial line is legitimate crash-recovery
+//     (ADR-053); corruption in the middle means durable history genuinely lost
+//     records, so the store MUST signal it instead of silently `continue`-ing
+//     and presenting the remainder as normal history (new false-clean risk).
+//   - LoadErr: non-nil on any I/O/permission failure. A load failure
 //     is NOT "no history"; it is "unknown prior state" (P30-I11).
 type TransitionLoadResult struct {
 	Transitions                []AlertTransition
 	FileDropped                int64
 	RetentionMetaInconsistent bool
+	Corrupt                    bool
 	LoadErr                    error
 }
 
@@ -140,6 +146,11 @@ type TransitionHistoryStats struct {
 	RetentionMetaInconsistent   bool
 	Available                   bool
 	LoadError                   bool
+	// HistoryCorrupt is true when the durable history contains a non-trailing
+	// unparseable line (P30-I12). It is STICKY: once set, the tracker never
+	// presents itself as clean again — Available stays false for the process
+	// lifetime, because durable records really were lost.
+	HistoryCorrupt bool
 }
 
 // AlertTracker holds the transient alert state (the firing-entry time) plus a
@@ -169,6 +180,10 @@ type AlertTracker struct {
 	// loadError marks that the durable Load failed. The next Observe treats the
 	// current condition as baseline (no edge, no synthetic FIRING).
 	loadError bool
+	// historyCorrupt marks non-trailing durable corruption (P30-I12). Sticky:
+	// once true the tracker is permanently degraded (Available=false), because
+	// recovered history genuinely lost records and must never look clean.
+	historyCorrupt bool
 	// retentionMetaInconsistent marks unparseable durable metadata (P30-I10).
 	retentionMetaInconsistent bool
 	// fileDropped is the durable-layer eviction count recovered at Load.
@@ -196,9 +211,12 @@ func NewAlertTrackerWithStore(store AlertTransitionStore) *AlertTracker {
 		return t
 	}
 	res := store.Load(context.Background())
-	if res.LoadErr != nil {
-		// P30-I11: load failure != "no history". Be honest; baseline next time.
-		t.loadError = true
+	if res.LoadErr != nil || res.Corrupt {
+		// P30-I11: load failure != "no history". P30-I12: a non-trailing corrupt
+		// line is also NOT clean history (records really were lost). Both paths
+		// degrade honestly — baseline on next Observe, never a synthetic edge.
+		t.loadError = res.LoadErr != nil
+		t.historyCorrupt = res.Corrupt
 		t.historyLoaded = false
 		return t
 	}
@@ -228,10 +246,11 @@ func (t *AlertTracker) Observe(cond AlertCondition, now time.Time) AlertState {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// P30-I11: after a failed durable Load, the first Observe establishes the
-	// baseline (current firing state) WITHOUT emitting a synthetic edge. This
-	// avoids the restart-while-FIRING false FIRING transition.
-	if t.store != nil && t.loadError && !t.historyLoaded {
+	// P30-I11/P30-I12: after a failed durable Load (I/O error OR non-trailing
+	// corruption), the first Observe establishes the baseline (current firing
+	// state) WITHOUT emitting a synthetic edge. This avoids the
+	// restart-while-FIRING false FIRING transition and never invents history.
+	if t.store != nil && (t.loadError || t.historyCorrupt) && !t.historyLoaded {
 		t.firing = cond.Firing
 		if cond.Firing {
 			t.since = now
@@ -325,8 +344,10 @@ func (t *AlertTracker) HistoryStats() TransitionHistoryStats {
 		Truncated:                 truncated,
 		FileDropped:               t.fileDropped,
 		RetentionMetaInconsistent: t.retentionMetaInconsistent,
-		Available:                 t.historyLoaded && !t.loadError,
-		LoadError:                 t.loadError,
+		Available: t.historyLoaded && !t.loadError && !t.historyCorrupt,
+		LoadError: t.loadError,
+		// P30-I12: corruption is sticky and keeps Available=false forever.
+		HistoryCorrupt: t.historyCorrupt,
 	}
 }
 

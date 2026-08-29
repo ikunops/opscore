@@ -575,7 +575,11 @@ function renderAlertTransitions(h) {
   // Honest retention banner (P29-M1 / Phase 30 / R24-7). Priority = most
   // severe honesty signal first; NEVER present a false-clean state.
   let banner = "";
-  if (hs.retention_meta_inconsistent === true) {
+  if (hs.history_corrupt === true) {
+    // P30-I12: non-trailing corruption in the durable log. Records really were
+    // lost, so this outranks every other signal and is never presented clean.
+    banner = `<div class="prov-banner broken" style="margin-bottom:12px;"><span class="dot"></span><span><b>⚠ Durable history corrupted</b> — the transition log contains unparseable records that are not a trailing partial write. Recovered history is incomplete and is NOT shown as authoritative.</span></div>`;
+  } else if (hs.retention_meta_inconsistent === true) {
     // P30-I10: metadata untrustworthy -> say so, never coerce to clean.
     banner = `<div class="prov-banner broken" style="margin-bottom:12px;"><span class="dot"></span><span><b>⚠ Retention metadata inconsistent</b> — history may be incomplete; the durable record's integrity could not be verified.</span></div>`;
   } else if (hs.load_error === true || hs.available === false) {
