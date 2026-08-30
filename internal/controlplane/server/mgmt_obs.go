@@ -232,7 +232,27 @@ func (s *Server) writeDurableHistory(w http.ResponseWriter, r *http.Request, hs 
 		s.writeDurableUnavailable(w, hs, "corrupt", limitRequested, limit)
 		return
 	}
-	s.writeHistoryOK(w, res.Transitions, hs, "durable", "ok", true, false, len(res.Transitions), limitRequested, limit)
+	// P31-I11: the durable response MUST be built from THIS read's findings,
+	// not from the tracker's startup stats. The durable file can degrade after
+	// startup (e.g. its metadata record becomes unparseable); echoing the stale
+	// startup stats would report "clean" while this read had just detected
+	// RetentionMetaInconsistent — masking the very problem the read was
+	// performed to find.
+	readStatus := "ok"
+	if res.RetentionMetaInconsistent {
+		// Metadata is untrustworthy, so file_dropped cannot be trusted either.
+		// Serve the recovered records best-effort (Phase 30 I10 semantics:
+		// honest signal, not a hard failure) but never call the result clean.
+		readStatus = "degraded"
+	}
+	hs.FileDropped = res.FileDropped
+	hs.RetentionMetaInconsistent = res.RetentionMetaInconsistent
+	hs.HistoryCorrupt = res.Corrupt
+	// This read succeeded and is not corrupt, so durable history IS available
+	// right now — regardless of what the tracker observed at startup.
+	hs.Available = true
+	hs.LoadError = false
+	s.writeHistoryOK(w, res.Transitions, hs, "durable", readStatus, true, false, len(res.Transitions), limitRequested, limit)
 }
 
 // writeDurableUnavailable answers a failed durable read with 503 + explicit

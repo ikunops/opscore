@@ -372,7 +372,19 @@ func (s *FileBackedTransitionStore) ReadRecent(ctx context.Context, n int) prote
 	if s.openErr != nil {
 		return protection.TransitionReadResult{LoadErr: s.openErr}
 	}
-	if st, err := os.Stat(s.path); err == nil && st.Size() > durableReadMaxBytes {
+	// P31-I10: a Stat failure must NOT be swallowed. With the previous
+	// `if st, err := os.Stat(...); err == nil && size > budget` form, a Stat
+	// error silently skipped the budget check and fell through to scan()/
+	// ReadFile — i.e. the budget was bypassed exactly when the file was in an
+	// abnormal state. If the file cannot even be stat-ed, the read has already
+	// failed; report it explicitly.
+	st, err := os.Stat(s.path)
+	if err != nil {
+		return protection.TransitionReadResult{
+			LoadErr: fmt.Errorf("durable read stat: %w", err),
+		}
+	}
+	if st.Size() > durableReadMaxBytes {
 		return protection.TransitionReadResult{
 			LoadErr: fmt.Errorf("%w: %d bytes > %d", ErrDurableBudgetExceeded, st.Size(), durableReadMaxBytes),
 		}
