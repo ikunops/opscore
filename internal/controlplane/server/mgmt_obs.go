@@ -252,6 +252,13 @@ func (s *Server) writeDurableHistory(w http.ResponseWriter, r *http.Request, hs 
 	// right now — regardless of what the tracker observed at startup.
 	hs.Available = true
 	hs.LoadError = false
+	// Truncated is DERIVED from the values above
+	// (runtime_dropped>0 || file_dropped>0 || retention_meta_inconsistent), so it
+	// must be recomputed here. Leaving it at the value HistoryStats() computed
+	// from startup counters would let a durable response state file_dropped=7
+	// and truncated=false simultaneously — a self-contradictory, false-clean
+	// statement (the same staleness class P31-I11 forbids).
+	hs.Truncated = hs.Dropped > 0 || hs.FileDropped > 0 || hs.RetentionMetaInconsistent
 	s.writeHistoryOK(w, res.Transitions, hs, "durable", readStatus, true, false, len(res.Transitions), limitRequested, limit)
 }
 
