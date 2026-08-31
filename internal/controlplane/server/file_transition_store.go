@@ -3,13 +3,18 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/YuDong999/opscore/internal/protection"
 )
@@ -116,6 +121,26 @@ func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, erro
 // `continue`-d over; presenting the surviving remainder as normal history would
 // be a new false-clean risk.
 func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransition, fileDropped int64, metaInconsistent bool, corrupt bool, hardErr error) {
+	recs, fd, mi, corrupt, err := s.scanRecords()
+	if err != nil {
+		return nil, 0, mi, false, err
+	}
+	if corrupt {
+		return nil, 0, mi, true, nil
+	}
+	out := make([]protection.AlertTransition, 0, len(recs))
+	for _, r := range recs {
+		out = append(out, r.rec)
+	}
+	return out, fd, mi, false, nil
+}
+
+// scanRecords is the Phase 32 generalisation of scan(): it returns each parsed
+// transition TOGETHER with the byte offset of its line, which is what lets the
+// store mint opaque cursors at zero extra I/O cost. Corruption semantics are
+// byte-for-byte those of P30-I12 (same trailing/middle discrimination), so the
+// startup Load and the paged durable read can never disagree.
+func (s *FileBackedTransitionStore) scanRecords() (records []scannedRecord, fileDropped int64, metaInconsistent bool, corrupt bool, hardErr error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -166,21 +191,29 @@ func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransi
 		}
 	}
 
-	// Collect the non-empty transition lines first, so "trailing" is judged
-	// against the LAST NON-EMPTY line (a trailing blank must not mask it).
-	txLines := make([]string, 0, len(lines))
-	for _, ln := range lines[start:] {
-		if strings.TrimSpace(ln) == "" {
+	// Collect the non-empty transition lines together with their byte offsets,
+	// so "trailing" is judged against the LAST NON-EMPTY line (a trailing blank
+	// must not mask it) and so cursors can be minted without extra I/O.
+	type lineAt struct {
+		text   string
+		offset int64
+	}
+	txLines := make([]lineAt, 0, len(lines))
+	off := int64(0)
+	for idx, ln := range lines {
+		if idx < start || strings.TrimSpace(ln) == "" {
+			off += int64(len(ln)) + 1 // account for the consumed/skipped line
 			continue
 		}
-		txLines = append(txLines, ln)
+		txLines = append(txLines, lineAt{text: ln, offset: off})
+		off += int64(len(ln)) + 1
 	}
 
-	transitions = make([]protection.AlertTransition, 0, len(txLines))
+	records = make([]scannedRecord, 0, len(txLines))
 	last := len(txLines) - 1
-	for i, ln := range txLines {
+	for i, la := range txLines {
 		var t protection.AlertTransition
-		if err := json.Unmarshal([]byte(ln), &t); err != nil || t.At.IsZero() {
+		if err := json.Unmarshal([]byte(la.text), &t); err != nil || t.At.IsZero() {
 			if i == last && partialTrailing {
 				// ADR-053: the final line carries NO terminator, so it really is
 				// an incomplete trailing write — silent recovery is the
@@ -192,11 +225,11 @@ func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransi
 			s.count = int64(len(txLines)) // keep the eviction mirror sane
 			return nil, 0, metaInconsistent, true, nil
 		}
-		transitions = append(transitions, t)
+		records = append(records, scannedRecord{rec: t, offset: la.offset})
 	}
-	s.count = int64(len(transitions))
+	s.count = int64(len(records))
 	s.fileDropped = fileDropped
-	return transitions, fileDropped, metaInconsistent, false, nil
+	return records, fileDropped, metaInconsistent, false, nil
 }
 
 // Load implements protection.AlertTransitionStore.
@@ -336,6 +369,117 @@ const durableReadMaxBytes = 8 << 20 // 8 MiB
 // reason instead of a generic error (P31-I4 honesty).
 var ErrDurableBudgetExceeded = errors.New("durable transition read budget exceeded")
 
+// ---------------------------------------------------------------------------
+// Phase 32 — opaque durable cursor
+// ---------------------------------------------------------------------------
+//
+// A cursor is an OPAQUE token: base64url("v1:" + offset + ":" + fingerprint).
+//
+//   - offset      is ONLY a lookup hint (fast path). It is NOT an order key and
+//                 NOT an identity: an eviction rewrite moves every offset.
+//   - fingerprint is the record IDENTITY (FNV-1a 64 of canonical fields).
+//                 It is NOT an order key either.
+//
+// P32-I11 (Durable order authority): paging order is the order in which records
+// actually appear in the durable file. Offset arithmetic and timestamp
+// comparison must never decide "what comes before the cursor".
+//
+// P32-I12 (Cursor survives rewrite): a rewrite changes offsets but does NOT
+// invalidate a cursor whose record is still retained. Expiry is decided solely
+// by "is the record still present", never by "did the offset move".
+
+const cursorVersion = "v1"
+
+// recordFingerprint is the durable IDENTITY of a transition record, computed
+// from canonical fields only. It deliberately does NOT depend on the record's
+// position in the file, so it still identifies the record after a rewrite.
+func recordFingerprint(t protection.AlertTransition) uint64 {
+	h := fnv.New64a()
+	_, _ = io.WriteString(h, t.At.UTC().Format(time.RFC3339Nano))
+	_, _ = io.WriteString(h, "|")
+	_, _ = io.WriteString(h, strconv.FormatBool(t.From))
+	_, _ = io.WriteString(h, "|")
+	_, _ = io.WriteString(h, strconv.FormatBool(t.To))
+	_, _ = io.WriteString(h, "|")
+	_, _ = io.WriteString(h, strconv.FormatInt(t.UnknownRate, 10))
+	_, _ = io.WriteString(h, "|")
+	_, _ = io.WriteString(h, strconv.FormatInt(t.Threshold, 10))
+	return h.Sum64()
+}
+
+func mintCursor(offset int64, t protection.AlertTransition) string {
+	raw := cursorVersion + ":" + strconv.FormatInt(offset, 10) + ":" +
+		strconv.FormatUint(recordFingerprint(t), 16)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// parsedCursor is the decoded form of an opaque cursor.
+type parsedCursor struct {
+	offset      int64
+	fingerprint uint64
+}
+
+func parseCursor(cur string) (parsedCursor, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(cur)
+	if err != nil {
+		return parsedCursor{}, fmt.Errorf("%w: undecodable", protection.ErrInvalidCursor)
+	}
+	parts := strings.Split(string(raw), ":")
+	if len(parts) != 3 || parts[0] != cursorVersion {
+		return parsedCursor{}, fmt.Errorf("%w: bad shape/version", protection.ErrInvalidCursor)
+	}
+	off, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || off < 0 {
+		return parsedCursor{}, fmt.Errorf("%w: bad offset", protection.ErrInvalidCursor)
+	}
+	fp, err := strconv.ParseUint(parts[2], 16, 64)
+	if err != nil {
+		return parsedCursor{}, fmt.Errorf("%w: bad fingerprint", protection.ErrInvalidCursor)
+	}
+	return parsedCursor{offset: off, fingerprint: fp}, nil
+}
+
+// scannedRecord pairs a parsed transition with the byte offset of its line in
+// the durable file. Offsets are recorded during scan, so cursors cost no I/O.
+type scannedRecord struct {
+	rec    protection.AlertTransition
+	offset int64
+}
+
+// resolveCursor locates the cursor's record index within the parsed durable
+// order (P32-I11: the index comes from the durable order; offset is only a
+// fast-path hint; fingerprint is only an identity check).
+// P32-I12: an offset change never expires a cursor — only a missing record does.
+func resolveCursor(records []scannedRecord, c parsedCursor) (int, error) {
+	// Fast path: exact offset hit with a matching identity.
+	for i := range records {
+		if records[i].offset == c.offset && recordFingerprint(records[i].rec) == c.fingerprint {
+			return i, nil
+		}
+	}
+	// Slow path: a rewrite moved offsets; identify purely by fingerprint.
+	match, matches := -1, 0
+	for i := range records {
+		if recordFingerprint(records[i].rec) == c.fingerprint {
+			matches++
+			if match < 0 {
+				match = i
+			}
+		}
+	}
+	switch {
+	case matches == 1:
+		return match, nil
+	case matches == 0:
+		// Gone from retention. Never restart from the newest page (that would
+		// silently duplicate/omit records) — report it, P32-I10.
+		return -1, fmt.Errorf("%w: record no longer retained", protection.ErrCursorExpired)
+	default:
+		// Identity collides, position unknowable. Never guess, P32-I10.
+		return -1, fmt.Errorf("%w: %d records share the identity", protection.ErrCursorAmbiguous, matches)
+	}
+}
+
 // ReadRecent implements protection.AlertTransitionStore (Phase 31). It performs
 // a BOUNDED durable read projection: up to n persisted transitions returned
 // NEWEST-FIRST. It is NOT a replay and NEVER re-evaluates the alert (P31-I2).
@@ -419,6 +563,106 @@ func (s *FileBackedTransitionStore) ReadRecent(ctx context.Context, n int) prote
 	}
 }
 
+// ReadBefore implements protection.AlertTransitionStore (Phase 32): a bounded
+// durable PAGE — up to n persisted transitions preceding `cursor`, NEWEST-FIRST.
+// An empty cursor starts from the newest record.
+//
+// P32-I11 (Durable order authority): the page boundary is an INDEX INTO THE
+// PARSED DURABLE ORDER. The cursor's offset is only a lookup hint and its
+// fingerprint only an identity check; neither participates in ordering, and
+// timestamps never do.
+//
+// P32-I12 (Cursor survives rewrite): an eviction rewrite moves offsets but does
+// not invalidate a cursor whose record is still retained — resolution falls back
+// to identity matching. Only a genuinely missing record expires a cursor.
+func (s *FileBackedTransitionStore) ReadBefore(ctx context.Context, cursor string, n int) protection.TransitionPageResult {
+	if err := ctx.Err(); err != nil {
+		return protection.TransitionPageResult{LoadErr: err}
+	}
+	if n <= 0 {
+		return protection.TransitionPageResult{}
+	}
+	if n > protection.DurableReadMaxLimit {
+		n = protection.DurableReadMaxLimit
+	}
+	if int64(n) > protection.FileTransitionCapacity {
+		n = int(protection.FileTransitionCapacity)
+	}
+
+	// An empty cursor means "start from the newest": no token to validate.
+	var pc parsedCursor
+	if cursor != "" {
+		parsed, err := parseCursor(cursor)
+		if err != nil {
+			return protection.TransitionPageResult{LoadErr: err}
+		}
+		pc = parsed
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.openErr != nil {
+		return protection.TransitionPageResult{LoadErr: s.openErr}
+	}
+	st, err := os.Stat(s.path)
+	if err != nil {
+		return protection.TransitionPageResult{
+			LoadErr: fmt.Errorf("durable read stat: %w", err),
+		}
+	}
+	if st.Size() > durableReadMaxBytes {
+		return protection.TransitionPageResult{
+			LoadErr: fmt.Errorf("%w: %d bytes > %d", ErrDurableBudgetExceeded, st.Size(), durableReadMaxBytes),
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return protection.TransitionPageResult{LoadErr: err}
+	}
+
+	recs, fd, metaInc, corrupt, err := s.scanRecords()
+	if err != nil {
+		return protection.TransitionPageResult{LoadErr: err}
+	}
+	if corrupt {
+		// Corrupt durable history is never served as authoritative data.
+		return protection.TransitionPageResult{Corrupt: true}
+	}
+
+	// Exclusive upper bound in durable order (records with index < end).
+	end := len(recs)
+	if cursor != "" {
+		p, err := resolveCursor(recs, pc)
+		if err != nil {
+			return protection.TransitionPageResult{LoadErr: err}
+		}
+		end = p
+	}
+	start := 0
+	if end > n {
+		start = end - n
+	}
+	sel := recs[start:end]
+	out := make([]protection.AlertTransition, 0, len(sel))
+	for i := len(sel) - 1; i >= 0; i-- {
+		out = append(out, sel[i].rec) // NEWEST-FIRST (P32-I5)
+	}
+	hasMore := start > 0
+	next := ""
+	if hasMore {
+		// Mint from the OLDEST record of this page, so the next request
+		// continues strictly before it. Never let a client derive this.
+		next = mintCursor(recs[start].offset, recs[start].rec)
+	}
+	return protection.TransitionPageResult{
+		Transitions:                out,
+		FileDropped:                fd,
+		RetentionMetaInconsistent: metaInc,
+		HasMore:                   hasMore,
+		NextCursor:                next,
+	}
+}
+
 // FailedTransitionStore is a DEGRADED protection.AlertTransitionStore used when
 // the durable transition file could not be opened at all (P30-I11-impl).
 //
@@ -454,6 +698,12 @@ func (s *FailedTransitionStore) Load(ctx context.Context) protection.TransitionL
 // look like "durable history exists but is empty".
 func (s *FailedTransitionStore) ReadRecent(ctx context.Context, n int) protection.TransitionReadResult {
 	return protection.TransitionReadResult{LoadErr: s.err}
+}
+
+// ReadBefore reports the same failure (P32-I4/P31-I9): a degraded store has no
+// durable pages to serve, and must never look like "an empty page".
+func (s *FailedTransitionStore) ReadBefore(ctx context.Context, cursor string, n int) protection.TransitionPageResult {
+	return protection.TransitionPageResult{LoadErr: s.err}
 }
 
 // Close implements protection.AlertTransitionStore.

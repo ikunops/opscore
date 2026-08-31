@@ -191,7 +191,9 @@ func (s *Server) handleProtectionAlertsHistory(w http.ResponseWriter, r *http.Re
 	if limit < len(txns) {
 		txns = txns[:limit] // take the most recent N (newest-first)
 	}
-	s.writeHistoryOK(w, txns, hs, "memory", "ok", hs.Available, hs.LoadError, 0, limitRequested, limit)
+	// The memory ring is a single bounded window with no paging: has_more is
+	// false and no cursor is minted (paging is a durable-read capability).
+	s.writeHistoryOK(w, txns, hs, "memory", "ok", hs.Available, hs.LoadError, 0, limitRequested, limit, false, "")
 }
 
 // durableReadTimeout is the time budget for one durable read projection
@@ -215,8 +217,27 @@ func (s *Server) writeDurableHistory(w http.ResponseWriter, r *http.Request, hs 
 	ctx, cancel := context.WithTimeout(r.Context(), durableReadTimeout)
 	defer cancel()
 
-	res := s.transitionStore.ReadRecent(ctx, limit)
+	// Phase 32: `before` is an OPAQUE server-minted cursor. Empty means "start
+	// from the newest", which keeps the Phase 31 behavior for callers that do
+	// not page.
+	before := r.URL.Query().Get("before")
+
+	res := s.transitionStore.ReadBefore(ctx, before, limit)
 	if res.LoadErr != nil {
+		// P32-I10 Cursor Integrity: a cursor problem is reported with its own
+		// explicit status — never by jumping elsewhere, reinterpreting the
+		// token, or restarting from the newest page.
+		switch {
+		case errors.Is(res.LoadErr, protection.ErrInvalidCursor):
+			s.writeCursorError(w, http.StatusBadRequest, "invalid_cursor", limitRequested, limit)
+			return
+		case errors.Is(res.LoadErr, protection.ErrCursorExpired):
+			s.writeCursorError(w, http.StatusGone, "cursor_expired", limitRequested, limit)
+			return
+		case errors.Is(res.LoadErr, protection.ErrCursorAmbiguous):
+			s.writeCursorError(w, http.StatusConflict, "cursor_ambiguous", limitRequested, limit)
+			return
+		}
 		reason := "read_error"
 		switch {
 		case errors.Is(res.LoadErr, ErrDurableBudgetExceeded):
@@ -259,7 +280,28 @@ func (s *Server) writeDurableHistory(w http.ResponseWriter, r *http.Request, hs 
 	// and truncated=false simultaneously — a self-contradictory, false-clean
 	// statement (the same staleness class P31-I11 forbids).
 	hs.Truncated = hs.Dropped > 0 || hs.FileDropped > 0 || hs.RetentionMetaInconsistent
-	s.writeHistoryOK(w, res.Transitions, hs, "durable", readStatus, true, false, len(res.Transitions), limitRequested, limit)
+	s.writeHistoryOK(w, res.Transitions, hs, "durable", readStatus, true, false,
+		len(res.Transitions), limitRequested, limit, res.HasMore, res.NextCursor)
+}
+
+// writeCursorError answers a cursor problem with its own explicit status
+// (P32-I10). It never substitutes a different page, never falls back to the
+// memory ring, and never reinterprets the token — a cursor failure is a
+// statement about that cursor, not an invitation to guess.
+func (s *Server) writeCursorError(w http.ResponseWriter, status int, reason string, limitRequested, limit int) {
+	writeJSON(w, status, map[string]any{
+		"error":       "durable cursor error",
+		"reason":      reason,
+		"read_source": "durable",
+		"read_status": "cursor_error",
+		"page": map[string]any{
+			"limit_requested": limitRequested,
+			"limit_effective": limit,
+			"returned":        0,
+			"has_more":        false,
+			"next_cursor":     "",
+		},
+	})
 }
 
 // writeDurableUnavailable answers a failed durable read with 503 + explicit
@@ -297,7 +339,7 @@ func (s *Server) writeDurableUnavailable(w http.ResponseWriter, hs protection.Tr
 // readSource/readStatus make the provenance unambiguous: the caller can always
 // tell whether this result came from the memory ring or the durable log, and
 // whether the durable read succeeded (P31-I4).
-func (s *Server) writeHistoryOK(w http.ResponseWriter, txns []protection.AlertTransition, hs protection.TransitionHistoryStats, readSource, readStatus string, durableAvailable, durableError bool, durableRetained, limitRequested, limit int) {
+func (s *Server) writeHistoryOK(w http.ResponseWriter, txns []protection.AlertTransition, hs protection.TransitionHistoryStats, readSource, readStatus string, durableAvailable, durableError bool, durableRetained, limitRequested, limit int, hasMore bool, nextCursor string) {
 	out := make([]map[string]any, 0, len(txns))
 	for _, t := range txns {
 		out = append(out, map[string]any{
@@ -329,6 +371,17 @@ func (s *Server) writeHistoryOK(w http.ResponseWriter, txns []protection.AlertTr
 			"limit_requested":             limitRequested, // P31-I3 clamp honesty
 			"limit_effective":             limit,
 			"returned":                    len(out),
+		},
+		// Phase 32 paging metadata. next_cursor is SERVER-MINTED: the client
+		// passes it back as `before` and must never derive the next boundary
+		// from the last record's timestamp (timestamps are neither unique nor
+		// strictly monotonic — P32-I9). Empty next_cursor means "last page".
+		"page": map[string]any{
+			"limit_requested": limitRequested,
+			"limit_effective": limit,
+			"returned":        len(out),
+			"has_more":        hasMore,
+			"next_cursor":     nextCursor,
 		},
 	})
 }

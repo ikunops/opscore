@@ -3,6 +3,9 @@ package protection
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -187,6 +190,51 @@ func (f *fakeStore) Append(ctx context.Context, t AlertTransition) error {
 }
 func (f *fakeStore) Load(ctx context.Context) TransitionLoadResult { return f.loadResult }
 func (f *fakeStore) Close() error                                 { return nil }
+
+// ReadBefore (Phase 32) pages the same preset data, NEWEST-FIRST. The double
+// keeps the same honesty vocabulary as Load and understands a simple opaque
+// "idx:<n>" cursor, so cursor semantics can be exercised without a filesystem.
+func (f *fakeStore) ReadBefore(ctx context.Context, cursor string, n int) TransitionPageResult {
+	base := f.loadResult // copy: same honesty signals
+	if base.LoadErr != nil || base.Corrupt {
+		return TransitionPageResult{
+			FileDropped:               base.FileDropped,
+			RetentionMetaInconsistent: base.RetentionMetaInconsistent,
+			Corrupt:                   base.Corrupt,
+			LoadErr:                   base.LoadErr,
+		}
+	}
+	end := len(base.Transitions)
+	if cursor != "" {
+		trimmed := strings.TrimPrefix(cursor, "idx:")
+		idx, err := strconv.Atoi(trimmed)
+		if err != nil || idx < 0 || idx > end {
+			return TransitionPageResult{LoadErr: fmt.Errorf("%w: %q", ErrInvalidCursor, cursor)}
+		}
+		end = idx
+	}
+	start := 0
+	if end > n {
+		start = end - n
+	}
+	sel := base.Transitions[start:end]
+	out := make([]AlertTransition, 0, len(sel))
+	for i := len(sel) - 1; i >= 0; i-- {
+		out = append(out, sel[i]) // NEWEST-FIRST
+	}
+	hasMore := start > 0
+	next := ""
+	if hasMore {
+		next = "idx:" + strconv.Itoa(start)
+	}
+	return TransitionPageResult{
+		Transitions:                out,
+		FileDropped:                base.FileDropped,
+		RetentionMetaInconsistent: base.RetentionMetaInconsistent,
+		HasMore:                   hasMore,
+		NextCursor:                next,
+	}
+}
 
 // ReadRecent (Phase 31) serves the bounded durable read projection from the
 // same preset data, NEWEST-FIRST (P31-I5). The double intentionally shares

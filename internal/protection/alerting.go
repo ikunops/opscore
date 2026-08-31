@@ -2,6 +2,7 @@ package protection
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -132,9 +133,55 @@ type AlertTransitionStore interface {
 	// read budget. It is NOT a replay and NEVER re-evaluates the alert
 	// (P31-I2). It reports the same honesty signals as Load (P31-I5).
 	ReadRecent(ctx context.Context, n int) TransitionReadResult
+	// ReadBefore (Phase 32) is the BOUNDED durable PAGING projection. It
+	// returns up to n persisted transitions that precede `cursor`,
+	// NEWEST-FIRST. An empty cursor starts from the newest record.
+	//
+	// `cursor` is an OPAQUE durable position token minted by the store
+	// (returned as NextCursor). Clients must not parse, construct, or derive it
+	// from a record's timestamp — timestamps are neither unique nor strictly
+	// monotonic (P32-I9). Ordering is governed by P32-I11.
+	ReadBefore(ctx context.Context, cursor string, n int) TransitionPageResult
 	// Close releases durable resources.
 	Close() error
 }
+
+// TransitionPageResult is the result of one bounded durable PAGE (Phase 32).
+// It carries the page plus THIS read's honesty signals (P31-I11: never masked
+// by the tracker's startup stats) and the paging metadata the server returns
+// verbatim (next_cursor is server-minted; the client must never derive the
+// next boundary from the last record's timestamp).
+type TransitionPageResult struct {
+	Transitions []AlertTransition
+	FileDropped int64
+	// RetentionMetaInconsistent and Corrupt are THIS read's findings (P31-I11).
+	RetentionMetaInconsistent bool
+	Corrupt                   bool
+	// LoadErr carries I/O failures AND cursor failures (sentinels below).
+	LoadErr error
+	// HasMore is true when records older than this page remain in retention.
+	HasMore bool
+	// NextCursor is the opaque token for the following (older) page; "" when
+	// HasMore is false.
+	NextCursor string
+}
+
+// Cursor sentinels (Phase 32, P32-I10 Cursor Integrity). They live in the core
+// so the store and the HTTP mapping cannot drift: a cursor problem is ALWAYS
+// reported explicitly — never resolved by jumping to another position, falling
+// back to the memory ring, or reinterpreting the token.
+var (
+	// ErrInvalidCursor: the token cannot be parsed at all (HTTP 400).
+	ErrInvalidCursor = errors.New("invalid durable cursor")
+	// ErrCursorExpired: well-formed token, but the record it identifies is no
+	// longer in durable retention (HTTP 410). Per P32-I12 this is decided by
+	// "is the record still retained", NOT by whether its byte offset moved
+	// after an eviction rewrite.
+	ErrCursorExpired = errors.New("durable cursor expired: record evicted")
+	// ErrCursorAmbiguous: the token's identity matches more than one retained
+	// record, so the position cannot be determined (HTTP 409). Never guess.
+	ErrCursorAmbiguous = errors.New("durable cursor ambiguous")
+)
 
 // TransitionReadResult is the result of a bounded durable read projection
 // (Phase 31). It is deliberately an ALIAS of TransitionLoadResult, not a new
