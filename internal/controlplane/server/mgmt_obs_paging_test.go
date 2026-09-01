@@ -334,9 +334,10 @@ func TestDurablePaging_InvalidCursor(t *testing.T) {
 }
 
 // --- T-g -------------------------------------------------------------------
-// P32-I8: the durable record format must be untouched — no field added for the
-// cursor's benefit.
-func TestDurablePaging_NoFormatChange(t *testing.T) {
+// P32-I8 (revised): the durable record format may evolve ONCE, in the storage
+// layer only, and only to carry the stable sequence. The API-facing
+// AlertTransition shape must remain untouched (P32-I5).
+func TestDurablePaging_FormatEvolutionAndAPIShape(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tx.jsonl")
 	store, err := NewFileBackedTransitionStore(path)
 	if err != nil {
@@ -355,16 +356,39 @@ func TestDurablePaging_NoFormatChange(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[1]), &rec); err != nil {
 		t.Fatalf("record must be valid JSON: %v", err)
 	}
-	// Exactly the Phase 30 field set — no sequence/id/cursor field added.
-	// AlertTransition carries no json tags, so the durable spelling is the
-	// Go field name (reading is case-insensitive, writing is not).
-	want := map[string]bool{"At": true, "From": true, "To": true, "UnknownRate": true, "Threshold": true}
-	if len(rec) != len(want) {
-		t.Fatalf("P32-I8: record field set changed, got %+v", rec)
+	// Storage envelope: a stable, explicitly-tagged contract = the Phase 30
+	// fields plus the durable sequence.
+	wantStorage := map[string]bool{
+		"seq": true, "at": true, "from": true, "to": true, "unknown_rate": true, "threshold": true,
+	}
+	if len(rec) != len(wantStorage) {
+		t.Fatalf("P32-I8: unexpected storage envelope, got %+v", rec)
 	}
 	for k := range rec {
-		if !want[k] {
-			t.Fatalf("P32-I8: unexpected new field %q in durable record", k)
+		if !wantStorage[k] {
+			t.Fatalf("P32-I8: unexpected field %q in the durable envelope", k)
+		}
+	}
+
+	// P32-I5: the API response shape is UNCHANGED — the sequence is a
+	// storage-layer concern and must never leak into the read surface.
+	srv, token, _ := newObsTestServer(t, true)
+	srv.alertTracker = protection.NewAlertTracker()
+	srv.transitionStore = store
+	_, got := getPage(t, srv, token, "source=durable&limit=10")
+	txs := got["transitions"].([]map[string]any)
+	if len(txs) != 1 {
+		t.Fatalf("want 1 transition, got %d", len(txs))
+	}
+	wantAPI := map[string]bool{
+		"at": true, "from": true, "to": true, "kind": true, "unknown_rate": true, "threshold": true,
+	}
+	if len(txs[0]) != len(wantAPI) {
+		t.Fatalf("P32-I5: API transition shape changed, got %+v", txs[0])
+	}
+	for k := range txs[0] {
+		if !wantAPI[k] {
+			t.Fatalf("P32-I5: unexpected field %q exposed by the API (seq must stay internal)", k)
 		}
 	}
 }
