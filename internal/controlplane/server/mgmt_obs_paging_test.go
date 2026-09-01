@@ -200,6 +200,72 @@ func TestDurablePaging_SurvivesAppendAndRewrite(t *testing.T) {
 	}
 }
 
+// --- T-b3 -----------------------------------------------------------------
+// R146=B: records whose canonical fields are byte-identical are LEGAL and may
+// repeat. A cursor minted on one of them must still resolve to THAT occurrence
+// after a rewrite — it must never collapse into 409 cursor_ambiguous while the
+// record is still retained (that would violate P32-I12).
+func TestDurablePaging_DuplicateRecordsSurviveRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tx.jsonl")
+	store, err := NewFileBackedTransitionStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	// Three records with IDENTICAL canonical fields (same instant, same rates),
+	// then a distinct one so the page has a boundary.
+	same := time.Now()
+	for i := 0; i < 3; i++ {
+		if err := store.Append(context.Background(), protection.AlertTransition{
+			At: same, From: false, To: true, UnknownRate: 7, Threshold: 50,
+		}); err != nil {
+			t.Fatalf("append dup %d: %v", i, err)
+		}
+	}
+	if err := store.Append(context.Background(), protection.AlertTransition{
+		At: same.Add(time.Second), From: true, To: false, UnknownRate: 0, Threshold: 50,
+	}); err != nil {
+		t.Fatalf("append distinct: %v", err)
+	}
+
+	srv, token, _ := newObsTestServer(t, true)
+	srv.alertTracker = protection.NewAlertTracker()
+	srv.transitionStore = store
+
+	// Page 1 (newest 2) mints a cursor on one of the duplicate occurrences.
+	_, p1 := getPage(t, srv, token, "source=durable&limit=2")
+	page1 := p1["page"].(map[string]any)
+	if page1["has_more"] != true {
+		t.Fatal("precondition: 4 records must yield a second page")
+	}
+	cursor := page1["next_cursor"].(string)
+	if cursor == "" {
+		t.Fatal("precondition: need a non-empty cursor")
+	}
+
+	// Rewrite the whole file so every byte offset moves (eviction-rewrite shape).
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if err := os.WriteFile(path+".tmp", raw, 0o600); err != nil {
+		t.Fatalf("write tmp: %v", err)
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+
+	// The same cursor must still resolve — NOT 409, NOT 410.
+	code, p2 := getPage(t, srv, token, "source=durable&limit=1000&before="+cursor)
+	if code != http.StatusOK {
+		t.Fatalf("R146/P32-I12: duplicate-record cursor must survive a rewrite, got %d (body=%q)",
+			code, p2["history_stats"])
+	}
+	rest := p2["transitions"].([]map[string]any)
+	if len(rest) != 2 {
+		t.Fatalf("P32: expected the 2 older records, got %d", len(rest))
+	}
+}
+
 // --- T-c -------------------------------------------------------------------
 // P32-I10: an expired cursor is explicit 410 and NEVER restarts from the
 // newest page.

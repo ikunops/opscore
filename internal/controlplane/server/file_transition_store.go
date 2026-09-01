@@ -373,12 +373,22 @@ var ErrDurableBudgetExceeded = errors.New("durable transition read budget exceed
 // Phase 32 — opaque durable cursor
 // ---------------------------------------------------------------------------
 //
-// A cursor is an OPAQUE token: base64url("v1:" + offset + ":" + fingerprint).
+// A cursor is an OPAQUE token:
 //
-//   - offset      is ONLY a lookup hint (fast path). It is NOT an order key and
-//                 NOT an identity: an eviction rewrite moves every offset.
-//   - fingerprint is the record IDENTITY (FNV-1a 64 of canonical fields).
-//                 It is NOT an order key either.
+//	base64url("v1:" + offset + ":" + fingerprint + ":" + ordinal)
+//
+//   - offset      is ONLY a lookup hint. It is NOT an order key and NOT an
+//                 identity: an eviction rewrite moves every offset.
+//   - fingerprint is the record CONTENT IDENTITY (FNV-1a 64 of canonical
+//                 fields). It is NOT an order key either.
+//   - ordinal     disambiguates records whose content is byte-identical: it is
+//                 the count of same-fingerprint records preceding this one in
+//                 durable order. Transitions with identical canonical fields are
+//                 LEGAL and may repeat, so content identity alone would collapse
+//                 them into one "ambiguous" match and wrongly expire a cursor
+//                 whose record is still retained (R146=B). The discriminator
+//                 lives only inside the cursor — P32-I8 forbids touching the
+//                 JSONL record shape.
 //
 // P32-I11 (Durable order authority): paging order is the order in which records
 // actually appear in the durable file. Offset arithmetic and timestamp
@@ -407,9 +417,31 @@ func recordFingerprint(t protection.AlertTransition) uint64 {
 	return h.Sum64()
 }
 
-func mintCursor(offset int64, t protection.AlertTransition) string {
-	raw := cursorVersion + ":" + strconv.FormatInt(offset, 10) + ":" +
-		strconv.FormatUint(recordFingerprint(t), 16)
+// occurrenceOrdinal counts how many records BEFORE index i share i's
+// fingerprint. Transitions whose canonical fields are byte-identical are LEGAL
+// and may legitimately repeat (e.g. two edges landing on the same timestamp
+// with the same rates), so content identity alone cannot distinguish them.
+//
+// P32-I8 forbids adding a field to the JSONL record, so this discriminator
+// lives ONLY inside the opaque cursor (R146=B).
+func occurrenceOrdinal(records []scannedRecord, i int) int {
+	fp := recordFingerprint(records[i].rec)
+	n := 0
+	for j := 0; j < i; j++ {
+		if recordFingerprint(records[j].rec) == fp {
+			n++
+		}
+	}
+	return n
+}
+
+// mintCursor builds the opaque token for records[i]:
+// base64url("v1:" + offset + ":" + fingerprint + ":" + ordinal)
+func mintCursor(records []scannedRecord, i int) string {
+	raw := cursorVersion + ":" +
+		strconv.FormatInt(records[i].offset, 10) + ":" +
+		strconv.FormatUint(recordFingerprint(records[i].rec), 16) + ":" +
+		strconv.Itoa(occurrenceOrdinal(records, i))
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
@@ -417,6 +449,7 @@ func mintCursor(offset int64, t protection.AlertTransition) string {
 type parsedCursor struct {
 	offset      int64
 	fingerprint uint64
+	ordinal     int
 }
 
 func parseCursor(cur string) (parsedCursor, error) {
@@ -425,7 +458,7 @@ func parseCursor(cur string) (parsedCursor, error) {
 		return parsedCursor{}, fmt.Errorf("%w: undecodable", protection.ErrInvalidCursor)
 	}
 	parts := strings.Split(string(raw), ":")
-	if len(parts) != 3 || parts[0] != cursorVersion {
+	if len(parts) != 4 || parts[0] != cursorVersion {
 		return parsedCursor{}, fmt.Errorf("%w: bad shape/version", protection.ErrInvalidCursor)
 	}
 	off, err := strconv.ParseInt(parts[1], 10, 64)
@@ -436,7 +469,11 @@ func parseCursor(cur string) (parsedCursor, error) {
 	if err != nil {
 		return parsedCursor{}, fmt.Errorf("%w: bad fingerprint", protection.ErrInvalidCursor)
 	}
-	return parsedCursor{offset: off, fingerprint: fp}, nil
+	ord, err := strconv.Atoi(parts[3])
+	if err != nil || ord < 0 {
+		return parsedCursor{}, fmt.Errorf("%w: bad ordinal", protection.ErrInvalidCursor)
+	}
+	return parsedCursor{offset: off, fingerprint: fp, ordinal: ord}, nil
 }
 
 // scannedRecord pairs a parsed transition with the byte offset of its line in
@@ -447,37 +484,46 @@ type scannedRecord struct {
 }
 
 // resolveCursor locates the cursor's record index within the parsed durable
-// order (P32-I11: the index comes from the durable order; offset is only a
-// fast-path hint; fingerprint is only an identity check).
-// P32-I12: an offset change never expires a cursor — only a missing record does.
+// order:
+//
+//	P32-I11: the index comes from the durable order; offset is only a lookup
+//	         hint and fingerprint only a content identity — neither orders
+//	         anything, and timestamps never participate.
+//	P32-I12: an offset change never expires a cursor; only a missing record
+//	         does. Resolution therefore falls back to (fingerprint, ordinal).
+//
+// The ordinal is what keeps legal duplicate records apart (R146=B): records
+// with byte-identical canonical fields are distinct occurrences, so they are
+// selected by "the Nth record with this content", not collapsed into an
+// ambiguous match.
 func resolveCursor(records []scannedRecord, c parsedCursor) (int, error) {
-	// Fast path: exact offset hit with a matching identity.
+	// Fast path: exact offset hit with a matching identity. This is
+	// unambiguous when the file layout has not changed since minting.
 	for i := range records {
 		if records[i].offset == c.offset && recordFingerprint(records[i].rec) == c.fingerprint {
 			return i, nil
 		}
 	}
-	// Slow path: a rewrite moved offsets; identify purely by fingerprint.
-	match, matches := -1, 0
+	// Slow path: a rewrite moved offsets. Locate every record sharing the
+	// content identity, then select the occurrence the cursor was minted for.
+	matches := make([]int, 0, 4)
 	for i := range records {
 		if recordFingerprint(records[i].rec) == c.fingerprint {
-			matches++
-			if match < 0 {
-				match = i
-			}
+			matches = append(matches, i)
 		}
 	}
-	switch {
-	case matches == 1:
-		return match, nil
-	case matches == 0:
+	if len(matches) == 0 {
 		// Gone from retention. Never restart from the newest page (that would
 		// silently duplicate/omit records) — report it, P32-I10.
 		return -1, fmt.Errorf("%w: record no longer retained", protection.ErrCursorExpired)
-	default:
-		// Identity collides, position unknowable. Never guess, P32-I10.
-		return -1, fmt.Errorf("%w: %d records share the identity", protection.ErrCursorAmbiguous, matches)
 	}
+	if c.ordinal >= len(matches) {
+		// The content still exists, but that specific occurrence was evicted.
+		// Never guess which surviving duplicate to use, P32-I10.
+		return -1, fmt.Errorf("%w: occurrence %d no longer retained (%d remain)",
+			protection.ErrCursorExpired, c.ordinal, len(matches))
+	}
+	return matches[c.ordinal], nil
 }
 
 // ReadRecent implements protection.AlertTransitionStore (Phase 31). It performs
@@ -652,7 +698,7 @@ func (s *FileBackedTransitionStore) ReadBefore(ctx context.Context, cursor strin
 	if hasMore {
 		// Mint from the OLDEST record of this page, so the next request
 		// continues strictly before it. Never let a client derive this.
-		next = mintCursor(recs[start].offset, recs[start].rec)
+		next = mintCursor(recs, start)
 	}
 	return protection.TransitionPageResult{
 		Transitions:                out,
