@@ -108,6 +108,12 @@ type FileBackedTransitionStore struct {
 	fileDropped int64 // in-memory mirror of persisted eviction count
 	lastSeq     int64 // P32-I13: highest sequence ever allocated (never reused)
 
+	// closeFn closes the append file handle inside Append. It exists solely so
+	// tests can simulate a post-sync close failure — the exact P32-I15 hazard
+	// where the record is already durable but a later step reports an error.
+	// Production always uses (*os.File).Close.
+	closeFn func(*os.File) error
+
 	// openErr captures a hard I/O failure encountered while mirroring the
 	// counters during construction (P30-I11-impl). It is NOT reported as a
 	// construction error: the store is still handed to the tracker, and Load()
@@ -155,7 +161,7 @@ func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, erro
 	}
 	f.Close()
 
-	s := &FileBackedTransitionStore{path: path}
+	s := &FileBackedTransitionStore{path: path, closeFn: (*os.File).Close}
 	recs, fd, metaInc, corrupt, legacy, err := s.scanRecords()
 	if err != nil {
 		s.openErr = err // P30-I11-impl: degrade through Load, never silently
@@ -443,21 +449,29 @@ func (s *FileBackedTransitionStore) Append(ctx context.Context, t protection.Ale
 		f.Close()
 		return err
 	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	// Advance the watermark only AFTER the record is durable. If we crash in
-	// between, recovery takes max(last_seq, max(record.seq)) and simply skips a
-	// value — it never re-issues one (P32-I15).
+	// P32-I15: the record is DURABLE at this point, so this sequence is
+	// CONSUMED — advance the watermark BEFORE any subsequent step can fail.
+	//
+	// Previously the watermark advanced only after a successful f.Close(), so a
+	// post-sync close error returned early and left lastSeq behind: the record
+	// was already on disk while lastSeq still pointed below it, and the next
+	// Append would re-issue the SAME sequence. That is sequence reuse, which
+	// P32-I13/I15 forbid outright. From here on, later errors may change this
+	// call's return value but can never make a consumed sequence allocatable
+	// again.
 	s.lastSeq = seq
 	s.count++
 
+	closeErr := s.closeFn(f)
+
+	var evictErr error
 	if s.count > protection.FileTransitionCapacity {
-		if err := s.evictLocked(); err != nil {
-			return err // best-effort; caller ignores, will retry next Append
-		}
+		evictErr = s.evictLocked() // best-effort; caller ignores, retried later
 	}
-	return nil
+	if closeErr != nil {
+		return closeErr
+	}
+	return evictErr
 }
 
 // evictLocked rewrites the file to keep only the most recent
