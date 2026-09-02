@@ -60,17 +60,20 @@ func TestProtectionObs_HistoryExport_FullRetainedJSON(t *testing.T) {
 	if body.HistoryStats["retained"] != float64(n) {
 		t.Fatalf("P33-I2: retained must be %d, got %v", n, body.HistoryStats["retained"])
 	}
-	// Durable layer is clean (no eviction yet): file_dropped must be 0. The
-	// runtime ring (cap 256) DID drop 1024-256=768 records, so truncated=true is
-	// the HONEST union-history signal — the export itself is complete
-	// (retained=1024), but the live ring lost older entries. Asserting both
-	// proves the export surfaces durable honesty without masking the runtime
-	// drop (P33-I2 / P31-I11).
+	// Durable layer is clean (1024 < durable cap 10000, so no durable eviction):
+	// file_dropped must be 0 and truncated=false. Per R153/P33-I2-R1 the export
+	// envelope describes ONLY the durable dataset and must NOT mix in the 256
+	// runtime ring's independent dropped count — that would violate the R152
+	// single-read / single-snapshot freeze. The runtime ring's own loss is a
+	// separate concern, proven by a dedicated eviction case (T-F) below.
 	if body.HistoryStats["file_dropped"] != float64(0) {
-		t.Fatalf("P33-I2: no durable eviction yet, file_dropped must be 0, got %v", body.HistoryStats["file_dropped"])
+		t.Fatalf("P33-I2-R1: no durable eviction, file_dropped must be 0, got %v", body.HistoryStats["file_dropped"])
 	}
-	if body.HistoryStats["truncated"] != true {
-		t.Fatalf("P33-I2: runtime ring dropped records, truncated must be true, got %v", body.HistoryStats["truncated"])
+	if body.HistoryStats["truncated"] != false {
+		t.Fatalf("P33-I2-R1: clean durable snapshot must report truncated=false, got %v", body.HistoryStats["truncated"])
+	}
+	if body.HistoryStats["dropped"] != float64(0) {
+		t.Fatalf("P33-I2-R1: dropped must equal durable-side loss (0 here), got %v", body.HistoryStats["dropped"])
 	}
 	// NEWEST-FIRST: last edge (i=n-1, odd => Firing=false) is CLEAR; first edge FIRING.
 	if body.Transitions[0]["kind"] != "CLEAR" {
@@ -211,5 +214,60 @@ func TestFileBackedTransitionStore_ReadAll_NoClamp(t *testing.T) {
 		if !res.Transitions[i-1].At.After(res.Transitions[i].At) {
 			t.Fatalf("ReadAll must be newest-first; idx %d not strictly newer than %d", i-1, i)
 		}
+	}
+}
+
+// T-F: when the durable dataset ITSELF evicts (records beyond
+// FileTransitionCapacity=10000 are dropped), the export envelope must report
+// file_dropped>0 and truncated=true — sourced purely from THIS ReadAll
+// snapshot (P33-I2-R1). This is the durable-side honesty case the judge
+// required as a dedicated test, separate from the runtime ring's loss.
+func TestProtectionObs_HistoryExport_DurableEvictionTruncated(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tx.jsonl")
+	store, err := NewFileBackedTransitionStore(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	const over = protection.FileTransitionCapacity + 5 // force 5 durable evictions
+	base := time.Now()
+	for i := 0; i < over; i++ {
+		tr := protection.AlertTransition{
+			At:          base.Add(time.Duration(i) * time.Second),
+			From:        i%2 == 1,
+			To:          i%2 == 0,
+			UnknownRate: 70,
+			Threshold:   50,
+		}
+		if err := store.Append(context.Background(), tr); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+	if res := store.ReadAll(context.Background()); res.FileDropped != 5 {
+		t.Fatalf("precheck: durable eviction must set FileDropped=5, got %d", res.FileDropped)
+	}
+
+	srv, token, _ := newObsTestServer(t, true)
+	srv.alertTracker = protection.NewAlertTracker() // not nil; not used on success path
+	srv.transitionStore = store
+
+	w := doReq(srv.ProtectionReadMux(), http.MethodGet,
+		"/management/v1/protection/alerts/history/export?format=json", token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("P33-I2-R1: eviction export want 200 got %d (body=%q)", w.Code, w.Body.String())
+	}
+	var body struct {
+		HistoryStats map[string]any `json:"history_stats"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v (body=%q)", err, w.Body.String())
+	}
+	if body.HistoryStats["file_dropped"] != float64(5) {
+		t.Fatalf("P33-I2-R1: durable eviction must report file_dropped=5, got %v", body.HistoryStats["file_dropped"])
+	}
+	if body.HistoryStats["dropped"] != float64(5) {
+		t.Fatalf("P33-I2-R1: dropped must equal durable-side loss (5), got %v", body.HistoryStats["dropped"])
+	}
+	if body.HistoryStats["truncated"] != true {
+		t.Fatalf("P33-I2-R1: durable eviction must report truncated=true, got %v", body.HistoryStats["truncated"])
 	}
 }

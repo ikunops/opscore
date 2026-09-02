@@ -556,7 +556,6 @@ func (s *Server) handleProtectionAlertsHistoryExport(w http.ResponseWriter, r *h
 		return
 	}
 
-	hs := s.alertTracker.HistoryStats()
 	ctx, cancel := context.WithTimeout(r.Context(), durableReadTimeout)
 	defer cancel()
 
@@ -569,29 +568,41 @@ func (s *Server) handleProtectionAlertsHistoryExport(w http.ResponseWriter, r *h
 		case errors.Is(res.LoadErr, context.DeadlineExceeded):
 			reason = "timeout"
 		}
-		s.writeHistoryExportUnavailable(w, hs, reason)
+		// Explicitly unavailable: report the tracker's runtime snapshot (no
+		// single-snapshot honesty claim is being made here).
+		s.writeHistoryExportUnavailable(w, s.alertTracker.HistoryStats(), reason)
 		return
 	}
 	if res.Corrupt {
-		s.writeHistoryExportUnavailable(w, hs, "corrupt")
+		s.writeHistoryExportUnavailable(w, s.alertTracker.HistoryStats(), "corrupt")
 		return
 	}
 
-	// P31-I11 / P33-I2: build the export from THIS read's findings, never from
-	// the tracker's stale startup stats. Recompute truncated from the values
-	// above so a retained-snapshot with file_dropped>0 can never claim
-	// truncated=false (the self-contradictory false-clean P31-I11 forbids).
+	// P33-I2-R1 (R153 blocker fix): the SUCCESS export envelope describes ONLY
+	// the durable dataset, sourced entirely from THIS single ReadAll snapshot.
+	// The 256-entry runtime ring's independent dropped count
+	// (alertTracker.HistoryStats().Dropped) must NOT be folded in — doing so
+	// would violate the R152 single-read / single-snapshot freeze and make
+	// `truncated` depend on a different point in time than the records served.
+	//   dropped      = durable-side loss  (= file_dropped)
+	//   file_dropped = durable retention loss
+	//   retained     = this ReadAll snapshot
+	//   truncated    = file_dropped>0 || retention_meta_inconsistent
+	hs := protection.TransitionHistoryStats{
+		Retained:                  len(res.Transitions),
+		Dropped:                   res.FileDropped,
+		FileDropped:               res.FileDropped,
+		RetentionMetaInconsistent: res.RetentionMetaInconsistent,
+		Available:                 true,
+		LoadError:                 false,
+		HistoryCorrupt:            res.Corrupt,
+	}
+	hs.Truncated = res.FileDropped > 0 || res.RetentionMetaInconsistent
+
 	readStatus := "ok"
 	if res.RetentionMetaInconsistent {
 		readStatus = "degraded"
 	}
-	hs.FileDropped = res.FileDropped
-	hs.RetentionMetaInconsistent = res.RetentionMetaInconsistent
-	hs.Available = true
-	hs.LoadError = false
-	hs.HistoryCorrupt = res.Corrupt
-	hs.Retained = len(res.Transitions)
-	hs.Truncated = hs.Dropped > 0 || hs.FileDropped > 0 || hs.RetentionMetaInconsistent
 
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	if format == "" {
