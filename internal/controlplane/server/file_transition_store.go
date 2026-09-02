@@ -162,7 +162,7 @@ func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, erro
 	f.Close()
 
 	s := &FileBackedTransitionStore{path: path, closeFn: (*os.File).Close}
-	recs, fd, metaInc, corrupt, legacy, err := s.scanRecords()
+	recs, fd, metaSeq, metaInc, corrupt, legacy, err := s.scanRecords()
 	if err != nil {
 		s.openErr = err // P30-I11-impl: degrade through Load, never silently
 		return s, nil
@@ -183,7 +183,7 @@ func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, erro
 			return s, nil
 		}
 		// Re-scan so every in-memory mirror reflects the published v2 state.
-		recs, fd, metaInc, corrupt, legacy, err = s.scanRecords()
+		recs, fd, metaSeq, metaInc, corrupt, legacy, err = s.scanRecords()
 		if err != nil || corrupt || legacy {
 			s.openErr = fmt.Errorf("post-migration verification failed (err=%v corrupt=%v legacy=%v)", err, corrupt, legacy)
 			return s, nil
@@ -191,11 +191,15 @@ func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, erro
 	}
 	s.count = int64(len(recs))
 	s.fileDropped = fd
-	// P32-I15: the sequence watermark is the MAX of the persisted watermark and
-	// every record's own sequence. If a record reached disk but the watermark did
-	// not (or vice versa), this still never re-issues an already-used sequence —
-	// a gap is allowed, a reuse is not.
-	s.lastSeq = 0
+	// P32-I15 (R150=B): recovery MUST combine BOTH sources —
+	//
+	//	lastSeq = max(meta.last_seq, max(record.seq))
+	//
+	// Taking only max(record.seq) silently drops the persisted watermark, so a
+	// sequence that was already allocated (and whose record may simply have been
+	// evicted, or lost to a torn write) would be handed out again. That is
+	// reuse, which P32-I13/I15 forbid: gaps are allowed, reuse is not.
+	s.lastSeq = metaSeq
 	for _, r := range recs {
 		if r.seq > s.lastSeq {
 			s.lastSeq = r.seq
@@ -213,7 +217,7 @@ func NewFileBackedTransitionStore(path string) (*FileBackedTransitionStore, erro
 // observes either the complete legacy file or the complete v2 file — never a
 // half-assigned sequence space. Caller MUST hold s.mu.
 func (s *FileBackedTransitionStore) migrateLocked(fileDropped int64, metaInconsistent bool) error {
-	recs, _, _, corrupt, _, err := s.scanRecords()
+	recs, _, _, _, corrupt, _, err := s.scanRecords()
 	if err != nil {
 		return err
 	}
@@ -277,7 +281,7 @@ func (s *FileBackedTransitionStore) migrateLocked(fileDropped int64, metaInconsi
 // `continue`-d over; presenting the surviving remainder as normal history would
 // be a new false-clean risk.
 func (s *FileBackedTransitionStore) scan() (transitions []protection.AlertTransition, fileDropped int64, metaInconsistent bool, corrupt bool, hardErr error) {
-	recs, fd, mi, corrupt, _, err := s.scanRecords()
+	recs, fd, _, mi, corrupt, _, err := s.scanRecords()
 	if err != nil {
 		return nil, 0, mi, false, err
 	}
@@ -298,20 +302,25 @@ type scannedRecord struct {
 }
 
 // scanRecords is the Phase 32 generalised scan: it returns each parsed
-// transition together with its stable durable sequence, and reports whether the
-// file is still in the LEGACY (pre-seq) format.
+// transition together with its stable durable sequence, the persisted sequence
+// watermark from the metadata record (P32-I15), and whether the file is still in
+// the LEGACY (pre-seq) format.
+//
+// metaLastSeq MUST be surfaced to callers: the recovery rule is
+// lastSeq = max(meta.last_seq, max(record.seq)), and dropping the persisted
+// watermark lets an already-allocated sequence be handed out again (R150=B).
 //
 // Corruption semantics are exactly those of P30-I12 (same trailing/middle
 // discrimination), so startup Load and the paged durable read can never disagree.
-func (s *FileBackedTransitionStore) scanRecords() (records []scannedRecord, fileDropped int64, metaInconsistent bool, corrupt bool, legacy bool, hardErr error) {
+func (s *FileBackedTransitionStore) scanRecords() (records []scannedRecord, fileDropped, metaLastSeq int64, metaInconsistent bool, corrupt bool, legacy bool, hardErr error) {
 	data, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			s.count = 0
 			s.fileDropped = 0
-			return nil, 0, false, false, false, nil
+			return nil, 0, 0, false, false, false, nil
 		}
-		return nil, 0, false, false, false, err
+		return nil, 0, 0, false, false, false, err
 	}
 	// P30-I12: a genuine crash partial write is INCOMPLETE — by definition it
 	// has NO line terminator. That distinction must be taken from the RAW bytes
@@ -326,7 +335,7 @@ func (s *FileBackedTransitionStore) scanRecords() (records []scannedRecord, file
 	if trimmed == "" {
 		s.count = 0
 		s.fileDropped = 0
-		return nil, 0, false, false, false, nil
+		return nil, 0, 0, false, false, false, nil
 	}
 	lines := strings.Split(trimmed, "\n")
 
@@ -343,6 +352,7 @@ func (s *FileBackedTransitionStore) scanRecords() (records []scannedRecord, file
 		var m fileMetaRecord
 		if json.Unmarshal([]byte(lines[0]), &m) == nil && m.Meta {
 			fileDropped = m.FileDropped
+			metaLastSeq = m.LastSeq // P32-I15: the persisted watermark
 			if m.MetaInconsistent {
 				metaInconsistent = true
 			}
@@ -381,7 +391,7 @@ func (s *FileBackedTransitionStore) scanRecords() (records []scannedRecord, file
 			// P30-I12: corruption mid-history. Stop and signal; never present
 			// the remainder as normal history without a corruption marker.
 			s.count = int64(len(txLines)) // keep the eviction mirror sane
-			return nil, 0, metaInconsistent, true, false, nil
+			return nil, 0, metaLastSeq, metaInconsistent, true, false, nil
 		}
 		// P32: a record without a sequence was written by the pre-Phase-32
 		// format (AlertTransition had no seq and no json tags).
@@ -392,7 +402,7 @@ func (s *FileBackedTransitionStore) scanRecords() (records []scannedRecord, file
 	}
 	s.count = int64(len(records))
 	s.fileDropped = fileDropped
-	return records, fileDropped, metaInconsistent, false, legacy, nil
+	return records, fileDropped, metaLastSeq, metaInconsistent, false, legacy, nil
 }
 
 // Load implements protection.AlertTransitionStore.
@@ -672,7 +682,7 @@ func (s *FileBackedTransitionStore) ReadRecent(ctx context.Context, n int) prote
 		return protection.TransitionReadResult{LoadErr: err}
 	}
 
-	recs, fd, metaInc, corrupt, _, err := s.scanRecords()
+	recs, fd, _, metaInc, corrupt, _, err := s.scanRecords()
 	if err != nil {
 		return protection.TransitionReadResult{LoadErr: err}
 	}
@@ -754,7 +764,7 @@ func (s *FileBackedTransitionStore) ReadBefore(ctx context.Context, cursor strin
 		return protection.TransitionPageResult{LoadErr: err}
 	}
 
-	recs, fd, metaInc, corrupt, _, err := s.scanRecords()
+	recs, fd, _, metaInc, corrupt, _, err := s.scanRecords()
 	if err != nil {
 		return protection.TransitionPageResult{LoadErr: err}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -75,38 +76,68 @@ func TestDurableSeq_NeverReusedAfterPostSyncError(t *testing.T) {
 
 // --- T-m4 ------------------------------------------------------------------
 // P32-I15 recovery rule: lastSeq = max(meta.last_seq, max(record.seq)).
-// A torn state (records ahead of the persisted watermark) must advance the
-// watermark past every existing record — gaps allowed, reuse forbidden.
+//
+// R150=B: this MUST cover both directions. The first case alone is also
+// satisfied by the (wrong) "max(records) only" implementation, so it cannot
+// tell the two apart; the second case is the discriminating one.
 func TestDurableSeq_RecoveryTakesMaxOfWatermarkAndRecords(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "tx.jsonl")
-	// Meta watermark lags behind the records (as a torn append would leave it).
-	seed := "{\"_meta\":true,\"file_dropped\":0,\"last_seq\":2}\n" +
-		"{\"seq\":1,\"at\":\"2020-01-01T00:00:00Z\",\"from\":false,\"to\":true,\"unknown_rate\":1,\"threshold\":50}\n" +
-		"{\"seq\":5,\"at\":\"2020-01-02T00:00:00Z\",\"from\":true,\"to\":false,\"unknown_rate\":0,\"threshold\":50}\n"
-	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
-		t.Fatalf("seed: %v", err)
+	cases := []struct {
+		name     string
+		metaSeq  int64   // persisted watermark in the meta record
+		recSeqs  []int64 // sequences actually present in the file
+		wantSeq  int64   // recovered lastSeq
+		wantNext int64   // first allocation after recovery
+	}{
+		{
+			// Records run AHEAD of the watermark (a torn append).
+			name: "records ahead of watermark", metaSeq: 2, recSeqs: []int64{1, 5},
+			wantSeq: 5, wantNext: 6,
+		},
+		{
+			// DISCRIMINATING CASE (R150): the watermark is AHEAD of every
+			// retained record, because the records carrying 6..10 were evicted.
+			// max(records) would answer 5 and re-issue 6 — that is REUSE.
+			// The correct answer honours the persisted watermark: 10, then 11.
+			name: "watermark ahead of records", metaSeq: 10, recSeqs: []int64{1, 5},
+			wantSeq: 10, wantNext: 11,
+		},
 	}
-	store, err := NewFileBackedTransitionStore(path)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	if store.lastSeq != 5 {
-		t.Fatalf("P32-I15: recovery must take max(last_seq=2, max(record.seq)=5)=5, got %d", store.lastSeq)
-	}
-	// The next append must allocate 6 — beyond every existing record.
-	if err := store.Append(context.Background(), protection.AlertTransition{
-		At: time.Now(), From: false, To: true, UnknownRate: 9, Threshold: 50,
-	}); err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	if store.lastSeq != 6 {
-		t.Fatalf("P32-I15: next allocation must be 6 (never reuse 1..5), got %d", store.lastSeq)
-	}
-	seqs := durableSeqs(t, path)
-	for i := 1; i < len(seqs); i++ {
-		if seqs[i] <= seqs[i-1] {
-			t.Fatalf("P32-I13: sequences must strictly increase, got %v", seqs)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "tx.jsonl")
+			seed := fmt.Sprintf("{\"_meta\":true,\"file_dropped\":0,\"last_seq\":%d}\n", tc.metaSeq)
+			for i, sq := range tc.recSeqs {
+				seed += fmt.Sprintf(
+					"{\"seq\":%d,\"at\":\"2020-01-0%dT00:00:00Z\",\"from\":false,\"to\":true,\"unknown_rate\":%d,\"threshold\":50}\n",
+					sq, i+1, sq)
+			}
+			if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			store, err := NewFileBackedTransitionStore(path)
+			if err != nil {
+				t.Fatalf("open store: %v", err)
+			}
+			if store.lastSeq != tc.wantSeq {
+				t.Fatalf("P32-I15: recovery = max(meta.last_seq=%d, max(records)) must be %d, got %d",
+					tc.metaSeq, tc.wantSeq, store.lastSeq)
+			}
+			if err := store.Append(context.Background(), protection.AlertTransition{
+				At: time.Now(), From: false, To: true, UnknownRate: 9, Threshold: 50,
+			}); err != nil {
+				t.Fatalf("append: %v", err)
+			}
+			if store.lastSeq != tc.wantNext {
+				t.Fatalf("P32-I15: next allocation must be %d (never reuse), got %d",
+					tc.wantNext, store.lastSeq)
+			}
+			seqs := durableSeqs(t, path)
+			for i := 1; i < len(seqs); i++ {
+				if seqs[i] <= seqs[i-1] {
+					t.Fatalf("P32-I13: sequences must strictly increase, got %v", seqs)
+				}
+			}
+		})
 	}
 }
 
