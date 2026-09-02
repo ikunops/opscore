@@ -257,6 +257,22 @@ func (f *fakeStore) ReadRecent(ctx context.Context, n int) TransitionReadResult 
 	return res
 }
 
+// ReadAll (Phase 33) returns the FULL retained set, NEWEST-FIRST — no per-call
+// count clamp. It reuses the same honesty signals as ReadRecent/Load.
+func (f *fakeStore) ReadAll(ctx context.Context) TransitionReadResult {
+	res := f.loadResult
+	if res.LoadErr != nil || res.Corrupt {
+		return res
+	}
+	txns := res.Transitions
+	out := make([]AlertTransition, 0, len(txns))
+	for i := len(txns) - 1; i >= 0; i-- {
+		out = append(out, txns[i])
+	}
+	res.Transitions = out
+	return res
+}
+
 // TestAlertTracker_P30_RestartReconstruction (T1) proves P30-I7: after a clean
 // non-empty Load, current firing reconstructs from the last transition's To, and
 // the runtime ring is seeded with the MOST RECENT transitions (not replayed, so

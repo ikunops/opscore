@@ -133,6 +133,13 @@ type AlertTransitionStore interface {
 	// read budget. It is NOT a replay and NEVER re-evaluates the alert
 	// (P31-I2). It reports the same honesty signals as Load (P31-I5).
 	ReadRecent(ctx context.Context, n int) TransitionReadResult
+	// ReadAll (Phase 33) is the FULL durable READ projection for bulk export: it
+	// returns EVERY currently-retained transition, NEWEST-FIRST, under the
+	// caller's read budget — NOT clamped to DurableReadMaxLimit (1000). Its
+	// entire reason for existing is the P32 gap where the only durable reads
+	// were bounded to 1000/page or the 256-ring snapshot; an export must stream
+	// the whole retained tail in one shot. Same honesty signals as Load.
+	ReadAll(ctx context.Context) TransitionReadResult
 	// ReadBefore (Phase 32) is the BOUNDED durable PAGING projection. It
 	// returns up to n persisted transitions that precede `cursor`,
 	// NEWEST-FIRST. An empty cursor starts from the newest record.

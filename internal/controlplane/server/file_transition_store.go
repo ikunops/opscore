@@ -708,6 +708,60 @@ func (s *FileBackedTransitionStore) ReadRecent(ctx context.Context, n int) prote
 	}
 }
 
+// ReadAll implements protection.AlertTransitionStore (Phase 33): the FULL
+// retained durable history in one read, NEWEST-FIRST, for bulk export. Unlike
+// ReadRecent it is NOT clamped to DurableReadMaxLimit (1000) — export exists
+// precisely to bypass that page cap and stream the entire retained tail. The
+// read budget (file byte cap) and the openErr/Stat/Corrupt honesty gates are
+// identical to ReadRecent; only the per-call count ceiling is lifted to the
+// full FileTransitionCapacity.
+func (s *FileBackedTransitionStore) ReadAll(ctx context.Context) protection.TransitionReadResult {
+	if err := ctx.Err(); err != nil {
+		return protection.TransitionReadResult{LoadErr: err}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.openErr != nil {
+		return protection.TransitionReadResult{LoadErr: s.openErr}
+	}
+	st, err := os.Stat(s.path)
+	if err != nil {
+		return protection.TransitionReadResult{
+			LoadErr: fmt.Errorf("durable read stat: %w", err),
+		}
+	}
+	if st.Size() > durableReadMaxBytes {
+		return protection.TransitionReadResult{
+			LoadErr: fmt.Errorf("%w: %d bytes > %d", ErrDurableBudgetExceeded, st.Size(), durableReadMaxBytes),
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return protection.TransitionReadResult{LoadErr: err}
+	}
+
+	recs, fd, _, metaInc, corrupt, _, err := s.scanRecords()
+	if err != nil {
+		return protection.TransitionReadResult{LoadErr: err}
+	}
+	if corrupt {
+		// Corrupt durable history is never served as authoritative data.
+		return protection.TransitionReadResult{Corrupt: true}
+	}
+
+	// Return ALL retained records, NEWEST-FIRST (mirror of ReadRecent ordering).
+	out := make([]protection.AlertTransition, 0, len(recs))
+	for i := len(recs) - 1; i >= 0; i-- {
+		out = append(out, recs[i].rec)
+	}
+	return protection.TransitionReadResult{
+		Transitions:                out,
+		FileDropped:                fd,
+		RetentionMetaInconsistent: metaInc,
+	}
+}
+
 // ReadBefore implements protection.AlertTransitionStore (Phase 32): a bounded
 // durable PAGE — up to n persisted transitions preceding `cursor`, NEWEST-FIRST.
 // An empty cursor starts from the newest record.
@@ -841,6 +895,13 @@ func (s *FailedTransitionStore) Load(ctx context.Context) protection.TransitionL
 // ReadRecent reports the same failure (P31-I9): a degraded store must never
 // look like "durable history exists but is empty".
 func (s *FailedTransitionStore) ReadRecent(ctx context.Context, n int) protection.TransitionReadResult {
+	return protection.TransitionReadResult{LoadErr: s.err}
+}
+
+// ReadAll reports the same failure (P33-I1): a degraded store must never look
+// like "durable history exists but is empty" — the export answers 503, never
+// a 200 with zero rows.
+func (s *FailedTransitionStore) ReadAll(ctx context.Context) protection.TransitionReadResult {
 	return protection.TransitionReadResult{LoadErr: s.err}
 }
 

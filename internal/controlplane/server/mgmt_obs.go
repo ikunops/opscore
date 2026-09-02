@@ -521,3 +521,183 @@ func (s *Server) writeDecisionsExportCSV(w http.ResponseWriter, recs []protectio
 	io.WriteString(w, fmt.Sprintf("# dropped=%d\n", stats.Dropped))
 	io.WriteString(w, fmt.Sprintf("# truncated=%v\n", stats.Truncated))
 }
+
+// handleProtectionAlertsHistoryExport (Phase 33) streams the FULL RETAINED
+// durable alert-transition history in one shot, for audit / SIEM bulk extract.
+// It is the durable counterpart of /decisions/export (which serves the
+// decision-provenance store — a DIFFERENT dataset): that endpoint covers
+// provenance; THIS one covers alert transitions.
+//
+// Durable-only (P33-I1): there is no ?source=memory path. The export's whole
+// purpose is the durable tail, and the 256-ring snapshot is already visible
+// via /alerts/history. If the durable store is unconfigured / unavailable /
+// corrupt, the handler answers 503 with an explicit reason — it NEVER answers
+// 200 with the memory ring as if that were the durable export (P31-I9 No
+// Silent Source Substitution). The envelope shape mirrors /decisions/export
+// (P33-I3) so a SIEM consumer treats both exports uniformly.
+func (s *Server) handleProtectionAlertsHistoryExport(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.gate == nil || s.alertTracker == nil {
+		writeError(w, http.StatusNotFound, "protection not enabled")
+		return
+	}
+	if s.transitionStore == nil {
+		// No durable store configured (memory mode). Explicit 503, never a
+		// 200-with-memory fallback (P33-I1).
+		s.writeHistoryExportUnavailable(w, s.alertTracker.HistoryStats(), "not_configured")
+		return
+	}
+
+	hs := s.alertTracker.HistoryStats()
+	ctx, cancel := context.WithTimeout(r.Context(), durableReadTimeout)
+	defer cancel()
+
+	res := s.transitionStore.ReadAll(ctx)
+	if res.LoadErr != nil {
+		reason := "read_error"
+		switch {
+		case errors.Is(res.LoadErr, ErrDurableBudgetExceeded):
+			reason = "budget_exceeded"
+		case errors.Is(res.LoadErr, context.DeadlineExceeded):
+			reason = "timeout"
+		}
+		s.writeHistoryExportUnavailable(w, hs, reason)
+		return
+	}
+	if res.Corrupt {
+		s.writeHistoryExportUnavailable(w, hs, "corrupt")
+		return
+	}
+
+	// P31-I11 / P33-I2: build the export from THIS read's findings, never from
+	// the tracker's stale startup stats. Recompute truncated from the values
+	// above so a retained-snapshot with file_dropped>0 can never claim
+	// truncated=false (the self-contradictory false-clean P31-I11 forbids).
+	readStatus := "ok"
+	if res.RetentionMetaInconsistent {
+		readStatus = "degraded"
+	}
+	hs.FileDropped = res.FileDropped
+	hs.RetentionMetaInconsistent = res.RetentionMetaInconsistent
+	hs.Available = true
+	hs.LoadError = false
+	hs.HistoryCorrupt = res.Corrupt
+	hs.Retained = len(res.Transitions)
+	hs.Truncated = hs.Dropped > 0 || hs.FileDropped > 0 || hs.RetentionMetaInconsistent
+
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if format == "" {
+		format = "json"
+	}
+	switch format {
+	case "json":
+		s.writeHistoryExportJSON(w, res.Transitions, hs, readStatus)
+	case "csv":
+		s.writeHistoryExportCSV(w, res.Transitions, hs, readStatus)
+	default:
+		writeError(w, http.StatusBadRequest, "unsupported format (use json|csv)")
+	}
+}
+
+func (s *Server) writeHistoryExportJSON(w http.ResponseWriter, txns []protection.AlertTransition, hs protection.TransitionHistoryStats, readStatus string) {
+	out := make([]map[string]any, 0, len(txns))
+	for _, t := range txns {
+		out = append(out, map[string]any{
+			"at":           t.At.Format(time.RFC3339),
+			"from":         t.From,
+			"to":           t.To,
+			"kind":         transitionKind(t.From, t.To),
+			"unknown_rate": t.UnknownRate,
+			"threshold":    t.Threshold,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"schema":              "alert-transition/export/v1",
+		"exported_at":         time.Now().UTC().Format(time.RFC3339),
+		"export_completeness": "retained-snapshot",
+		"transitions":         out,
+		"history_stats": map[string]any{
+			"capacity":                    protection.FileTransitionCapacity,
+			"retained":                    hs.Retained,
+			"dropped":                     hs.Dropped,
+			"file_dropped":                hs.FileDropped,
+			"truncated":                   hs.Truncated,
+			"retention_meta_inconsistent": hs.RetentionMetaInconsistent,
+			"available":                   hs.Available,
+			"load_error":                  hs.LoadError,
+			"history_corrupt":             hs.HistoryCorrupt,
+			"read_status":                 readStatus,
+		},
+	})
+}
+
+func (s *Server) writeHistoryExportCSV(w http.ResponseWriter, txns []protection.AlertTransition, hs protection.TransitionHistoryStats, readStatus string) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=alert-transitions-export-%s.csv", time.Now().UTC().Format("20060102T150405Z")))
+	w.WriteHeader(http.StatusOK)
+
+	cw := csv.NewWriter(w)
+	cw.Write([]string{"at", "from", "to", "kind", "unknown_rate", "threshold"})
+	for _, t := range txns {
+		cw.Write([]string{
+			t.At.Format(time.RFC3339),
+			strconv.FormatBool(t.From),
+			strconv.FormatBool(t.To),
+			transitionKind(t.From, t.To),
+			strconv.FormatInt(t.UnknownRate, 10),
+			strconv.FormatInt(t.Threshold, 10),
+		})
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		return // headers already sent; nothing safe to do
+	}
+	// Machine-readable metadata (P33-I5, mirrors R127-fix-3): leading '#'
+	// lines are export-format metadata, NOT data rows; consumers may ignore
+	// them.
+	io.WriteString(w, "# schema=alert-transition/export/v1\n")
+	io.WriteString(w, fmt.Sprintf("# exported_at=%s\n", time.Now().UTC().Format(time.RFC3339)))
+	io.WriteString(w, "# export_completeness=retained-snapshot\n")
+	io.WriteString(w, fmt.Sprintf("# capacity=%d\n", protection.FileTransitionCapacity))
+	io.WriteString(w, fmt.Sprintf("# retained=%d\n", hs.Retained))
+	io.WriteString(w, fmt.Sprintf("# dropped=%d\n", hs.Dropped))
+	io.WriteString(w, fmt.Sprintf("# file_dropped=%d\n", hs.FileDropped))
+	io.WriteString(w, fmt.Sprintf("# truncated=%v\n", hs.Truncated))
+	io.WriteString(w, fmt.Sprintf("# retention_meta_inconsistent=%v\n", hs.RetentionMetaInconsistent))
+	io.WriteString(w, fmt.Sprintf("# read_status=%s\n", readStatus))
+}
+
+// writeHistoryExportUnavailable answers a failed durable export with 503 +
+// explicit reason (P31-I9 / P33-I1). 200 would claim "you asked for the full
+// durable history and here it is"; we did not serve it, so we must not say so.
+func (s *Server) writeHistoryExportUnavailable(w http.ResponseWriter, hs protection.TransitionHistoryStats, reason string) {
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+		"error":       "durable alert-transition history export unavailable",
+		"reason":      reason,
+		"read_source": "durable",
+		"read_status": "unavailable",
+		"history_stats": map[string]any{
+			"capacity":                    protection.FileTransitionCapacity,
+			"retained":                    hs.Retained,
+			"dropped":                     hs.Dropped,
+			"file_dropped":                hs.FileDropped,
+			"truncated":                   hs.Truncated,
+			"retention_meta_inconsistent": hs.RetentionMetaInconsistent,
+			"available":                   hs.Available,
+			"load_error":                  hs.LoadError,
+			"history_corrupt":             hs.HistoryCorrupt,
+			"read_source":                 "durable",
+			"read_status":                 "unavailable",
+			"durable_available":           false,
+			"durable_error":               true,
+		},
+	})
+}

@@ -1624,6 +1624,11 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// extended to the FULL buffered buffer and serialized as JSON/CSV.
 	// Registered ONLY here (:8082), never :8080 / external-v1 (R21-1 / R127).
 	mux.HandleFunc("GET /management/v1/protection/decisions/export", s.handleProtectionDecisionsExport)
+	// Phase 33 Durable Alert-Transition History Export — FULL RETAINED durable
+	// history in one shot (JSON/CSV) for audit / SIEM bulk extract. Durable-only
+	// (503, never a memory fallback); envelope parallels /decisions/export.
+	// Registered ONLY here (:8082), never :8080 / external-v1 (R21-1 / P33-I4).
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export", s.handleProtectionAlertsHistoryExport)
 	return mux
 }
 
