@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -588,6 +589,24 @@ func (s *Server) handleProtectionAlertsHistoryExport(w http.ResponseWriter, r *h
 	//   file_dropped = durable retention loss
 	//   retained     = this ReadAll snapshot
 	//   truncated    = file_dropped>0 || retention_meta_inconsistent
+	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	if format == "" {
+		format = "json"
+	}
+	switch format {
+	case "json":
+		s.writeHistoryExportJSON(w, res)
+	case "csv":
+		s.writeHistoryExportCSV(w, res)
+	default:
+		writeError(w, http.StatusBadRequest, "unsupported format (use json|csv)")
+	}
+}
+
+// historyExportStats derives the honest completeness block for a durable
+// alert-transition export entirely from THIS single ReadAll snapshot (P33-I2-R1
+// / R153: the envelope must never fold in the 256-ring runtime dropped count).
+func historyExportStats(res protection.TransitionReadResult) protection.TransitionHistoryStats {
 	hs := protection.TransitionHistoryStats{
 		Retained:                  len(res.Transitions),
 		Dropped:                   res.FileDropped,
@@ -598,29 +617,22 @@ func (s *Server) handleProtectionAlertsHistoryExport(w http.ResponseWriter, r *h
 		HistoryCorrupt:            res.Corrupt,
 	}
 	hs.Truncated = res.FileDropped > 0 || res.RetentionMetaInconsistent
+	return hs
+}
 
+// serializeHistoryExportJSON writes the durable alert-transition export envelope
+// as JSON to w (Phase 33). It is a PURE serializer: the envelope is built
+// entirely from res (exported_at comes from the store's provenance, res.ExportedAt
+// — P34-CLOCK-1), so the SAME function serves both the on-demand HTTP export and
+// the Phase 34 scheduled on-disk export.
+func serializeHistoryExportJSON(w io.Writer, res protection.TransitionReadResult) error {
+	hs := historyExportStats(res)
 	readStatus := "ok"
 	if res.RetentionMetaInconsistent {
 		readStatus = "degraded"
 	}
-
-	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
-	if format == "" {
-		format = "json"
-	}
-	switch format {
-	case "json":
-		s.writeHistoryExportJSON(w, res.Transitions, hs, readStatus)
-	case "csv":
-		s.writeHistoryExportCSV(w, res.Transitions, hs, readStatus)
-	default:
-		writeError(w, http.StatusBadRequest, "unsupported format (use json|csv)")
-	}
-}
-
-func (s *Server) writeHistoryExportJSON(w http.ResponseWriter, txns []protection.AlertTransition, hs protection.TransitionHistoryStats, readStatus string) {
-	out := make([]map[string]any, 0, len(txns))
-	for _, t := range txns {
+	out := make([]map[string]any, 0, len(res.Transitions))
+	for _, t := range res.Transitions {
 		out = append(out, map[string]any{
 			"at":           t.At.Format(time.RFC3339),
 			"from":         t.From,
@@ -630,9 +642,11 @@ func (s *Server) writeHistoryExportJSON(w http.ResponseWriter, txns []protection
 			"threshold":    t.Threshold,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(map[string]any{
 		"schema":              "alert-transition/export/v1",
-		"exported_at":         time.Now().UTC().Format(time.RFC3339),
+		"exported_at":         res.ExportedAt.UTC().Format(time.RFC3339),
 		"export_completeness": "retained-snapshot",
 		"transitions":         out,
 		"history_stats": map[string]any{
@@ -650,40 +664,92 @@ func (s *Server) writeHistoryExportJSON(w http.ResponseWriter, txns []protection
 	})
 }
 
-func (s *Server) writeHistoryExportCSV(w http.ResponseWriter, txns []protection.AlertTransition, hs protection.TransitionHistoryStats, readStatus string) {
-	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=alert-transitions-export-%s.csv", time.Now().UTC().Format("20060102T150405Z")))
-	w.WriteHeader(http.StatusOK)
-
+// serializeHistoryExportCSV writes the durable alert-transition export as CSV to
+// w, with trailing '#' metadata lines (P33-I5, mirrors R127-fix-3). Pure
+// serializer shared by the on-demand handler and the Phase 34 scheduler.
+func serializeHistoryExportCSV(w io.Writer, res protection.TransitionReadResult) error {
+	hs := historyExportStats(res)
+	readStatus := "ok"
+	if res.RetentionMetaInconsistent {
+		readStatus = "degraded"
+	}
 	cw := csv.NewWriter(w)
-	cw.Write([]string{"at", "from", "to", "kind", "unknown_rate", "threshold"})
-	for _, t := range txns {
-		cw.Write([]string{
+	if err := cw.Write([]string{"at", "from", "to", "kind", "unknown_rate", "threshold"}); err != nil {
+		return err
+	}
+	for _, t := range res.Transitions {
+		if err := cw.Write([]string{
 			t.At.Format(time.RFC3339),
 			strconv.FormatBool(t.From),
 			strconv.FormatBool(t.To),
 			transitionKind(t.From, t.To),
 			strconv.FormatInt(t.UnknownRate, 10),
 			strconv.FormatInt(t.Threshold, 10),
-		})
+		}); err != nil {
+			return err
+		}
 	}
 	cw.Flush()
 	if err := cw.Error(); err != nil {
-		return // headers already sent; nothing safe to do
+		return err
 	}
 	// Machine-readable metadata (P33-I5, mirrors R127-fix-3): leading '#'
 	// lines are export-format metadata, NOT data rows; consumers may ignore
 	// them.
-	io.WriteString(w, "# schema=alert-transition/export/v1\n")
-	io.WriteString(w, fmt.Sprintf("# exported_at=%s\n", time.Now().UTC().Format(time.RFC3339)))
-	io.WriteString(w, "# export_completeness=retained-snapshot\n")
-	io.WriteString(w, fmt.Sprintf("# capacity=%d\n", protection.FileTransitionCapacity))
-	io.WriteString(w, fmt.Sprintf("# retained=%d\n", hs.Retained))
-	io.WriteString(w, fmt.Sprintf("# dropped=%d\n", hs.Dropped))
-	io.WriteString(w, fmt.Sprintf("# file_dropped=%d\n", hs.FileDropped))
-	io.WriteString(w, fmt.Sprintf("# truncated=%v\n", hs.Truncated))
-	io.WriteString(w, fmt.Sprintf("# retention_meta_inconsistent=%v\n", hs.RetentionMetaInconsistent))
-	io.WriteString(w, fmt.Sprintf("# read_status=%s\n", readStatus))
+	if _, err := io.WriteString(w, "# schema=alert-transition/export/v1\n"); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("# exported_at=%s\n", res.ExportedAt.UTC().Format(time.RFC3339))); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, "# export_completeness=retained-snapshot\n"); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("# capacity=%d\n", protection.FileTransitionCapacity)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("# retained=%d\n", hs.Retained)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("# dropped=%d\n", hs.Dropped)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("# file_dropped=%d\n", hs.FileDropped)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("# truncated=%v\n", hs.Truncated)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("# retention_meta_inconsistent=%v\n", hs.RetentionMetaInconsistent)); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, fmt.Sprintf("# read_status=%s\n", readStatus)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) writeHistoryExportJSON(w http.ResponseWriter, res protection.TransitionReadResult) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if err := serializeHistoryExportJSON(w, res); err != nil {
+		// Headers already sent; nothing safe to do but log.
+		if s.logger != nil {
+			s.logger.Error("history export json serialize failed", "err", err)
+		}
+	}
+}
+
+func (s *Server) writeHistoryExportCSV(w http.ResponseWriter, res protection.TransitionReadResult) {
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=alert-transitions-export-%s.csv", res.ExportedAt.UTC().Format("20060102T150405Z")))
+	w.WriteHeader(http.StatusOK)
+	if err := serializeHistoryExportCSV(w, res); err != nil {
+		// Headers already sent; nothing safe to do but log.
+		if s.logger != nil {
+			s.logger.Error("history export csv serialize failed", "err", err)
+		}
+	}
 }
 
 // writeHistoryExportUnavailable answers a failed durable export with 503 +
@@ -711,4 +777,30 @@ func (s *Server) writeHistoryExportUnavailable(w http.ResponseWriter, hs protect
 			"durable_error":               true,
 		},
 	})
+}
+
+// handleHistoryExportSchedulerStatus (Phase 34) exposes the read-only state of
+// the scheduled periodic exporter. It is a STATUS endpoint, never an export —
+// it returns counters and the last-run timestamp, not history. When the
+// scheduler is nil (disabled), it reports enabled=false so a consumer can tell
+// "not configured" apart from "configured and idle".
+func (s *Server) handleHistoryExportSchedulerStatus(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.historyScheduler == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"running": false,
+			"message": "scheduled history export is disabled (configure --export-interval and --export-dir to enable)",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.historyScheduler.Status())
 }

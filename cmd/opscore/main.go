@@ -9,10 +9,12 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/YuDong999/opscore/internal/builtin"
@@ -455,6 +457,12 @@ func cmdServe(args []string) {
 	// can be exercised locally without a real systemd target. The fake host
 	// becomes the default target.
 	demoMode := fs.Bool("demo", cfgBool(vals, "demo", false), "start an embedded fake SSH host and use it as the default target")
+	// Phase 34 (scheduled periodic export): OPT-IN. Enabled only when BOTH a
+	// positive interval and a destination dir are set; otherwise stays off.
+	exportInterval := fs.Duration("export-interval", 0, "scheduled durable alert-transition history export period (0 = disabled)")
+	exportDir := fs.String("export-dir", "", "destination directory for scheduled history snapshots (required when export-interval > 0)")
+	exportFormats := fs.String("export-formats", "json,csv", "comma-separated export formats (json,csv)")
+	exportRetain := fs.Int("export-retain", 96, "local snapshot retention cap (0 = keep all; default 96)")
 	fs.Parse(args)
 
 	logger := newLogger()
@@ -568,6 +576,35 @@ func cmdServe(args []string) {
 		transitionPath = *dbPath + ".alert-transitions.jsonl"
 	}
 	bundle := buildProtectionGate(stor, logger, transitionPath)
+
+	// Phase 34: build the OPT-IN scheduled exporter. Enabled only when BOTH a
+	// positive interval and a destination dir are configured; a PARTIAL config
+	// (one set, the other not) or an unknown/empty format fails fast (P34-I5 —
+	// never silently degrades to disabled).
+	var exportScheduler *server.HistoryExportScheduler
+	exportEnabled := *exportInterval > 0 && *exportDir != ""
+	if *exportInterval > 0 != (*exportDir != "") {
+		logger.Error("scheduled history export misconfigured — both --export-interval and --export-dir are required together (P34-I5 fail-fast)",
+			"interval", exportInterval.String(), "dir", *exportDir)
+		os.Exit(1)
+	}
+	if exportEnabled {
+		formats := parseExportFormats(*exportFormats)
+		sc, err := server.NewHistoryExportScheduler(server.HistoryExportConfig{
+			Store:    bundle.transitionStore,
+			Dir:      *exportDir,
+			Interval: *exportInterval,
+			Formats:  formats,
+			Retain:   *exportRetain,
+			Logger:   logger,
+		})
+		if err != nil {
+			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)
+			os.Exit(1)
+		}
+		exportScheduler = sc
+	}
+
 	srv, err := server.New(server.Config{
 		Storage:        stor,
 		Dispatcher:     dispatcher,
@@ -585,6 +622,7 @@ func cmdServe(args []string) {
 		AlertTracker:    bundle.alertTracker,
 		AlertPolicy:     bundle.alertPolicy,
 		TransitionStore: bundle.transitionStore,
+		HistoryScheduler: exportScheduler,
 	})
 	if err != nil {
 		logger.Error("server init failed", "err", err)
@@ -625,18 +663,64 @@ func cmdServe(args []string) {
 	// :8082 — do NOT also run the harness management surface on the same :8082
 	// on one host, or the protection read surface collides ("correct code,
 	// wrong topology").
+
+	// Signal-aware lifecycle (P34-I4: the export scheduler is bound to serve).
+	// serveCtx is cancelled on SIGINT/SIGTERM; the scheduler stops accepting
+	// new ticks and settles its in-flight tick, then Done() closes.
+	serveCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	mainSrv := &http.Server{Addr: *addr, Handler: srv.Handler()}
+	muxSrv := &http.Server{Addr: *mgmtAddr, Handler: srv.ProtectionReadMux()}
+
 	go func() {
 		logger.Info("OpsCore Protection management read surface listening", "addr", *mgmtAddr)
-		if err := http.ListenAndServe(*mgmtAddr, srv.ProtectionReadMux()); err != nil {
+		if err := muxSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("protection management read surface stopped", "err", err)
 		}
 	}()
 
-	logger.Info("OpsCore Control Plane listening", "addr", *addr, "storage", *storageKind)
-	if err := http.ListenAndServe(*addr, srv.Handler()); err != nil {
-		logger.Error("server stopped", "err", err)
-		os.Exit(1)
+	// Phase 34 (P34-I4 lifecycle bound to serve): start the scheduled exporter
+	// bound to the serve context. Start is fire-and-forget; shutdown completes
+	// on serveCtx cancellation and is observable via exportScheduler.Done().
+	if exportScheduler != nil {
+		exportScheduler.Start(serveCtx)
+		logger.Info("scheduled history export enabled", "dir", *exportDir, "interval", exportInterval.String(), "formats", *exportFormats, "retain", *exportRetain)
 	}
+
+	logger.Info("OpsCore Control Plane listening", "addr", *addr, "storage", *storageKind)
+	go func() {
+		if err := mainSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("server stopped", "err", err)
+		}
+	}()
+
+	// Block until a termination signal cancels serveCtx; then gracefully shut
+	// down the HTTP surfaces and the export scheduler.
+	<-serveCtx.Done()
+	logger.Info("shutdown signal received — draining")
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	_ = mainSrv.Shutdown(shutdownCtx)
+	_ = muxSrv.Shutdown(shutdownCtx)
+	if exportScheduler != nil {
+		<-exportScheduler.Done()
+	}
+	stop()
+	os.Exit(0)
+}
+
+// parseExportFormats splits a comma-separated format list, trims spaces, and
+// drops empty entries. An all-empty string yields nil (the scheduler's
+// New() then fails fast on "at least one format required", P34-I5).
+func parseExportFormats(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func cmdList() {

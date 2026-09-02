@@ -108,12 +108,18 @@ type AlertTransition struct {
 //     and presenting the remainder as normal history (new false-clean risk).
 //   - LoadErr: non-nil on any I/O/permission failure. A load failure
 //     is NOT "no history"; it is "unknown prior state" (P30-I11).
+//   - ExportedAt: the store-side wall-clock timestamp at which THIS snapshot
+//     was materialized (Phase 34 provenance). It is the STORE's time, never
+//     the scheduler's clock (P34-CLOCK-1): the scheduler must never derive
+//     ExportedAt from its own clock, so a snapshot's exported_at stays honest
+//     about when the durable history was read, not when the ticker fired.
 type TransitionLoadResult struct {
 	Transitions                []AlertTransition
 	FileDropped                int64
 	RetentionMetaInconsistent bool
 	Corrupt                    bool
 	LoadErr                    error
+	ExportedAt                 time.Time
 }
 
 // AlertTransitionStore is the durable, cross-restart retention boundary for

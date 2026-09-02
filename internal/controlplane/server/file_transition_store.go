@@ -759,6 +759,7 @@ func (s *FileBackedTransitionStore) ReadAll(ctx context.Context) protection.Tran
 		Transitions:                out,
 		FileDropped:                fd,
 		RetentionMetaInconsistent: metaInc,
+		ExportedAt:                 time.Now().UTC(),
 	}
 }
 

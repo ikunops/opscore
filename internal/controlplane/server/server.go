@@ -102,6 +102,11 @@ type Config struct {
 	// becomes a second authority over the store — the AlertTracker keeps owning
 	// the write path and the startup load (P31-I6).
 	TransitionStore protection.AlertTransitionStore
+	// HistoryScheduler is the OPT-IN Phase 34 scheduled periodic exporter of the
+	// durable alert-transition history. Nil means disabled (default-off). When
+	// set, the composition root has already started it bound to the serve
+	// lifecycle; the Server only exposes its read-only status here.
+	HistoryScheduler *HistoryExportScheduler
 	// HostStore, when set, enables the Host Registry: operations may reference
 	// a named host ("target": "web-01") instead of a full inline connection
 	// spec, and /api/hosts CRUD manages the registry. Nil disables both.
@@ -164,6 +169,8 @@ type Server struct {
 	// Phase 31 bounded read projection (?source=durable). It is the same
 	// instance the tracker writes through; the Server never owns its state.
 	transitionStore protection.AlertTransitionStore
+	// historyScheduler is the OPT-IN Phase 34 scheduled exporter (nil = off).
+	historyScheduler *HistoryExportScheduler
 	// alertPolicy is the Phase 24.2 declarative alert threshold config.
 	alertPolicy protection.AlertPolicy
 }
@@ -207,6 +214,7 @@ func New(cfg Config) (*Server, error) {
 		alertTracker:  cfg.AlertTracker,
 		alertPolicy:   cfg.AlertPolicy,
 		transitionStore: cfg.TransitionStore,
+		historyScheduler: cfg.HistoryScheduler,
 	}
 	if cfg.BootstrapAdmin != nil {
 		if err := s.bootstrapAdmin(cfg.BootstrapAdmin); err != nil {
@@ -1629,6 +1637,10 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// (503, never a memory fallback); envelope parallels /decisions/export.
 	// Registered ONLY here (:8082), never :8080 / external-v1 (R21-1 / P33-I4).
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export", s.handleProtectionAlertsHistoryExport)
+	// Phase 34 status (read-only): shows whether the scheduled periodic export
+	// is enabled and its last-run / error counters. Registered ONLY here
+	// (:8082), never :8080 (R21-1).
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/scheduler", s.handleHistoryExportSchedulerStatus)
 	return mux
 }
 
