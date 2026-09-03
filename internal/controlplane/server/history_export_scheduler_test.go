@@ -99,6 +99,10 @@ func TestHistoryExportConfigValidation(t *testing.T) {
 	if _, err := NewHistoryExportScheduler(good); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
 	}
+	// nil Store is a fail-fast config error (R160 / R161-B fix).
+	if _, err := NewHistoryExportScheduler(HistoryExportConfig{Dir: t.TempDir(), Interval: time.Minute, Formats: []string{"json"}, Store: nil}); err == nil {
+		t.Fatal("nil store: expected fail-fast error, got nil")
+	}
 	cases := []struct {
 		name string
 		cfg  HistoryExportConfig
@@ -451,16 +455,36 @@ func TestHistoryExportPruneRetention(t *testing.T) {
 	}
 }
 
-// T15 — durable-only skip: nil store marks skip, writes no file.
-func TestHistoryExportNilStoreSkips(t *testing.T) {
-	dir := t.TempDir()
-	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: nil, Dir: dir, Interval: time.Hour, Formats: []string{"json"}})
-	s.Tick(context.Background())
-	if len(formalFiles(t, dir)) != 0 {
-		t.Fatal("nil store must not write any file")
+// T15 — nil Store is a fail-fast config error (R160). A non-nil store that
+// later returns error/corrupt still skips at runtime (see T16), but nil is
+// never accepted at construction (R161/B fix).
+func TestHistoryExportNilStoreRejected(t *testing.T) {
+	if _, err := NewHistoryExportScheduler(HistoryExportConfig{Store: nil, Dir: t.TempDir(), Interval: time.Hour, Formats: []string{"json"}}); err == nil {
+		t.Fatal("nil store must fail-fast at New, got nil error")
 	}
-	if s.Status().LastError == "" {
-		t.Fatal("nil store skip must set LastError")
+}
+
+// T17 — dual-format retention counts SNAPSHOTS, not files (R161/B fix).
+// Retain=3 with [json,csv] must keep 3 snapshots = 6 artifact files, not 3.
+func TestHistoryExportDualFormatRetentionCountsSnapshots(t *testing.T) {
+	dir := t.TempDir()
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions()}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json", "csv"}, Retain: 3})
+	for i := 0; i < 5; i++ {
+		st.res.ExportedAt = time.Date(2026, 8, 29, 15, 0, 0, i*1000, time.UTC)
+		s.Tick(context.Background())
+	}
+	files := formalFiles(t, dir)
+	if len(files) != 6 {
+		t.Fatalf("dual-format Retain=3 should keep 3 snapshots = 6 files, got %d: %v", len(files), files)
+	}
+	// exactly 3 distinct snapshots (json+csv of one ExportedAt share a unit)
+	units := make(map[string]bool)
+	for _, f := range files {
+		units[snapshotGroupKey(f)] = true
+	}
+	if len(units) != 3 {
+		t.Fatalf("expected 3 distinct snapshots, got %d: %v", len(units), units)
 	}
 }
 

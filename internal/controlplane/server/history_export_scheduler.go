@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -25,9 +26,11 @@ const historyExportFileBase = "alert-transitions"
 // composition root only constructs it when BOTH a positive interval and a
 // destination dir are supplied; otherwise it stays nil and nothing is written.
 type HistoryExportConfig struct {
-	// Store is the durable alert-transition store. May be nil (memory mode):
-	// a nil store makes every tick a durable-unavailable SKIP (never a
-	// pseudo-success file), not a startup error (P34 durable-only).
+	// Store is the durable alert-transition store. REQUIRED: a nil Store is a
+	// fail-fast config error at New time (R160 — durable-only export never
+	// silently degrades to a no-op scheduler). A configured store that later
+	// returns a ReadAll error/corrupt still makes the tick SKIP at runtime
+	// (degraded store), but nil is never accepted.
 	Store protection.AlertTransitionStore
 	// Dir is the destination directory for snapshot files. Required when enabled.
 	Dir string
@@ -37,8 +40,12 @@ type HistoryExportConfig struct {
 	// is published independently; a partial failure is reported explicitly
 	// (P34-I2 — no faked success). Only "json" and "csv" are accepted.
 	Formats []string
-	// Retain is the local file retention cap. 0 keeps ALL snapshots; >0 keeps
-	// at most Retain newest files (P34-I6 bounded local retention). Default 96.
+	// Retain is the local snapshot retention cap. 0 keeps ALL snapshots; >0
+	// keeps at most Retain newest SNAPSHOTS. One scheduled export (one
+	// ExportedAt) is ONE snapshot regardless of how many formats (.json/.csv)
+	// it materializes; a snapshot and all its artifact files are removed together
+	// (P34-I6 bounded local retention, corrected to snapshot units per R161/B).
+	// Default 96.
 	Retain int
 	// Logger receives lifecycle/error diagnostics. May be nil.
 	Logger *slog.Logger
@@ -114,6 +121,12 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 	if cfg.Retain < 0 {
 		return nil, fmt.Errorf("history export: retain must be >= 0 (0 = keep all)")
 	}
+	// R160 (durable-only): a nil Store is a fail-fast config error, never a
+	// silent no-op scheduler. A non-nil but erroring store is handled at Tick
+	// time (degraded-store skip), not here.
+	if cfg.Store == nil {
+		return nil, fmt.Errorf("history export: store is required (durable-only export)")
+	}
 	clock := cfg.Clock
 	if clock == nil {
 		clock = time.Now
@@ -177,16 +190,8 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 		s.mu.Unlock()
 	}()
 
-	// Durable-only (P34 durable-only): a nil store means memory mode — there is
-	// no durable history to export, so we SKIP and mark it explicitly. We never
-	// write a pseudo-success file containing the 256-ring snapshot.
-	if s.cfg.Store == nil {
-		s.mu.Lock()
-		s.lastError = "durable store not configured (memory mode) — skipped"
-		s.mu.Unlock()
-		return
-	}
-
+	// Store is guaranteed non-nil by New (R160 fail-fast). A configured store
+	// that errors/corrupts at runtime is a degraded-store SKIP further below.
 	res := s.cfg.Store.ReadAll(ctx)
 	if res.LoadErr != nil {
 		s.mu.Lock()
@@ -343,10 +348,20 @@ func serializeHistoryExportForFormat(w io.Writer, fmtName string, res protection
 	}
 }
 
-// prune enforces the bounded local retention cap (P34-I6). 0 keeps all files.
-// Candidates are the scheduler's own snapshot files only (prefixed
-// historyExportFileBase + "-"); .tmp/.reserve leftovers are ignored, and
-// unrelated files in Dir are never touched. Oldest excess files are removed.
+// collisionSuffixRE matches a trailing ".<digits>" collision-retry suffix on a
+// snapshot file name. Such a suffix means the same ExportedAt was published
+// again because the original target was already occupied; it does NOT make the
+// file a separate retention unit (R161/B).
+var collisionSuffixRE = regexp.MustCompile(`\.\d+$`)
+
+// prune enforces the bounded local retention cap (P34-I6) in SNAPSHOT units.
+// 0 keeps all snapshots. Candidates are the scheduler's own snapshot files only
+// (prefixed historyExportFileBase + "-"); .tmp/.reserve leftovers are ignored,
+// and unrelated files in Dir are never touched. A snapshot is identified by its
+// ExportedAt timestamp after stripping the format (.json/.csv) AND any trailing
+// collision-retry suffix, so all artifact files of one export (and any rare
+// collision variants) form a single retention unit removed together. Oldest
+// excess snapshots are removed (P34-I6 corrected to snapshot units per R161/B).
 func (s *HistoryExportScheduler) prune() error {
 	if s.cfg.Retain <= 0 {
 		return nil // 0 = keep all
@@ -355,11 +370,9 @@ func (s *HistoryExportScheduler) prune() error {
 	if err != nil {
 		return fmt.Errorf("prune read dir: %w", err)
 	}
-	type snap struct {
-		name string
-		key  string // chronological sort key (timestamp (+ optional .N suffix))
-	}
-	var snaps []snap
+	// group files by snapshot identity (one export = one unit, multi-format)
+	groups := make(map[string][]string) // groupKey -> file names
+	var order []string                   // insertion order of group keys
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -371,19 +384,34 @@ func (s *HistoryExportScheduler) prune() error {
 		if strings.HasSuffix(name, ".tmp") || strings.HasSuffix(name, ".reserve") {
 			continue
 		}
-		snaps = append(snaps, snap{name: name, key: snapshotSortKey(name)})
+		gk := snapshotGroupKey(name)
+		if _, ok := groups[gk]; !ok {
+			order = append(order, gk)
+		}
+		groups[gk] = append(groups[gk], name)
 	}
-	if len(snaps) <= s.cfg.Retain {
+	if len(groups) <= s.cfg.Retain {
 		return nil
 	}
-	sort.SliceStable(snaps, func(i, j int) bool { return snaps[i].key < snaps[j].key })
-	excess := len(snaps) - s.cfg.Retain
+	sort.SliceStable(order, func(i, j int) bool { return order[i] < order[j] })
+	excess := len(groups) - s.cfg.Retain
 	for i := 0; i < excess; i++ {
-		if err := os.Remove(filepath.Join(s.cfg.Dir, snaps[i].name)); err != nil {
-			return fmt.Errorf("prune remove %s: %w", snaps[i].name, err)
+		gk := order[i]
+		for _, fn := range groups[gk] {
+			if err := os.Remove(filepath.Join(s.cfg.Dir, fn)); err != nil {
+				return fmt.Errorf("prune remove %s: %w", fn, err)
+			}
 		}
 	}
 	return nil
+}
+
+// snapshotGroupKey returns the retention unit (snapshot) identity for a file:
+// alert-transitions-<ts>.<fmt>[.N] -> "<ts>". It strips the format suffix (via
+// snapshotSortKey) and any trailing collision-retry ".<digits>" so the json and
+// csv artifacts of one export — and rare retry variants — share one unit.
+func snapshotGroupKey(name string) string {
+	return collisionSuffixRE.ReplaceAllString(snapshotSortKey(name), "")
 }
 
 // snapshotSortKey extracts the chronological ordering key from a snapshot file
