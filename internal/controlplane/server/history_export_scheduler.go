@@ -286,8 +286,12 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 			names[f] = name + "." + f
 		}
 
-		// 1. Reserve the WHOLE group's slots (EEXIST => ordinal occupied).
+		// 1. Reserve the WHOLE group's slots (EEXIST => ordinal occupied). Every
+		// sentinel WE create is recorded (bool + FileInfo) so cleanup can later
+		// prove ownership instead of removing pathnames (R164/B).
 		reserved := make(map[string]bool, len(s.cfg.Formats))
+		sentinelInfo := make(map[string]os.FileInfo, len(s.cfg.Formats))
+		tmpInfo := make(map[string]os.FileInfo, len(s.cfg.Formats))
 		reserveErr := ""
 		reserveExist := false
 		for _, f := range s.cfg.Formats {
@@ -297,13 +301,16 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 				reserveExist = os.IsExist(err)
 				break
 			}
+			// Ownership evidence for the sentinel we just created.
+			if si, serr := sf.Stat(); serr == nil {
+				sentinelInfo[f] = si
+			}
 			sf.Close()
 			reserved[f] = true
 		}
 		if reserveErr != "" {
-			for f := range reserved {
-				os.Remove(filepath.Join(s.cfg.Dir, names[f]+".reserve"))
-			}
+			// Clean up ONLY the sentinels this scheduler created (ownership-safe).
+			s.cleanupArtifacts(names, nil, sentinelInfo)
 			if reserveExist {
 				continue // base ordinal occupied -> the whole group advances
 			}
@@ -313,9 +320,12 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 		// 2. Per-format tmp writes (write failures never move the ordinal).
 		writeErrs := make(map[string]error, len(s.cfg.Formats))
 		for _, f := range s.cfg.Formats {
-			if werr := s.writeTmp(filepath.Join(s.cfg.Dir, names[f]+".tmp"), f, res); werr != nil {
+			info, werr := s.writeTmp(filepath.Join(s.cfg.Dir, names[f]+".tmp"), f, res)
+			if werr != nil {
 				writeErrs[f] = werr
+				continue
 			}
+			tmpInfo[f] = info // we created it -> we own it
 		}
 
 		// 2b. Pre-check EVERY target BEFORE any link: if an external/legacy file
@@ -363,11 +373,10 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 			}
 		}
 
-		// Cleanup tmp + sentinel debris for every format of this ordinal.
-		for _, f := range s.cfg.Formats {
-			os.Remove(filepath.Join(s.cfg.Dir, names[f]+".tmp"))
-			os.Remove(filepath.Join(s.cfg.Dir, names[f]+".reserve"))
-		}
+		// Cleanup OUR OWN tmp + sentinel debris for this ordinal. Removals are
+		// ownership-checked, so a pathname that is no longer our own file (or was
+		// never created by us) is preserved — never deleted by name (R164/B).
+		s.cleanupArtifacts(names, tmpInfo, sentinelInfo)
 		if occupied {
 			// Nothing was linked at this ordinal: the whole group advances.
 			// Never fall through to the success path here — that would report
@@ -400,12 +409,22 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 	return []string{"could not reserve a free snapshot slot after 100 retries"}
 }
 
-func (s *HistoryExportScheduler) writeTmp(tmpPath, fmtName string, res protection.TransitionReadResult) (err error) {
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+// writeTmp streams one format into tmpPath and returns the FileInfo of the file
+// it created, so the caller can later prove OWNERSHIP before deleting it
+// (R164/B — cleanup must never remove a pathname blindly). O_EXCL is used: the
+// sentinel already reserves this slot, so an existing tmp path here is not ours
+// and is refused instead of being truncated (no foreign data is ever destroyed).
+// On success the caller owns the tmp; on error no ownership is granted.
+func (s *HistoryExportScheduler) writeTmp(tmpPath, fmtName string, res protection.TransitionReadResult) (info os.FileInfo, err error) {
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
+		// Stat while the fd is still open: this is the file WE created.
+		if fi, serr := f.Stat(); serr == nil {
+			info = fi
+		}
 		cerr := f.Close()
 		if err == nil {
 			err = cerr
@@ -414,9 +433,27 @@ func (s *HistoryExportScheduler) writeTmp(tmpPath, fmtName string, res protectio
 	// Stream straight into the file (no full-buffer copy); the serializer
 	// writers are the same pure functions the HTTP export uses.
 	if werr := serializeHistoryExportForFormat(f, fmtName, res); werr != nil {
-		return werr
+		return nil, werr
 	}
-	return f.Sync()
+	return nil, f.Sync()
+}
+
+// cleanupArtifacts removes the .tmp and .reserve debris THIS scheduler created
+// at one ordinal — and only that debris. Each candidate is identified by the
+// os.FileInfo captured when we created it (nil = we never created it, so it is
+// left alone), and removeOwnArtifact re-verifies identity before unlinking. A
+// pathname that has since been replaced by another process is therefore
+// preserved; cleanup errors are best-effort and never affect the publish result
+// (P34-STATE: they are not format failures).
+func (s *HistoryExportScheduler) cleanupArtifacts(names map[string]string, tmpInfo, sentinelInfo map[string]os.FileInfo) {
+	for _, f := range s.cfg.Formats {
+		if info, ok := tmpInfo[f]; ok && info != nil {
+			removeOwnArtifact(filepath.Join(s.cfg.Dir, names[f]+".tmp"), info)
+		}
+		if info, ok := sentinelInfo[f]; ok && info != nil {
+			removeOwnArtifact(filepath.Join(s.cfg.Dir, names[f]+".reserve"), info)
+		}
+	}
 }
 
 // removeOwnArtifact removes path ONLY IF it is still the exact file identified

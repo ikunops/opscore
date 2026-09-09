@@ -674,6 +674,83 @@ func TestHistoryExportRemoveOwnArtifactOwnershipSafe(t *testing.T) {
 	}
 }
 
+// T22 (R164/B) — reservation sentinel / tmp cleanup is ownership-safe: only the
+// debris THIS scheduler created is removed, and only while it is still that same
+// file. Foreign reserves are preserved (never deleted by pathname).
+func TestHistoryExportCleanupArtifactsOwnershipSafe(t *testing.T) {
+	dir := t.TempDir()
+	base := "alert-transitions-20260829T170000Z"
+	names := map[string]string{"json": base + ".json", "csv": base + ".csv"}
+
+	// Ours: created by us, identity recorded.
+	ourTmp := filepath.Join(dir, base+".json.tmp")
+	ourReserve := filepath.Join(dir, base+".json.reserve")
+	if err := os.WriteFile(ourTmp, []byte("tmp"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ourReserve, []byte("reserve"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ourTmpInfo, err := os.Lstat(ourTmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ourReserveInfo, err := os.Lstat(ourReserve)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Foreign: created by "another process" — never recorded, must survive.
+	foreignTmp := filepath.Join(dir, base+".csv.tmp")
+	foreignReserve := filepath.Join(dir, base+".csv.reserve")
+	if err := os.WriteFile(foreignTmp, []byte("FOREIGN-TMP"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(foreignReserve, []byte("FOREIGN-RESERVE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions()}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json", "csv"}})
+	s.cleanupArtifacts(names,
+		map[string]os.FileInfo{"json": ourTmpInfo},                    // csv: not ours
+		map[string]os.FileInfo{"json": ourReserveInfo})                 // csv: not ours
+
+	if _, err := os.Lstat(ourTmp); !os.IsNotExist(err) {
+		t.Fatal("our own tmp should be cleaned up")
+	}
+	if _, err := os.Lstat(ourReserve); !os.IsNotExist(err) {
+		t.Fatal("our own sentinel should be cleaned up")
+	}
+	if data, err := os.ReadFile(foreignTmp); err != nil || string(data) != "FOREIGN-TMP" {
+		t.Fatalf("foreign tmp was deleted: %v / %q", err, data)
+	}
+	if data, err := os.ReadFile(foreignReserve); err != nil || string(data) != "FOREIGN-RESERVE" {
+		t.Fatalf("foreign sentinel was deleted: %v / %q", err, data)
+	}
+
+	// NOTE: a "created by us, then replaced by a foreign file" race is NOT
+	// asserted here on purpose: on Windows/NTFS a delete+recreate can reuse the
+	// same file index, so os.SameFile legitimately still matches. The invariant
+	// this test pins is the ownership RECORD: we never delete a file we did not
+	// create (covered above), and removeOwnArtifact's identity check is covered
+	// by T21 with a genuinely different file.
+
+	// Integration: a normal tick leaves NO debris of its own behind.
+	dir2 := t.TempDir()
+	st2 := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions(), ExportedAt: time.Date(2026, 8, 29, 17, 5, 0, 0, time.UTC)}}
+	s2, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st2, Dir: dir2, Interval: time.Hour, Formats: []string{"json", "csv"}})
+	s2.Tick(context.Background())
+	leftovers, _ := filepath.Glob(filepath.Join(dir2, "*.reserve"))
+	leftovers2, _ := filepath.Glob(filepath.Join(dir2, "*.tmp"))
+	if len(leftovers) != 0 || len(leftovers2) != 0 {
+		t.Fatalf("own debris not cleaned: %v %v", leftovers, leftovers2)
+	}
+	if got := len(formalFiles(t, dir2)); got != 2 {
+		t.Fatalf("expected 2 formal artifacts, got %d", got)
+	}
+}
+
 // itoa is a tiny local helper (avoid importing strconv in tests just for this).
 func itoa(n int) string {
 	if n == 0 {
