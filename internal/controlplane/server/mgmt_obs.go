@@ -804,3 +804,91 @@ func (s *Server) handleHistoryExportSchedulerStatus(w http.ResponseWriter, r *ht
 	}
 	writeJSON(w, http.StatusOK, s.historyScheduler.Status())
 }
+
+// handleHistoryExportManifestList (Phase 35) lists manifest-bearing snapshot
+// groups NEWEST-FIRST with opaque publication_id cursors. Read-only, admin-only,
+// :8082 only. Cursor contract (frozen): 400 invalid_cursor / 409 cursor_expired /
+// 409 cursor_ambiguous. The scheduler being disabled is an explicit 503, never
+// a fake empty page (durable-only / opt-in honesty).
+func (s *Server) handleHistoryExportManifestList(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.historyScheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduled history export is disabled (configure --export-interval and --export-dir to enable)")
+		return
+	}
+	limit := 10
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	entries, next, lerr := s.historyScheduler.ListManifests(limit, r.URL.Query().Get("before"))
+	switch {
+	case lerr == nil:
+	case errors.Is(lerr, ErrCursorInvalid):
+		writeError(w, http.StatusBadRequest, "invalid_cursor")
+		return
+	case errors.Is(lerr, ErrCursorExpired):
+		writeError(w, http.StatusConflict, "cursor_expired")
+		return
+	case errors.Is(lerr, ErrCursorAmbiguous):
+		writeError(w, http.StatusConflict, "cursor_ambiguous")
+		return
+	default:
+		writeError(w, http.StatusInternalServerError, lerr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries":     entries,
+		"next_cursor": next,
+		"count":       len(entries),
+	})
+}
+
+// handleHistoryExportVerify (Phase 35) runs the read-only integrity
+// verification over the newest snapshot groups across BOTH discovery domains
+// (manifest ∪ artifact). It never writes, deletes, or repairs anything (M3).
+func (s *Server) handleHistoryExportVerify(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.historyScheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduled history export is disabled (configure --export-interval and --export-dir to enable)")
+		return
+	}
+	limit := 10
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	results, verr := s.historyScheduler.VerifySnapshots(limit)
+	if verr != nil {
+		writeError(w, http.StatusInternalServerError, verr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"checked": len(results),
+		"results": results,
+	})
+}

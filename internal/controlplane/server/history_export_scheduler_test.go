@@ -134,12 +134,17 @@ func TestHistoryExportSingleTickWritesFile(t *testing.T) {
 	s.Tick(context.Background())
 
 	files := formalFiles(t, dir)
-	if len(files) != 1 {
-		t.Fatalf("expected 1 file, got %v", files)
+	// Phase 35: the tick publishes the artifact AND its manifest.
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files (json + manifest), got %v", files)
 	}
 	want := "alert-transitions-" + safeTS(exp) + ".json"
-	if files[0] != want {
-		t.Fatalf("filename = %q, want %q", files[0], want)
+	wantManifest := "alert-transitions-" + safeTS(exp) + ".manifest.json"
+	if !strings.Contains(strings.Join(files, " "), want) {
+		t.Fatalf("filename missing %q, got %v", want, files)
+	}
+	if !strings.Contains(strings.Join(files, " "), wantManifest) {
+		t.Fatalf("manifest missing %q, got %v", wantManifest, files)
 	}
 	// content parses as the export envelope
 	data, _ := os.ReadFile(filepath.Join(dir, files[0]))
@@ -164,8 +169,9 @@ func TestHistoryExportBothFormats(t *testing.T) {
 	s.Tick(context.Background())
 
 	files := formalFiles(t, dir)
-	if len(files) != 2 {
-		t.Fatalf("expected 2 files, got %v", files)
+	// Phase 35: both formats plus the snapshot manifest.
+	if len(files) != 3 {
+		t.Fatalf("expected 3 files (json + csv + manifest), got %v", files)
 	}
 	// each format present
 	joined := strings.Join(files, " ")
@@ -213,11 +219,12 @@ func TestHistoryExportUsesStoreExportedAt(t *testing.T) {
 	s.Tick(context.Background())
 
 	files := formalFiles(t, dir)
-	if len(files) != 1 {
-		t.Fatalf("expected 1 file, got %v", files)
+	// Phase 35: artifact + manifest, both named from the store's ExportedAt.
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %v", files)
 	}
-	if !strings.Contains(files[0], safeTS(storeTS)) {
-		t.Fatalf("filename %q does not contain store timestamp %q", files[0], safeTS(storeTS))
+	if !strings.Contains(strings.Join(files, " "), safeTS(storeTS)) {
+		t.Fatalf("filenames %v do not contain store timestamp %q", files, safeTS(storeTS))
 	}
 	if strings.Contains(files[0], "2099") {
 		t.Fatalf("filename leaked scheduler clock: %q", files[0])
@@ -251,19 +258,23 @@ func TestHistoryExportSameTsNoOverwrite(t *testing.T) {
 		t.Fatal("first snapshot was overwritten by second tick")
 	}
 	files := formalFiles(t, dir)
-	// original + renamed retry (alert-transitions-<ts>.1.json — the collision
-	// ordinal attaches to the SHARED snapshot base, before the extension).
-	if len(files) != 2 {
-		t.Fatalf("expected 2 files (original + renamed retry), got %v", files)
+	// original (json+manifest) + renamed retry (.1.json + .1.manifest.json) —
+	// the collision ordinal attaches to the SHARED snapshot base, before the
+	// extension, and the manifest rides on the same base (Phase 35).
+	if len(files) != 4 {
+		t.Fatalf("expected 4 files (original + retry, each with manifest), got %v", files)
 	}
-	hasRetry := false
+	hasRetryJSON, hasRetryManifest := false, false
 	for _, f := range files {
 		if f == "alert-transitions-"+safeTS(exp)+".1.json" {
-			hasRetry = true
+			hasRetryJSON = true
+		}
+		if f == "alert-transitions-"+safeTS(exp)+".1.manifest.json" {
+			hasRetryManifest = true
 		}
 	}
-	if !hasRetry {
-		t.Fatalf("expected renamed retry file, got %v", files)
+	if !hasRetryJSON || !hasRetryManifest {
+		t.Fatalf("expected renamed retry files (artifact + manifest), got %v", files)
 	}
 }
 
@@ -440,8 +451,9 @@ func TestHistoryExportPruneRetention(t *testing.T) {
 		st.res.ExportedAt = time.Date(2026, 8, 29, 13, 0, 0, i*1000, time.UTC)
 		s.Tick(context.Background())
 	}
-	if got := len(formalFiles(t, dir)); got != 3 {
-		t.Fatalf("after prune expected 3 files, got %d", got)
+	// 3 units x (json + manifest) = 6 files (Phase 35 adds the manifest).
+	if got := len(formalFiles(t, dir)); got != 6 {
+		t.Fatalf("after prune expected 6 files (3 units), got %d", got)
 	}
 
 	// Retain=0 keeps all.
@@ -451,8 +463,8 @@ func TestHistoryExportPruneRetention(t *testing.T) {
 		st.res.ExportedAt = time.Date(2026, 8, 29, 14, 0, 0, i*1000, time.UTC)
 		s2.Tick(context.Background())
 	}
-	if got := len(formalFiles(t, dir2)); got != 5 {
-		t.Fatalf("retain=0 should keep all, got %d", got)
+	if got := len(formalFiles(t, dir2)); got != 10 {
+		t.Fatalf("retain=0 should keep all (5 units x 2 files), got %d", got)
 	}
 }
 
@@ -476,8 +488,8 @@ func TestHistoryExportDualFormatRetentionCountsSnapshots(t *testing.T) {
 		s.Tick(context.Background())
 	}
 	files := formalFiles(t, dir)
-	if len(files) != 6 {
-		t.Fatalf("dual-format Retain=3 should keep 3 snapshots = 6 files, got %d: %v", len(files), files)
+	if len(files) != 9 {
+		t.Fatalf("dual-format Retain=3 should keep 3 snapshots = 9 files (json+csv+manifest), got %d: %v", len(files), files)
 	}
 	// exactly 3 distinct snapshots (json+csv of one ExportedAt share a unit)
 	units := make(map[string]bool)
@@ -520,17 +532,20 @@ func TestHistoryExportReadErrorNoFile(t *testing.T) {
 	}
 }
 
-// T18 (R162/B) — collision variants belong to ONE retention unit. Both the
-// current base-level shape (<ts>.1.csv) and the legacy per-format shape
-// (<ts>.json.1) must collapse into the same unit as the plain artifacts.
+// T18 (R162/B) — collision variants belong to ONE retention unit: the plain
+// artifacts and the base-level collision shapes (<ts>.1.<fmt>) all strip to the
+// same ExportedAt unit through the shared canonical resolver (R172).
+// NOTE: the pre-R162 legacy per-format shape (<ts>.json.1) is NOT a recognized
+// artifact under the frozen Phase 35 resolver — such files are ignored by
+// prune (never deleted, surfaced by verify) rather than grouped.
 func TestHistoryExportCollisionSuffixGroupsAsOneUnit(t *testing.T) {
 	dir := t.TempDir()
 	ts := "20260829T160000.000000000Z"
 	names := []string{
 		"alert-transitions-" + ts + ".json",
 		"alert-transitions-" + ts + ".csv",
-		"alert-transitions-" + ts + ".json.1", // legacy collision shape
-		"alert-transitions-" + ts + ".1.csv",  // current base-level shape
+		"alert-transitions-" + ts + ".1.json", // base-level collision shape
+		"alert-transitions-" + ts + ".1.csv",  // base-level collision shape
 	}
 	for _, n := range names {
 		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
@@ -746,8 +761,8 @@ func TestHistoryExportCleanupArtifactsOwnershipSafe(t *testing.T) {
 	if len(leftovers) != 0 || len(leftovers2) != 0 {
 		t.Fatalf("own debris not cleaned: %v %v", leftovers, leftovers2)
 	}
-	if got := len(formalFiles(t, dir2)); got != 2 {
-		t.Fatalf("expected 2 formal artifacts, got %d", got)
+	if got := len(formalFiles(t, dir2)); got != 3 {
+		t.Fatalf("expected 3 formal artifacts (json+csv+manifest), got %d", got)
 	}
 }
 

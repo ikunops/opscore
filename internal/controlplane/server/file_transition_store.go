@@ -752,14 +752,23 @@ func (s *FileBackedTransitionStore) ReadAll(ctx context.Context) protection.Tran
 
 	// Return ALL retained records, NEWEST-FIRST (mirror of ReadRecent ordering).
 	out := make([]protection.AlertTransition, 0, len(recs))
+	var minSeq, maxSeq int64
 	for i := len(recs) - 1; i >= 0; i-- {
 		out = append(out, recs[i].rec)
+		if i == len(recs)-1 || recs[i].seq < minSeq {
+			minSeq = recs[i].seq
+		}
+		if recs[i].seq > maxSeq {
+			maxSeq = recs[i].seq
+		}
 	}
 	return protection.TransitionReadResult{
 		Transitions:                out,
 		FileDropped:                fd,
-		RetentionMetaInconsistent: metaInc,
+		RetentionMetaInconsistent:  metaInc,
 		ExportedAt:                 time.Now().UTC(),
+		MinSeq:                     minSeq,
+		MaxSeq:                     maxSeq,
 	}
 }
 

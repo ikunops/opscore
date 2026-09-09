@@ -120,6 +120,12 @@ type TransitionLoadResult struct {
 	Corrupt                    bool
 	LoadErr                    error
 	ExportedAt                 time.Time
+	// MinSeq/MaxSeq (Phase 35) bound the durable sequence numbers of the records
+	// in THIS read result. They describe the actual exported set only — they
+	// never imply that every seq in [MinSeq, MaxSeq] exists (retention may have
+	// dropped holes). 0/0 when the result carries no transitions.
+	MinSeq int64
+	MaxSeq int64
 }
 
 // AlertTransitionStore is the durable, cross-restart retention boundary for

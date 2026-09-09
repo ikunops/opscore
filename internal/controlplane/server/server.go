@@ -1641,6 +1641,11 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// is enabled and its last-run / error counters. Registered ONLY here
 	// (:8082), never :8080 (R21-1).
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/scheduler", s.handleHistoryExportSchedulerStatus)
+	// Phase 35 (read-only): snapshot manifest listing/paging and integrity
+	// verification. Admin-only, strictly read-only (no repair, no delete).
+	// Registered ONLY here (:8082), never :8080 (R21-1).
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/manifest", s.handleHistoryExportManifestList)
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/verify", s.handleHistoryExportVerify)
 	return mux
 }
 
