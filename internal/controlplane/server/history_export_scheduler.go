@@ -261,10 +261,12 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 //     format; never per-format retry suffixes — R162/B);
 //  2. write each format's .tmp (Sync before link). Write failures are
 //     PER-FORMAT errors and do NOT move the ordinal (P34-I2 partial export);
-//  3. os.Link(tmp -> target). Link is no-replace: if ANY link returns EEXIST,
-//     the artifacts we linked at this ordinal are removed (our own files only)
-//     and the whole group retries at the next ordinal. We NEVER overwrite an
-//     existing snapshot (ours, an external process's, or a legacy export).
+//  3. pre-check every target with Lstat BEFORE linking: if a legacy/external file
+//     already occupies ANY format's target the group advances without linking at
+//     all, so the common collision case never deletes anything. os.Link is still
+//     no-replace, so a residual race-EEXIST rolls the group forward — and that
+//     rollback is OWNERSHIP-SAFE (removeOwnArtifact proves the path is still the
+//     file we published; a foreign replacement is reported, never deleted).
 // A crash between steps 2 and 3 leaves only .tmp + sentinel debris; never a
 // corrupt formal file, and never a silently-overwritten one.
 // Returns one error string per failed format (empty = full success).
@@ -316,25 +318,48 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 			}
 		}
 
-		// 3. No-replace links; ANY EEXIST rolls the WHOLE group forward.
+		// 2b. Pre-check EVERY target BEFORE any link: if an external/legacy file
+		// already occupies ANY format's target, the group advances immediately and
+		// no link is performed at all — so the common collision case never
+		// publishes and therefore never has to delete anything (R163/B).
+		occupied := false
 		linkCollide := false
-		var linked []string
 		linkErrs := make(map[string]error)
 		for _, f := range s.cfg.Formats {
 			if writeErrs[f] != nil {
 				continue
 			}
-			target := filepath.Join(s.cfg.Dir, names[f])
-			if lerr := os.Link(target+".tmp", target); lerr != nil {
-				if os.IsExist(lerr) {
-					// An external/legacy file occupies one format's target.
-					// Never overwrite it; the whole group shifts ordinal.
-					linkCollide = true
-					break
+			if _, err := os.Lstat(filepath.Join(s.cfg.Dir, names[f])); err == nil {
+				occupied = true
+				break
+			} else if !os.IsNotExist(err) {
+				linkErrs[f] = err // path unusable: report it, never guess
+			}
+		}
+
+		// 3. No-replace links. After the pre-check, an EEXIST here can only be a
+		// RACE (someone created the target between the check and the link).
+		linked := make(map[string]os.FileInfo)
+		if !occupied {
+			for _, f := range s.cfg.Formats {
+				if writeErrs[f] != nil || linkErrs[f] != nil {
+					continue
 				}
-				linkErrs[f] = lerr
-			} else {
-				linked = append(linked, f)
+				target := filepath.Join(s.cfg.Dir, names[f])
+				if lerr := os.Link(target+".tmp", target); lerr != nil {
+					if os.IsExist(lerr) {
+						linkCollide = true
+						break
+					}
+					linkErrs[f] = lerr
+					continue
+				}
+				// Ownership evidence: remember the EXACT file we published
+				// (volume + file index), not merely its pathname, so a later
+				// rollback can prove the path still IS our artifact.
+				if info, serr := os.Lstat(target); serr == nil {
+					linked[f] = info
+				}
 			}
 		}
 
@@ -343,12 +368,22 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 			os.Remove(filepath.Join(s.cfg.Dir, names[f]+".tmp"))
 			os.Remove(filepath.Join(s.cfg.Dir, names[f]+".reserve"))
 		}
-		if linkCollide {
-			// Roll back OUR OWN just-linked artifacts, then retry the group.
-			for _, f := range linked {
-				os.Remove(filepath.Join(s.cfg.Dir, names[f]))
-			}
+		if occupied {
+			// Nothing was linked at this ordinal: the whole group advances.
+			// Never fall through to the success path here — that would report
+			// success for a tick that published no file (P34-I2).
 			continue
+		}
+		if linkCollide {
+			// Roll back ONLY artifacts that are provably still OURS — never a
+			// pathname that may have been replaced by another process (R163/B).
+			for f, info := range linked {
+				target := filepath.Join(s.cfg.Dir, names[f])
+				if rerr := removeOwnArtifact(target, info); rerr != nil {
+					linkErrs[f] = rerr
+				}
+			}
+			continue // the whole group retries at the next ordinal
 		}
 
 		var errs []string
@@ -382,6 +417,27 @@ func (s *HistoryExportScheduler) writeTmp(tmpPath, fmtName string, res protectio
 		return werr
 	}
 	return f.Sync()
+}
+
+// removeOwnArtifact removes path ONLY IF it is still the exact file identified
+// by want — the os.FileInfo captured when WE published it. os.SameFile compares
+// the volume serial and file index, so a pathname that has since been replaced
+// (deleted and recreated) by another process is recognised as foreign and is
+// NEVER deleted; the caller gets an error instead and reports it (R163/B:
+// rollback must be ownership-safe, not pathname-based). A path that is already
+// gone is treated as success (there is nothing of ours left to remove).
+func removeOwnArtifact(path string, want os.FileInfo) error {
+	cur, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !os.SameFile(want, cur) {
+		return fmt.Errorf("refusing to remove %s: no longer the artifact we published", path)
+	}
+	return os.Remove(path)
 }
 
 // serializeHistoryExportForFormat dispatches to the shared Phase 33 serializers

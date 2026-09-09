@@ -622,6 +622,58 @@ func TestHistoryExportStatusPerTick(t *testing.T) {
 	}
 }
 
+// T21 (R163/B) — rollback is OWNERSHIP-SAFE, not pathname-based: the artifact is
+// removed only while it is still the exact file we published.
+func TestHistoryExportRemoveOwnArtifactOwnershipSafe(t *testing.T) {
+	dir := t.TempDir()
+
+	// Positive case: same file -> removed.
+	ours := filepath.Join(dir, "ours.json")
+	if err := os.WriteFile(ours, []byte("MINE"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(ours)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOwnArtifact(ours, info); err != nil {
+		t.Fatalf("own artifact should be removable: %v", err)
+	}
+	if _, err := os.Lstat(ours); !os.IsNotExist(err) {
+		t.Fatal("own artifact was not removed")
+	}
+
+	// Negative case: `want` identifies a DIFFERENT file -> refuse, never delete.
+	target := filepath.Join(dir, "target.json")
+	if err := os.WriteFile(target, []byte("KEEP-ME"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(dir, "other.json")
+	if err := os.WriteFile(other, []byte("OTHER"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	otherInfo, err := os.Lstat(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOwnArtifact(target, otherInfo); err == nil {
+		t.Fatal("expected refusal when the path is not the artifact we published")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("foreign file was deleted: %v", err)
+	}
+	if string(data) != "KEEP-ME" {
+		t.Fatalf("foreign file modified/deleted: %q", data)
+	}
+
+	// A path that is already gone is a no-op success.
+	gone := filepath.Join(dir, "gone.json")
+	if err := removeOwnArtifact(gone, otherInfo); err != nil {
+		t.Fatalf("missing path should be a no-op: %v", err)
+	}
+}
+
 // itoa is a tiny local helper (avoid importing strconv in tests just for this).
 func itoa(n int) string {
 	if n == 0 {
