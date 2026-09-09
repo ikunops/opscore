@@ -721,3 +721,55 @@ func TestDuplicateIDDetectionNotLimitedByWindow(t *testing.T) {
 		t.Fatalf("status = %q/%q, want unknown via duplicate_publication_id", results[0].Status, results[0].Detail)
 	}
 }
+
+// T43 — manifest reservation lifecycle (R178/B): the manifest sentinel stays
+// held during the ENTIRE publication window (an external O_EXCL steal attempt
+// mid-window must fail with EEXIST) and is released only after publication.
+func TestManifestReservationHeldUntilPublication(t *testing.T) {
+	dir := t.TempDir()
+	exp := time.Date(2026, 8, 29, 13, 45, 30, 0, time.UTC)
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions(), ExportedAt: exp}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json"}})
+
+	windowSeen := false
+	var violation error
+	s.beforeManifestPublish = func(d, mname string) {
+		windowSeen = true
+		// Mid-window: try to steal the reserved manifest slot. The scheduler
+		// must still hold it, so O_EXCL creation must fail with EEXIST.
+		f, err := os.OpenFile(filepath.Join(d, mname+".reserve"), os.O_CREATE|os.O_EXCL, 0o644)
+		if err == nil {
+			f.Close()
+			os.Remove(filepath.Join(d, mname+".reserve"))
+			violation = errors.New("manifest reservation was released before publication")
+			return
+		}
+		if !os.IsExist(err) {
+			violation = err
+		}
+	}
+	s.Tick(context.Background())
+
+	if !windowSeen {
+		t.Fatal("reservation-window hook never invoked")
+	}
+	if violation != nil {
+		t.Fatal(violation)
+	}
+	// Manifest is formally published...
+	manifestName := "alert-transitions-" + safeTS(exp) + ".manifest.json"
+	if _, err := os.Stat(filepath.Join(dir, manifestName)); err != nil {
+		t.Fatalf("manifest not published: %v", err)
+	}
+	// ...and only now is the sentinel released (no debris, no orphan).
+	if _, err := os.Stat(filepath.Join(dir, manifestName+".reserve")); !os.IsNotExist(err) {
+		t.Fatal("manifest sentinel not released after publication")
+	}
+	results, verr := s.VerifySnapshots(10)
+	if verr != nil {
+		t.Fatal(verr)
+	}
+	if len(results) != 1 || results[0].Status != verifyStatusOK {
+		t.Fatalf("verify = %+v, want single ok (no orphan_artifact)", results)
+	}
+}

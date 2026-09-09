@@ -102,6 +102,11 @@ type HistoryExportScheduler struct {
 	failed         int64
 
 	done chan struct{}
+
+	// beforeManifestPublish is a TEST-ONLY hook invoked at the start of
+	// publishManifest — i.e. inside the manifest reservation window. It lets
+	// tests probe the reservation lifecycle (T43). Production leaves it nil.
+	beforeManifestPublish func(dir, manifestName string)
 }
 
 // NewHistoryExportScheduler validates the config and builds a scheduler
@@ -429,14 +434,28 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 			}
 		}
 
-		// Cleanup OUR OWN tmp + sentinel debris for this ordinal. Removals are
-		// ownership-checked, so a pathname that is no longer our own file (or was
-		// never created by us) is preserved — never deleted by name (R164/B).
-		s.cleanupArtifacts(names, tmpInfo, sentinelInfo)
+		// Phase 35 (R178/B): the manifest sentinel's reservation MUST stay held
+		// until the manifest itself is published (R176 A4 lifecycle). Cleanup is
+		// therefore split: artifact debris is cleaned per-path below, while the
+		// "manifest" key is retained until after publishManifest returns.
+		artifactTmp := make(map[string]os.FileInfo, len(tmpInfo))
+		artifactSent := make(map[string]os.FileInfo, len(sentinelInfo))
+		for k, v := range tmpInfo {
+			if k != "manifest" {
+				artifactTmp[k] = v
+			}
+		}
+		for k, v := range sentinelInfo {
+			if k != "manifest" {
+				artifactSent[k] = v
+			}
+		}
 		if occupied {
-			// Nothing was linked at this ordinal: the whole group advances.
+			// Nothing was linked at this ordinal: no manifest will be published
+			// here either, so release the whole group's slots and advance.
 			// Never fall through to the success path here — that would report
 			// success for a tick that published no file (P34-I2).
+			s.cleanupArtifacts(names, tmpInfo, sentinelInfo)
 			continue
 		}
 		if linkCollide {
@@ -448,6 +467,7 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 					linkErrs[f] = rerr
 				}
 			}
+			s.cleanupArtifacts(names, tmpInfo, sentinelInfo)
 			continue // the whole group retries at the next ordinal
 		}
 
@@ -462,12 +482,19 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 		}
 		if len(errs) > 0 {
 			// M1: a partial export publishes NO manifest — the verify surface
-			// reports these artifacts as orphan_artifact (explicit, M5).
+			// reports these artifacts as orphan_artifact (explicit, M5). The
+			// manifest slot is no longer needed: release it.
+			s.cleanupArtifacts(names, tmpInfo, sentinelInfo)
 			return errs, "", ""
 		}
 
 		// 4. Phase 35 manifest (M1 ordering: artifacts all linked, hashes next).
+		// Artifact debris is released first; the manifest sentinel is HELD
+		// across the hash/tmp/link window (R178/B — reservation lifecycle).
+		s.cleanupArtifacts(names, artifactTmp, artifactSent)
 		mErr := s.publishManifest(res, base, ordinal, names, pubID, s.clock().UTC())
+		// The manifest publication window is complete: release its slot.
+		s.cleanupArtifacts(names, nil, map[string]os.FileInfo{"manifest": sentinelInfo["manifest"]})
 		return nil, mErr, ""
 	}
 	return []string{"could not reserve a free snapshot slot after 100 retries"}, "", ""
@@ -478,6 +505,11 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 // no-replace, M1/M2). The manifest name has ALREADY been reserved with the
 // artifact group at this ordinal.
 func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadResult, base string, ordinal int, names map[string]string, pubID int64, generatedAt time.Time) (manifestErr string) {
+	// TEST-ONLY hook: we are now INSIDE the manifest reservation window —
+	// the sentinel is still held and the formal target is not yet linked.
+	if s.beforeManifestPublish != nil {
+		s.beforeManifestPublish(s.cfg.Dir, names["manifest"])
+	}
 	formats := make([]manifestFormatInfo, 0, len(s.cfg.Formats))
 	for _, f := range s.cfg.Formats {
 		sum, size, herr := hashFile(filepath.Join(s.cfg.Dir, names[f]))
