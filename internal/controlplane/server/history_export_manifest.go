@@ -3,6 +3,7 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -90,6 +91,61 @@ func parseSnapshotManifest(data []byte) (*snapshotManifest, error) {
 		return nil, fmt.Errorf("manifest seq_continuity %q invalid", m.SeqContinuity)
 	}
 	return &m, nil
+}
+
+// countArtifactRecords recounts the records ACTUALLY present in an artifact
+// file (Phase 35 verify): the JSON envelope's transitions array, or the CSV
+// data rows (header excluded). This is an independent recount — never copied
+// from the manifest (R177/B: ActualRecords must be a real recomputation).
+func countArtifactRecords(path, format string) (int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	switch format {
+	case "json":
+		var env struct {
+			Transitions []json.RawMessage `json:"transitions"`
+		}
+		if err := json.NewDecoder(f).Decode(&env); err != nil {
+			return 0, err
+		}
+		return int64(len(env.Transitions)), nil
+	case "csv":
+		// The export CSV carries trailing '#' metadata lines (P33-I5): they are
+		// format metadata, NOT data rows, and must be skipped by the recount.
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return 0, err
+		}
+		var cleaned strings.Builder
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			cleaned.WriteString(line)
+			cleaned.WriteString("\n")
+		}
+		r := csv.NewReader(strings.NewReader(cleaned.String()))
+		rows := int64(0)
+		for {
+			if _, err := r.Read(); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				return 0, err
+			}
+			rows++
+		}
+		if rows > 0 {
+			rows-- // header row
+		}
+		return rows, nil
+	default:
+		return 0, fmt.Errorf("unknown format %q", format)
+	}
 }
 
 // hashFile streams path and returns its sha256 hex digest and byte size.
@@ -451,10 +507,9 @@ func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, err
 	if err != nil {
 		return nil, err
 	}
-	if len(groups) > limit {
-		groups = groups[:limit]
-	}
-	// Publication-id uniqueness across the whole namespace (verify layer).
+	// Publication-id uniqueness is a NAMESPACE property: it is checked over the
+	// FULL manifest set BEFORE the limit window is applied (R177/B — a
+	// duplicate outside the requested page must still poison the namespace).
 	idCount := map[int64]int{}
 	for _, g := range groups {
 		if g.manifestFn == "" {
@@ -468,6 +523,9 @@ func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, err
 			g.manifest = m
 			idCount[m.PublicationID]++
 		}
+	}
+	if len(groups) > limit {
+		groups = groups[:limit]
 	}
 
 	out := make([]VerifyResult, 0, len(groups)+len(unattributed))
@@ -560,9 +618,17 @@ func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, err
 					status = verifyStatusUnknown
 					continue
 				}
+				actualRecords, rerr := countArtifactRecords(filepath.Join(s.cfg.Dir, fn), f.Format)
+				if rerr != nil {
+					fr.Status = verifyStatusUnknown
+					fr.Detail = "artifact unparseable: " + rerr.Error()
+					res.Formats = append(res.Formats, fr)
+					status = verifyStatusUnknown
+					continue
+				}
 				fr.ActualSHA256 = sum
 				fr.ActualBytes = size
-				fr.ActualRecords = f.Records // record count is manifest-declared provenance
+				fr.ActualRecords = actualRecords // INDEPENDENT recount, not the declared value (R177/B)
 				if sum != f.SHA256 || size != f.Bytes {
 					fr.Status = verifyStatusMismatch
 					fr.Detail = "digest/size differ from manifest-generation observation"
@@ -570,6 +636,16 @@ func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, err
 						status = verifyStatusMismatch
 					}
 					details = append(details, f.Format+": digest mismatch")
+					res.Formats = append(res.Formats, fr)
+					continue
+				}
+				if actualRecords != f.Records {
+					fr.Status = verifyStatusMismatch
+					fr.Detail = "record count differs from manifest declaration"
+					if status == verifyStatusOK || status == verifyStatusMissing {
+						status = verifyStatusMismatch
+					}
+					details = append(details, f.Format+": record count mismatch")
 				}
 				res.Formats = append(res.Formats, fr)
 			}

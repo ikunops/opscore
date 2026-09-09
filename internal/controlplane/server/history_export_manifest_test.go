@@ -388,7 +388,8 @@ func TestVerifyUndeclaredArtifactUniqueOwner(t *testing.T) {
 	// A registered T.1 snapshot with its own manifest + artifact.
 	sum, _ := fileSHA256(t, filepath.Join(dir, "alert-transitions-"+safeTS(exp)+".json"))
 	self1 := safeTS(exp) + ".1"
-	if err := os.WriteFile(filepath.Join(dir, "alert-transitions-"+self1+".json"), []byte("ORDINAL1"), 0o644); err != nil {
+	// A valid (empty) envelope so the recount succeeds.
+	if err := os.WriteFile(filepath.Join(dir, "alert-transitions-"+self1+".json"), []byte(`{"transitions":[]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	sum1, size1 := fileSHA256(t, filepath.Join(dir, "alert-transitions-"+self1+".json"))
@@ -639,5 +640,84 @@ func TestDuplicatePublicationIDCursorAmbiguous(t *testing.T) {
 		if r.Status != verifyStatusUnknown || !strings.Contains(r.Detail, "duplicate_publication_id") {
 			t.Fatalf("verify = %+v, want unknown/duplicate_publication_id", r)
 		}
+	}
+}
+
+// T41 — actual record count is an INDEPENDENT recount (R177/B): tampering that
+// adds a record must surface actual_records != declared_records, proving the
+// value is recomputed from the artifact rather than copied from the manifest.
+func TestVerifyActualRecordsIndependentlyRecounted(t *testing.T) {
+	dir := t.TempDir()
+	exp := time.Date(2026, 8, 29, 13, 45, 30, 0, time.UTC)
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions(), ExportedAt: exp}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json"}})
+	s.Tick(context.Background())
+
+	// Tamper: add ONE extra transition record to the artifact envelope.
+	path := filepath.Join(dir, "alert-transitions-"+safeTS(exp)+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var env map[string]any
+	if err := json.Unmarshal(data, &env); err != nil {
+		t.Fatal(err)
+	}
+	trs := env["transitions"].([]any)
+	trs = append(trs, map[string]any{
+		"at": "2026-08-29T12:00:03Z", "from": true, "to": false,
+		"kind": "resolve", "unknown_rate": 9.0, "threshold": 30.0,
+	})
+	env["transitions"] = trs
+	out, _ := json.MarshalIndent(env, "", "  ")
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	results, verr := s.VerifySnapshots(10)
+	if verr != nil {
+		t.Fatal(verr)
+	}
+	var fr *VerifyFormatResult
+	for _, r := range results {
+		for i := range r.Formats {
+			if r.Formats[i].Format == "json" {
+				f := r.Formats[i]
+				fr = &f
+			}
+		}
+	}
+	if fr == nil {
+		t.Fatalf("json format result missing: %+v", results)
+	}
+	if fr.ActualRecords != int64(len(sampleTransitions())+1) {
+		t.Fatalf("actual_records = %d, want a REAL recount (%d)", fr.ActualRecords, len(sampleTransitions())+1)
+	}
+	if fr.DeclaredRecords != int64(len(sampleTransitions())) {
+		t.Fatalf("declared_records = %d, want %d", fr.DeclaredRecords, len(sampleTransitions()))
+	}
+	if fr.Status != verifyStatusMismatch {
+		t.Fatalf("status = %q, want mismatch", fr.Status)
+	}
+}
+
+// T42 — duplicate publication_id OUTSIDE the requested limit window must still
+// poison the namespace (R177/B): the integrity scan precedes limit truncation.
+func TestDuplicateIDDetectionNotLimitedByWindow(t *testing.T) {
+	dir := t.TempDir()
+	writeTestManifest(t, dir, "20260829T130000Z", 101, nil) // newest, inside window
+	writeTestManifest(t, dir, "20260829T080000Z", 101, nil) // older duplicate, OUTSIDE limit=1
+
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions()}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json"}})
+	results, err := s.VerifySnapshots(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("window must cap RESULTS to 1, got %+v", results)
+	}
+	if results[0].Status != verifyStatusUnknown || !strings.Contains(results[0].Detail, "duplicate_publication_id") {
+		t.Fatalf("status = %q/%q, want unknown via duplicate_publication_id", results[0].Status, results[0].Detail)
 	}
 }
