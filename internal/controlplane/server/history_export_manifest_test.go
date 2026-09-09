@@ -256,14 +256,56 @@ func TestWatermarkLostFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Tick(context.Background())
-	if got := formalFiles(t, dir); len(got) != 0 {
-		t.Fatalf("fail-closed tick must publish nothing, got %v", got)
+	// R179/B order: the id is allocated AFTER the artifacts are published, so a
+	// lost watermark means artifacts WITHOUT a manifest — verify reports them
+	// as orphan_artifact and the state error is surfaced explicitly.
+	if got := formalFiles(t, dir); len(got) != 1 || !strings.HasSuffix(got[0], ".json") {
+		t.Fatalf("expected only the json artifact (no manifest), got %v", got)
 	}
 	if s.Status().PublicationStateError == "" {
 		t.Fatal("PublicationStateError must be set on lost watermark")
 	}
-	if s.Status().Published != 0 || s.Status().Failed != 0 {
-		t.Fatalf("published/failed = %d/%d, want 0/0", s.Status().Published, s.Status().Failed)
+	results, verr := s.VerifySnapshots(10)
+	if verr != nil {
+		t.Fatal(verr)
+	}
+	if len(results) != 1 || results[0].Status != verifyStatusOrphanArtifact {
+		t.Fatalf("verify = %+v, want orphan_artifact", results)
+	}
+}
+
+// T44 — a failed export attempt consumes NO publication_id (R179/B): the id is
+// allocated only after every artifact published, so failures never burn ids.
+func TestFailedAttemptDoesNotConsumePublicationID(t *testing.T) {
+	dir := t.TempDir()
+	exp := time.Date(2026, 8, 29, 13, 45, 30, 0, time.UTC)
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions(), ExportedAt: exp}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json"}})
+
+	// Failed attempt: the json .tmp path is occupied by a directory.
+	if err := os.Mkdir(filepath.Join(dir, "alert-transitions-"+safeTS(exp)+".json.tmp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.Tick(context.Background())
+	if s.Status().Published != 0 {
+		t.Fatalf("failed attempt published = %d, want 0", s.Status().Published)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, publicationStateFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(raw)) != "0" {
+		t.Fatalf("watermark consumed by failed attempt: %q, want 0", raw)
+	}
+
+	// Retry succeeds: the very first publication id is used.
+	if err := os.Remove(filepath.Join(dir, "alert-transitions-"+safeTS(exp)+".json.tmp")); err != nil {
+		t.Fatal(err)
+	}
+	s.Tick(context.Background())
+	m := readManifestFile(t, dir, "alert-transitions-"+safeTS(exp)+".manifest.json")
+	if v, _ := m["publication_id"].(float64); int64(v) != 1 {
+		t.Fatalf("publication_id = %v, want 1 (failed attempt consumed nothing)", m["publication_id"])
 	}
 }
 

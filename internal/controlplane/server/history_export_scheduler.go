@@ -315,14 +315,6 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 // corrupt formal file, and never a silently-overwritten one.
 // Returns (per-format error strings, manifest publish error, watermark error).
 func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadResult) (pubErrs []string, manifestErr string, pubStateErr string) {
-	// M7 fail-closed ordering: the publication watermark is consulted BEFORE
-	// anything is written. If it cannot prove never-reuse, this tick publishes
-	// NO snapshot and NO manifest (R175 v8); a watermark allocated here but
-	// lost to a later crash is a legal gap.
-	pubID, perr := allocatePublicationID(s.cfg.Dir)
-	if perr != nil {
-		return nil, "", perr.Error()
-	}
 	// Filesystem-safe timestamp: RFC3339Nano has ':' which is Windows-invalid,
 	// so use a colon-free layout. res.ExportedAt is store provenance (P34-CLOCK-1).
 	safe := res.ExportedAt.UTC().Format("20060102T150405.999999999") + "Z"
@@ -488,14 +480,18 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 			return errs, "", ""
 		}
 
-		// 4. Phase 35 manifest (M1 ordering: artifacts all linked, hashes next).
-		// Artifact debris is released first; the manifest sentinel is HELD
-		// across the hash/tmp/link window (R178/B — reservation lifecycle).
+		// 4. Phase 35 manifest (R176 A4 order, restored per R179/B):
+		//    all artifact Links succeeded → hash formal artifacts →
+		//    allocatePublicationID → build/write/link manifest. A failed
+		//    attempt therefore consumes NO publication id; a crash after id
+		//    persistence still only creates a legal gap (M7). Artifact debris
+		//    is released first; the manifest sentinel is HELD across the
+		//    hash/allocate/tmp/link window (R178/B — reservation lifecycle).
 		s.cleanupArtifacts(names, artifactTmp, artifactSent)
-		mErr := s.publishManifest(res, base, ordinal, names, pubID, s.clock().UTC())
+		mErr, sErr := s.publishManifest(res, base, ordinal, names, s.clock().UTC())
 		// The manifest publication window is complete: release its slot.
 		s.cleanupArtifacts(names, nil, map[string]os.FileInfo{"manifest": sentinelInfo["manifest"]})
-		return nil, mErr, ""
+		return nil, mErr, sErr
 	}
 	return []string{"could not reserve a free snapshot slot after 100 retries"}, "", ""
 }
@@ -504,7 +500,7 @@ func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadRe
 // artifacts, and publishes the manifest through its reserved slot (atomic
 // no-replace, M1/M2). The manifest name has ALREADY been reserved with the
 // artifact group at this ordinal.
-func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadResult, base string, ordinal int, names map[string]string, pubID int64, generatedAt time.Time) (manifestErr string) {
+func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadResult, base string, ordinal int, names map[string]string, generatedAt time.Time) (manifestErr string, pubStateErr string) {
 	// TEST-ONLY hook: we are now INSIDE the manifest reservation window —
 	// the sentinel is still held and the formal target is not yet linked.
 	if s.beforeManifestPublish != nil {
@@ -514,7 +510,7 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 	for _, f := range s.cfg.Formats {
 		sum, size, herr := hashFile(filepath.Join(s.cfg.Dir, names[f]))
 		if herr != nil {
-			return "manifest: hash " + f + ": " + herr.Error()
+			return "manifest: hash " + f + ": " + herr.Error(), ""
 		}
 		formats = append(formats, manifestFormatInfo{
 			Format:  f,
@@ -523,6 +519,17 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 			Bytes:   size,
 			Records: int64(len(res.Transitions)),
 		})
+	}
+	// R176 A4 / R179/B: the durable publication_id is allocated ONLY after
+	// every format published successfully and the artifacts were hashed —
+	// failed attempts never consume an id (T44), while a crash after the id
+	// is persisted only creates a legal gap (M7 never-reuse still holds).
+	pubID, err := allocatePublicationID(s.cfg.Dir)
+	if err != nil {
+		// Fail-closed M7: without a provable watermark there is no manifest.
+		// The already-linked artifacts stay on disk and are honestly reported
+		// as orphan_artifact by the verify surface (M5).
+		return "", err.Error()
 	}
 	hs := historyExportStats(res)
 	identity := strings.TrimPrefix(base, historyExportFileBase+"-")
@@ -547,7 +554,7 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 	target := filepath.Join(s.cfg.Dir, names["manifest"])
 	mf, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
-		return "manifest: write tmp: " + err.Error()
+		return "manifest: write tmp: " + err.Error(), ""
 	}
 	werr := serializeSnapshotManifest(mf, &manifest)
 	var syncErr error
@@ -562,19 +569,19 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 	}
 	if werr != nil {
 		os.Remove(tmpPath)
-		return "manifest: write tmp: " + werr.Error()
+		return "manifest: write tmp: " + werr.Error(), ""
 	}
 	if lerr := os.Link(tmpPath, target); lerr != nil {
 		os.Remove(tmpPath)
 		if os.IsExist(lerr) {
 			// Race: a foreign file appeared at the reserved manifest slot. Never
 			// overwrite; the artifacts are honestly reported as orphan_artifact.
-			return "manifest: link target occupied: " + names["manifest"]
+			return "manifest: link target occupied: " + names["manifest"], ""
 		}
-		return "manifest: link: " + lerr.Error()
+		return "manifest: link: " + lerr.Error(), ""
 	}
 	os.Remove(tmpPath)
-	return ""
+	return "", ""
 }
 
 // writeTmp streams one format into tmpPath and returns the FileInfo of the file
