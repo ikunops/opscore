@@ -251,13 +251,14 @@ func TestHistoryExportSameTsNoOverwrite(t *testing.T) {
 		t.Fatal("first snapshot was overwritten by second tick")
 	}
 	files := formalFiles(t, dir)
-	// original + renamed retry (alert-transitions-<ts>.json.1)
+	// original + renamed retry (alert-transitions-<ts>.1.json — the collision
+	// ordinal attaches to the SHARED snapshot base, before the extension).
 	if len(files) != 2 {
 		t.Fatalf("expected 2 files (original + renamed retry), got %v", files)
 	}
 	hasRetry := false
 	for _, f := range files {
-		if f == "alert-transitions-"+safeTS(exp)+".json.1" {
+		if f == "alert-transitions-"+safeTS(exp)+".1.json" {
 			hasRetry = true
 		}
 	}
@@ -415,7 +416,7 @@ func TestHistoryExportNoReplaceExternalFile(t *testing.T) {
 	files := formalFiles(t, dir)
 	hasRetry := false
 	for _, f := range files {
-		if f == legacyName+".1" {
+		if f == "alert-transitions-"+safeTS(exp)+".1.json" { // shared-base ordinal 1
 			hasRetry = true
 			data, _ := os.ReadFile(filepath.Join(dir, f))
 			var env map[string]any
@@ -497,8 +498,14 @@ func TestHistoryExportReadErrorNoFile(t *testing.T) {
 	if len(formalFiles(t, dir)) != 0 {
 		t.Fatal("read error must not write a file")
 	}
-	if s.Status().Failed != 1 {
-		t.Fatalf("failed = %d, want 1", s.Status().Failed)
+	// A skipped tick attempts NO format, so the per-tick counters reset to 0/0
+	// (R160/R162); the skip itself is observable via LastError.
+	st1 := s.Status()
+	if st1.Published != 0 || st1.Failed != 0 {
+		t.Fatalf("read-error tick: published=%d failed=%d, want 0/0 (no format attempted)", st1.Published, st1.Failed)
+	}
+	if !strings.Contains(st1.LastError, "read error") {
+		t.Fatalf("LastError = %q, want read error", st1.LastError)
 	}
 
 	dir2 := t.TempDir()
@@ -507,6 +514,111 @@ func TestHistoryExportReadErrorNoFile(t *testing.T) {
 	s2.Tick(context.Background())
 	if len(formalFiles(t, dir2)) != 0 {
 		t.Fatal("corrupt must not write a file")
+	}
+	if !strings.Contains(s2.Status().LastError, "corrupt") {
+		t.Fatalf("LastError = %q, want corrupt", s2.Status().LastError)
+	}
+}
+
+// T18 (R162/B) — collision variants belong to ONE retention unit. Both the
+// current base-level shape (<ts>.1.csv) and the legacy per-format shape
+// (<ts>.json.1) must collapse into the same unit as the plain artifacts.
+func TestHistoryExportCollisionSuffixGroupsAsOneUnit(t *testing.T) {
+	dir := t.TempDir()
+	ts := "20260829T160000.000000000Z"
+	names := []string{
+		"alert-transitions-" + ts + ".json",
+		"alert-transitions-" + ts + ".csv",
+		"alert-transitions-" + ts + ".json.1", // legacy collision shape
+		"alert-transitions-" + ts + ".1.csv",  // current base-level shape
+	}
+	for _, n := range names {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions()}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json"}, Retain: 1})
+
+	// All four artifacts are ONE unit, so Retain=1 must keep the unit whole.
+	// (A broken grouping would see >=2 units and delete the oldest ones.)
+	if err := s.prune(); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(formalFiles(t, dir)); got != 4 {
+		t.Fatalf("collision variants must form ONE retention unit (Retain=1 keeps it whole), got %d files", got)
+	}
+	units := make(map[string]bool)
+	for _, n := range names {
+		units[snapshotGroupKey(n)] = true
+	}
+	if len(units) != 1 {
+		t.Fatalf("expected a single group key, got %v", units)
+	}
+}
+
+// T19 (R162/B) — shared base identity: a collision advances ONE ordinal for the
+// WHOLE snapshot group; both formats derive from the same base, never from
+// independent per-format retry counters.
+func TestHistoryExportSharedBaseIdentity(t *testing.T) {
+	dir := t.TempDir()
+	exp := time.Date(2026, 8, 29, 16, 30, 0, 0, time.UTC)
+	// Occupy the ordinal-0 json target so the group must advance TOGETHER.
+	if err := os.WriteFile(filepath.Join(dir, "alert-transitions-"+safeTS(exp)+".json"), []byte("LEGACY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions(), ExportedAt: exp}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json", "csv"}})
+	s.Tick(context.Background())
+
+	files := formalFiles(t, dir)
+	hasJSON, hasCSV := false, false
+	for _, f := range files {
+		switch f {
+		case "alert-transitions-" + safeTS(exp) + ".1.json":
+			hasJSON = true
+		case "alert-transitions-" + safeTS(exp) + ".1.csv":
+			hasCSV = true
+		case "alert-transitions-" + safeTS(exp) + ".csv":
+			t.Fatalf("csv published independently at ordinal 0 (per-format retry): %v", files)
+		}
+	}
+	if !hasJSON || !hasCSV {
+		t.Fatalf("both formats must share ordinal 1, got %v", files)
+	}
+	if got := s.Status().Published; got != 2 {
+		t.Fatalf("published = %d, want 2", got)
+	}
+}
+
+// T20 (R162/B) — Published/Failed reflect the LAST tick, not cumulative counts.
+func TestHistoryExportStatusPerTick(t *testing.T) {
+	dir := t.TempDir()
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions()}}
+	s, _ := NewHistoryExportScheduler(HistoryExportConfig{Store: st, Dir: dir, Interval: time.Hour, Formats: []string{"json", "csv"}})
+
+	// tick1: both formats succeed -> 2/0
+	st.res.ExportedAt = time.Date(2026, 8, 29, 17, 0, 0, 0, time.UTC)
+	s.Tick(context.Background())
+	if got := s.Status(); got.Published != 2 || got.Failed != 0 {
+		t.Fatalf("tick1: published=%d failed=%d, want 2/0", got.Published, got.Failed)
+	}
+
+	// tick2: csv write fails (its .tmp path is occupied) -> 1/1
+	st.res.ExportedAt = time.Date(2026, 8, 29, 17, 0, 1, 0, time.UTC)
+	if err := os.Mkdir(filepath.Join(dir, "alert-transitions-"+safeTS(st.res.ExportedAt)+".csv.tmp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s.Tick(context.Background())
+	if got := s.Status(); got.Published != 1 || got.Failed != 1 {
+		t.Fatalf("tick2: published=%d failed=%d, want 1/1", got.Published, got.Failed)
+	}
+
+	// tick3: both succeed again -> 2/0 (per-tick reset, NOT cumulative)
+	st.res.ExportedAt = time.Date(2026, 8, 29, 17, 0, 2, 0, time.UTC)
+	s.Tick(context.Background())
+	if got := s.Status(); got.Published != 2 || got.Failed != 0 {
+		t.Fatalf("tick3: published=%d failed=%d, want 2/0 (per-tick, not cumulative)", got.Published, got.Failed)
 	}
 }
 

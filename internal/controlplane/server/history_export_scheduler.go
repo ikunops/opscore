@@ -16,9 +16,11 @@ import (
 	"github.com/YuDong999/opscore/internal/protection"
 )
 
-// historyExportFileBase is the on-disk snapshot prefix (Phase 34). Files are
-// named alert-transitions-<ts>.<fmt>[.N]; the "[.N]" suffix is a collision
-// retry index, never present in the common case.
+// historyExportFileBase is the on-disk snapshot prefix (Phase 34). One Tick
+// computes ONE shared snapshot base identity alert-transitions-<ts>[.N]; every
+// format appends its own extension, so a snapshot's artifacts share the same
+// collision ordinal: alert-transitions-<ts>[.N].<fmt> (R162/B — base-level
+// collision retry, never per-format retry suffixes).
 const historyExportFileBase = "alert-transitions"
 
 // HistoryExportConfig configures the Phase 34 scheduled periodic export of the
@@ -36,9 +38,10 @@ type HistoryExportConfig struct {
 	Dir string
 	// Interval is the tick period. Required > 0 when enabled.
 	Interval time.Duration
-	// Formats lists the export encodings to materialize each tick. Each format
-	// is published independently; a partial failure is reported explicitly
-	// (P34-I2 — no faked success). Only "json" and "csv" are accepted.
+	// Formats lists the export encodings to materialize each tick. All formats
+	// share ONE snapshot base identity per tick; a per-format write failure is
+	// reported explicitly (P34-I2 — no faked success). Only "json" and "csv"
+	// are accepted.
 	Formats []string
 	// Retain is the local snapshot retention cap. 0 keeps ALL snapshots; >0
 	// keeps at most Retain newest SNAPSHOTS. One scheduled export (one
@@ -196,30 +199,25 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 	if res.LoadErr != nil {
 		s.mu.Lock()
 		s.lastError = "read error: " + res.LoadErr.Error()
-		s.failed++
+		// Published/Failed are LAST-TICK format counts (R160/R162): a skipped
+		// tick attempted no formats, so both reset to zero.
+		s.published, s.failed = 0, 0
 		s.mu.Unlock()
 		return
 	}
 	if res.Corrupt {
 		s.mu.Lock()
 		s.lastError = "durable history corrupt — skipped"
-		s.failed++
+		s.published, s.failed = 0, 0
 		s.mu.Unlock()
 		return
 	}
 
-	// Publish each format independently. Per-format success is the only thing
-	// that counts as a success; partial failure is reported explicitly, never
-	// masked as a full success (P34-I2).
-	var pubErrs []string
-	anyOK := false
-	for _, f := range s.cfg.Formats {
-		if err := s.publishFormat(res, f); err != nil {
-			pubErrs = append(pubErrs, f+": "+err.Error())
-		} else {
-			anyOK = true
-		}
-	}
+	// Publish ALL formats of this tick under ONE shared snapshot base identity
+	// (R162/B). Collision retries advance one ordinal for the whole group;
+	// per-format write failures stay independent and are reported explicitly,
+	// never masked as a full success (P34-I2).
+	pubErrs := s.publishSnapshot(res)
 
 	s.mu.Lock()
 	switch {
@@ -227,18 +225,18 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 		// Full success: record provenance, clear any prior error.
 		s.lastExportedAt = res.ExportedAt
 		s.lastError = ""
-		s.published++
-	case anyOK:
-		// Partial success: proveance recorded; mark explicit partial error.
+	case len(pubErrs) < len(s.cfg.Formats):
+		// Partial success: provenance recorded; explicit partial error.
 		s.lastExportedAt = res.ExportedAt
 		s.lastError = "partial export: " + strings.Join(pubErrs, "; ")
-		s.published++
-		s.failed++
 	default:
 		// Total failure: no file was published.
 		s.lastError = "export failed: " + strings.Join(pubErrs, "; ")
-		s.failed++
 	}
+	// Published/Failed are the LAST tick's per-format counts (R160), NOT
+	// cumulative counters (R162/B fix).
+	s.published = int64(len(s.cfg.Formats) - len(pubErrs))
+	s.failed = int64(len(pubErrs))
 	s.mu.Unlock()
 
 	// Prune is independent of publish success (P34-STATE-1): its error is
@@ -254,66 +252,117 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 	}
 }
 
-// publishFormat atomically materializes one format to disk with a no-replace
-// guarantee (P34-I3). Scheme:
-//  1. reserve a unique slot via a sentinel file (O_CREATE|O_EXCL) — exists-check
-//     and reservation are one syscall, so there is no TOCTOU window;
-//  2. write content to a .tmp file, Sync, Close;
-//  3. os.Link(tmp -> target). Link is no-replace: if target already exists the
-//     OS returns EEXIST. On EEXIST we derive a new candidate base name and retry
-//     — we NEVER overwrite an existing snapshot (ours, an external process's, or
-//     a legacy export). On ANY failure we delete the .tmp and sentinel and leave
-//     no half-written formal file.
-// A crash between steps 2 and 3 leaves only a .tmp + sentinel; never a corrupt
-// formal file, and never a silently-overwritten one.
-func (s *HistoryExportScheduler) publishFormat(res protection.TransitionReadResult, fmtName string) error {
+// publishSnapshot atomically materializes ALL formats of one tick under a
+// single shared snapshot base identity (P34-I3, R160/R162). Scheme per ordinal:
+//  1. reserve every format's slot via sentinel files (O_CREATE|O_EXCL) — one
+//     shared base = alert-transitions-<ts>[.<ordinal>], each format appending
+//     only its extension. Any EEXIST during reservation means THIS base ordinal
+//     is occupied, so the WHOLE group advances (no-replace preserved for every
+//     format; never per-format retry suffixes — R162/B);
+//  2. write each format's .tmp (Sync before link). Write failures are
+//     PER-FORMAT errors and do NOT move the ordinal (P34-I2 partial export);
+//  3. os.Link(tmp -> target). Link is no-replace: if ANY link returns EEXIST,
+//     the artifacts we linked at this ordinal are removed (our own files only)
+//     and the whole group retries at the next ordinal. We NEVER overwrite an
+//     existing snapshot (ours, an external process's, or a legacy export).
+// A crash between steps 2 and 3 leaves only .tmp + sentinel debris; never a
+// corrupt formal file, and never a silently-overwritten one.
+// Returns one error string per failed format (empty = full success).
+func (s *HistoryExportScheduler) publishSnapshot(res protection.TransitionReadResult) []string {
 	// Filesystem-safe timestamp: RFC3339Nano has ':' which is Windows-invalid,
 	// so use a colon-free layout. res.ExportedAt is store provenance (P34-CLOCK-1).
 	safe := res.ExportedAt.UTC().Format("20060102T150405.999999999") + "Z"
-	base := fmt.Sprintf("%s-%s.%s", historyExportFileBase, safe, fmtName)
+	base := fmt.Sprintf("%s-%s", historyExportFileBase, safe)
 
-	for attempt := 0; attempt < 100; attempt++ {
-		cand := base
-		if attempt > 0 {
-			cand = fmt.Sprintf("%s.%d", base, attempt)
+	for ordinal := 0; ordinal < 100; ordinal++ {
+		names := make(map[string]string, len(s.cfg.Formats))
+		for _, f := range s.cfg.Formats {
+			name := base
+			if ordinal > 0 {
+				name = fmt.Sprintf("%s.%d", base, ordinal)
+			}
+			names[f] = name + "." + f
 		}
-		sentinelPath := filepath.Join(s.cfg.Dir, cand+".reserve")
-		targetPath := filepath.Join(s.cfg.Dir, cand)
-		tmpPath := targetPath + ".tmp"
 
-		// 1. Reserve the slot atomically (EEXIST => another publisher or a
-		// leftover reserve holds this name; move to the next candidate).
-		sf, err := os.OpenFile(sentinelPath, os.O_CREATE|os.O_EXCL, 0o644)
-		if err != nil {
-			if os.IsExist(err) {
+		// 1. Reserve the WHOLE group's slots (EEXIST => ordinal occupied).
+		reserved := make(map[string]bool, len(s.cfg.Formats))
+		reserveErr := ""
+		reserveExist := false
+		for _, f := range s.cfg.Formats {
+			sf, err := os.OpenFile(filepath.Join(s.cfg.Dir, names[f]+".reserve"), os.O_CREATE|os.O_EXCL, 0o644)
+			if err != nil {
+				reserveErr = f + ": reserve slot: " + err.Error()
+				reserveExist = os.IsExist(err)
+				break
+			}
+			sf.Close()
+			reserved[f] = true
+		}
+		if reserveErr != "" {
+			for f := range reserved {
+				os.Remove(filepath.Join(s.cfg.Dir, names[f]+".reserve"))
+			}
+			if reserveExist {
+				continue // base ordinal occupied -> the whole group advances
+			}
+			return []string{reserveErr}
+		}
+
+		// 2. Per-format tmp writes (write failures never move the ordinal).
+		writeErrs := make(map[string]error, len(s.cfg.Formats))
+		for _, f := range s.cfg.Formats {
+			if werr := s.writeTmp(filepath.Join(s.cfg.Dir, names[f]+".tmp"), f, res); werr != nil {
+				writeErrs[f] = werr
+			}
+		}
+
+		// 3. No-replace links; ANY EEXIST rolls the WHOLE group forward.
+		linkCollide := false
+		var linked []string
+		linkErrs := make(map[string]error)
+		for _, f := range s.cfg.Formats {
+			if writeErrs[f] != nil {
 				continue
 			}
-			return fmt.Errorf("reserve slot: %w", err)
-		}
-		sf.Close()
-
-		// 2. Write tmp (Sync ensures durability before Link).
-		if werr := s.writeTmp(tmpPath, fmtName, res); werr != nil {
-			os.Remove(sentinelPath)
-			return werr
-		}
-
-		// 3. No-replace publish.
-		if lerr := os.Link(tmpPath, targetPath); lerr != nil {
-			os.Remove(tmpPath)
-			os.Remove(sentinelPath)
-			if os.IsExist(lerr) {
-				// An external/legacy file already occupies targetPath. Never
-				// overwrite it; try the next candidate base name.
-				continue
+			target := filepath.Join(s.cfg.Dir, names[f])
+			if lerr := os.Link(target+".tmp", target); lerr != nil {
+				if os.IsExist(lerr) {
+					// An external/legacy file occupies one format's target.
+					// Never overwrite it; the whole group shifts ordinal.
+					linkCollide = true
+					break
+				}
+				linkErrs[f] = lerr
+			} else {
+				linked = append(linked, f)
 			}
-			return fmt.Errorf("link snapshot: %w", lerr)
 		}
-		os.Remove(tmpPath)
-		os.Remove(sentinelPath)
-		return nil
+
+		// Cleanup tmp + sentinel debris for every format of this ordinal.
+		for _, f := range s.cfg.Formats {
+			os.Remove(filepath.Join(s.cfg.Dir, names[f]+".tmp"))
+			os.Remove(filepath.Join(s.cfg.Dir, names[f]+".reserve"))
+		}
+		if linkCollide {
+			// Roll back OUR OWN just-linked artifacts, then retry the group.
+			for _, f := range linked {
+				os.Remove(filepath.Join(s.cfg.Dir, names[f]))
+			}
+			continue
+		}
+
+		var errs []string
+		for _, f := range s.cfg.Formats {
+			switch {
+			case writeErrs[f] != nil:
+				errs = append(errs, f+": write tmp: "+writeErrs[f].Error())
+			case linkErrs[f] != nil:
+				errs = append(errs, f+": link snapshot: "+linkErrs[f].Error())
+			}
+		}
+		return errs
 	}
-	return fmt.Errorf("could not reserve a free snapshot slot after 100 retries")
+	return []string{"could not reserve a free snapshot slot after 100 retries"}
 }
 
 func (s *HistoryExportScheduler) writeTmp(tmpPath, fmtName string, res protection.TransitionReadResult) (err error) {
@@ -348,11 +397,9 @@ func serializeHistoryExportForFormat(w io.Writer, fmtName string, res protection
 	}
 }
 
-// collisionSuffixRE matches a trailing ".<digits>" collision-retry suffix on a
-// snapshot file name. Such a suffix means the same ExportedAt was published
-// again because the original target was already occupied; it does NOT make the
-// file a separate retention unit (R161/B).
-var collisionSuffixRE = regexp.MustCompile(`\.\d+$`)
+// collisionOrFormatRE matches a trailing collision-retry ordinal ".<digits>"
+// OR format extension ".json"/".csv" on a snapshot file name.
+var collisionOrFormatRE = regexp.MustCompile(`\.(?:\d+|json|csv)$`)
 
 // prune enforces the bounded local retention cap (P34-I6) in SNAPSHOT units.
 // 0 keeps all snapshots. Candidates are the scheduler's own snapshot files only
@@ -406,30 +453,24 @@ func (s *HistoryExportScheduler) prune() error {
 	return nil
 }
 
-// snapshotGroupKey returns the retention unit (snapshot) identity for a file:
-// alert-transitions-<ts>.<fmt>[.N] -> "<ts>". It strips the format suffix (via
-// snapshotSortKey) and any trailing collision-retry ".<digits>" so the json and
-// csv artifacts of one export — and rare retry variants — share one unit.
+// snapshotGroupKey returns the retention unit (snapshot) identity for a
+// snapshot file: alert-transitions-<ts>[.N].<fmt> -> "<ts>". It REPEATEDLY
+// strips a trailing format suffix (.json/.csv) and trailing collision ordinal
+// (".<digits>") in ANY order, so both the current base-level naming
+// ("<ts>.1.json") and legacy per-format collision names ("<ts>.json.1") collapse
+// into the same unit as the plain artifacts of that ExportedAt (R162/B fix —
+// the previous strip-once ordering mis-grouped "<ts>.<fmt>.<N>" as "<ts>.<fmt>").
+// The timestamp layout always ends in "Z", so the fractional ".<digits>" inside
+// the timestamp itself is never stripped.
 func snapshotGroupKey(name string) string {
-	return collisionSuffixRE.ReplaceAllString(snapshotSortKey(name), "")
-}
-
-// snapshotSortKey extracts the chronological ordering key from a snapshot file
-// name: alert-transitions-<ts>.<fmt>[.N] -> "<ts>[.N]". Stripping the format
-// suffix keeps json/csv snapshots at the same timestamp ordered together.
-func snapshotSortKey(name string) string {
-	const prefix = historyExportFileBase + "-"
-	if !strings.HasPrefix(name, prefix) {
-		return name
-	}
-	body := strings.TrimPrefix(name, prefix)
-	for _, ext := range []string{"json", "csv"} {
-		if strings.HasSuffix(body, "."+ext) {
-			body = strings.TrimSuffix(body, "."+ext)
-			break
+	body := strings.TrimPrefix(name, historyExportFileBase+"-")
+	for {
+		next := collisionOrFormatRE.ReplaceAllString(body, "")
+		if next == body {
+			return body
 		}
+		body = next
 	}
-	return body
 }
 
 // Status returns a snapshot of the scheduler state for the read API.
