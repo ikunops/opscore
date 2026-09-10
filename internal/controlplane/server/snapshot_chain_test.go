@@ -18,9 +18,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type chainFixture struct {
-	snapDir string
-	sched   *HistoryExportScheduler
-	store   *fakeExportStore
+	snapDir  string
+	sched    *HistoryExportScheduler
+	store    *fakeExportStore
+	privPath string
+	pubPath  string
 }
 
 func newChainFixture(t *testing.T) *chainFixture {
@@ -42,7 +44,41 @@ func newChainFixture(t *testing.T) *chainFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &chainFixture{snapDir: snapDir, sched: s, store: st}
+	return &chainFixture{snapDir: snapDir, sched: s, store: st, privPath: privPath, pubPath: pubPath}
+}
+
+// v4Manifest builds a chain-bearing manifest skeleton for hand-crafted cases.
+func v4Manifest(id int64, identity string, chain *manifestChain) *snapshotManifest {
+	return &snapshotManifest{
+		SchemaVersion: manifestSchemaVersionV4,
+		PublicationID: id,
+		Snapshot:      identity,
+		ExportedAt:    "2026-09-10T00:00:00Z",
+		GeneratedAt:   "2026-09-10T00:00:00Z",
+		Source:        "durable",
+		SeqContinuity: seqContinuityValue,
+		MinSeq:        1,
+		MaxSeq:        10,
+		Records:       10,
+		Chain:         chain,
+	}
+}
+
+// writeSignedManifest signs a manifest with the given signer and writes it to
+// the snapshot directory (used to craft hop shapes a real publisher never emits).
+func writeSignedManifest(t *testing.T, dir string, signer *exportSigner, m *snapshotManifest) {
+	t.Helper()
+	if err := signer.signManifest(m, chainT0); err != nil {
+		t.Fatal(err)
+	}
+	data, err := serializeSnapshotManifestBytes(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := "alert-transitions-" + m.Snapshot + ".manifest.json"
+	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // tick publishes ONE signed snapshot with the given store provenance.
@@ -78,13 +114,17 @@ func (f *chainFixture) drop(t *testing.T, exp time.Time) {
 
 func chainOf(t *testing.T, res []VerifyResult, exp time.Time) string {
 	t.Helper()
-	id := safeTS(exp)
+	return chainOfID(t, res, safeTS(exp))
+}
+
+func chainOfID(t *testing.T, res []VerifyResult, identity string) string {
+	t.Helper()
 	for _, r := range res {
-		if r.Snapshot == id {
+		if r.Snapshot == identity {
 			return r.Chain
 		}
 	}
-	t.Fatalf("result for %s missing: %+v", id, res)
+	t.Fatalf("result for %s missing: %+v", identity, res)
 	return ""
 }
 
@@ -510,6 +550,77 @@ func TestChainPartialUnverifiableBreaks(t *testing.T) {
 	if verdict.Verdict != "chain_broken" {
 		t.Fatalf("chain = %+v, want chain_broken (a dropped chain-bearing node is not a smaller clean chain)", verdict)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// T99 — a non-genesis hop without a predecessor digest is NOT verified (R197).
+// BOTH commitments (id AND canonical digest) are mandatory for every hop,
+// otherwise chain_ok would not mean what it claims.
+// ---------------------------------------------------------------------------
+func TestChainNonGenesisWithoutDigestBreaks(t *testing.T) {
+	signerOf := func(t *testing.T, f *chainFixture) *exportSigner {
+		t.Helper()
+		signer, err := newExportSigner(f.privPath, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return signer
+	}
+
+	// Control: with the digest present and exact, the same shape verifies —
+	// proving the check was tightened rather than removed.
+	t.Run("digest_present_verifies", func(t *testing.T) {
+		f := newChainFixture(t)
+		signer := signerOf(t, f)
+		first := v4Manifest(1, "20260910T010000Z", &manifestChain{PrevPublicationID: 0})
+		writeSignedManifest(t, f.snapDir, signer, first)
+		dg, err := manifestDigest(first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeSignedManifest(t, f.snapDir, signer, v4Manifest(2, "20260910T020000Z", &manifestChain{PrevPublicationID: 1, PrevManifestDigest: dg}))
+
+		res, verdict := mustVerifyDetailed(t, f.sched)
+		if verdict.Verdict != "chain_ok" {
+			t.Fatalf("chain = %+v, want chain_ok", verdict)
+		}
+		if got := chainOfID(t, res, "20260910T020000Z"); got != chainPosPredecessorVerified {
+			t.Fatalf("position = %q, want %q", got, chainPosPredecessorVerified)
+		}
+	})
+
+	t.Run("missing_digest", func(t *testing.T) {
+		f := newChainFixture(t)
+		signer := signerOf(t, f)
+		writeSignedManifest(t, f.snapDir, signer, v4Manifest(1, "20260910T010000Z", &manifestChain{PrevPublicationID: 0}))
+		// Validly signed, id commitment present, digest commitment ABSENT.
+		writeSignedManifest(t, f.snapDir, signer, v4Manifest(2, "20260910T020000Z", &manifestChain{PrevPublicationID: 1}))
+
+		res, verdict := mustVerifyDetailed(t, f.sched)
+		if verdict.Verdict != "chain_broken" {
+			t.Fatalf("a hop without a predecessor digest must break the chain: %+v", verdict)
+		}
+		if len(verdict.BrokenAt) != 1 || verdict.BrokenAt[0] != 2 {
+			t.Fatalf("broken_at = %v, want [2]", verdict.BrokenAt)
+		}
+		if got := chainOfID(t, res, "20260910T020000Z"); got != chainPosBroken {
+			t.Fatalf("position = %q, want %q", got, chainPosBroken)
+		}
+	})
+
+	t.Run("wrong_digest_breaks", func(t *testing.T) {
+		f := newChainFixture(t)
+		signer := signerOf(t, f)
+		writeSignedManifest(t, f.snapDir, signer, v4Manifest(1, "20260910T010000Z", &manifestChain{PrevPublicationID: 0}))
+		writeSignedManifest(t, f.snapDir, signer, v4Manifest(2, "20260910T020000Z", &manifestChain{
+			PrevPublicationID: 1, PrevManifestDigest: strings.Repeat("ab", 32),
+		}))
+
+		_, verdict := mustVerifyDetailed(t, f.sched)
+		if verdict.Verdict != "chain_broken" {
+			t.Fatalf("a mismatching predecessor digest must break the chain: %+v", verdict)
+		}
+	})
 }
 
 func TestChainDefaultIsUnchanged(t *testing.T) {

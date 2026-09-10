@@ -178,8 +178,10 @@ func verifyManifestChain(nodes []chainNode, chainBearing int) (ChainVerdict, map
 
 	for i := 1; i < len(sorted); i++ {
 		prev, cur := sorted[i-1], sorted[i]
-		ok := cur.prevID == prev.id && (cur.prevDigest == "" || cur.prevDigest == prev.digest)
-		if ok {
+		// A non-genesis hop MUST carry BOTH commitments: the id AND the exact
+		// canonical digest of its predecessor. An empty digest is never a
+		// wildcard — chain_ok must mean every hop is id+digest bound (R197).
+		if cur.prevID == prev.id && cur.prevDigest == prev.digest {
 			positions[cur.identity] = chainPosPredecessorVerified
 			continue
 		}
@@ -187,9 +189,12 @@ func verifyManifestChain(nodes []chainNode, chainBearing int) (ChainVerdict, map
 		v.BrokenAt = append(v.BrokenAt, cur.id)
 		positions[cur.identity] = chainPosBroken
 		if v.Detail == "" {
-			if cur.prevID != prev.id {
+			switch {
+			case cur.prevID != prev.id:
 				v.Detail = fmt.Sprintf("manifest %d commits to predecessor %d but the retained predecessor is %d", cur.id, cur.prevID, prev.id)
-			} else {
+			case cur.prevDigest == "":
+				v.Detail = fmt.Sprintf("manifest %d commits to predecessor %d without a predecessor digest", cur.id, cur.prevID)
+			default:
 				v.Detail = fmt.Sprintf("manifest %d commits to a predecessor digest that does not match %d", cur.id, prev.id)
 			}
 		}
