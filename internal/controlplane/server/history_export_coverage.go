@@ -125,7 +125,10 @@ func (s *HistoryExportScheduler) Coverage(since, until *int64, limit int) (*Cove
 
 	var usable []CoverageInterval
 	var knownPubIDs []int64
-	uncertainRelevant := false
+	// coverage_uncertain candidates are collected BEFORE the window exists;
+	// whether each one is RELEVANT to this query is decided afterwards, once
+	// the window is known (R187/B — relevant is never an unconditional flag).
+	var uncertains []coverageUncertainCandidate
 	var spanMin, spanMax int64
 	haveUsable := false
 
@@ -142,10 +145,8 @@ func (s *HistoryExportScheduler) Coverage(since, until *int64, limit int) (*Cove
 			if reason == unusableEmptyRange {
 				entry.Class = coverageClassIrrelevant
 			} else {
-				// The real extent is unknown: it could fill ANY gap, so it can
-				// never be dismissed (R186 final rule).
 				entry.Class = coverageClassUncertain
-				uncertainRelevant = true
+				uncertains = append(uncertains, coverageUncertainCandidate{manifest: m, reason: reason})
 			}
 			res.Unusable = append(res.Unusable, entry)
 			continue
@@ -185,6 +186,16 @@ func (s *HistoryExportScheduler) Coverage(since, until *int64, limit int) (*Cove
 	}
 	res.Window = CoverageWindow{Since: winSince, Until: winUntil}
 
+	// ---- relevant (R186 rule, R187 refinement) -----------------------------
+	// A coverage_uncertain snapshot is relevant only if its real extent cannot
+	// be EXCLUDED from this window; see coverageUncertainRelevant.
+	uncertainRelevant := false
+	for _, c := range uncertains {
+		if coverageUncertainRelevant(c.manifest, c.reason, winSince, winUntil) {
+			uncertainRelevant = true
+			break
+		}
+	}
 	res.ProvenanceUncertain = uncertainRelevant
 
 	if !haveUsable {
@@ -207,27 +218,46 @@ func (s *HistoryExportScheduler) Coverage(since, until *int64, limit int) (*Cove
 		return res, nil
 	}
 
-	// ---- M2: seq-axis union / merge (never time-ordered) --------------------
-	merged := mergeCoverageIntervals(usable)
-
-	// observed span ∩ window (M3 v2): inside the observed span an uncovered
-	// stretch is ALWAYS a gap; only beyond the span is out_of_scope.
-	spanLo, spanHi := maxI64(spanMin, winSince), minI64(spanMax, winUntil)
-	if winSince < spanMin {
-		// spanMin > winSince ⇒ spanMin-1 cannot underflow.
-		res.OutOfScope = append(res.OutOfScope, CoverageInterval{Min: winSince, Max: spanMin - 1})
-	}
-	if winUntil > spanMax {
-		// spanMax < winUntil ⇒ spanMax+1 cannot overflow.
-		res.OutOfScope = append(res.OutOfScope, CoverageInterval{Min: spanMax + 1, Max: winUntil})
-	}
-
-	for _, iv := range merged {
-		lo, hi := maxI64(iv.Min, spanLo), minI64(iv.Max, spanHi)
+	// ---- M2 (frozen order): window clip FIRST, then seq union/merge --------
+	// R186 pipeline: usable intervals → clip [since,until] → union/merge.
+	clipped := make([]CoverageInterval, 0, len(usable))
+	for _, iv := range usable {
+		lo, hi := maxI64(iv.Min, winSince), minI64(iv.Max, winUntil)
 		if lo <= hi {
-			res.Covered = append(res.Covered, CoverageInterval{Min: lo, Max: hi})
+			clipped = append(clipped, CoverageInterval{Min: lo, Max: hi})
 		}
 	}
+	merged := mergeCoverageIntervals(clipped)
+
+	// observed span (= observed extent ∩ window) = the union bounds AFTER the
+	// clip. Empty when the window lies entirely outside the observed extent.
+	spanLo, spanHi := int64(0), int64(-1)
+	if len(clipped) > 0 {
+		spanLo, spanHi = clipped[0].Min, clipped[0].Max
+		for _, iv := range clipped {
+			if iv.Min < spanLo {
+				spanLo = iv.Min
+			}
+			if iv.Max > spanHi {
+				spanHi = iv.Max
+			}
+		}
+	}
+
+	// out_of_scope = window \ observed extent, computed from the UNCLIPPED span
+	// (the extent ANY snapshot touched): inside the extent an uncovered stretch
+	// is ALWAYS a gap; only beyond it is out_of_scope (M3 v2).
+	if winSince < spanMin {
+		// spanMin > winSince ⇒ spanMin-1 cannot underflow; the upper end is
+		// clamped so a wholly-disjoint window is reported exactly.
+		res.OutOfScope = append(res.OutOfScope, CoverageInterval{Min: winSince, Max: minI64(winUntil, spanMin-1)})
+	}
+	if winUntil > spanMax {
+		res.OutOfScope = append(res.OutOfScope, CoverageInterval{Min: maxI64(winSince, spanMax+1), Max: winUntil})
+	}
+
+	// covered = merged — the intervals are already window-bounded by the clip.
+	res.Covered = append(res.Covered, merged...)
 
 	// gaps = (observed span ∩ window) \ covered
 	cursor := spanLo
@@ -300,6 +330,39 @@ func (s *HistoryExportScheduler) loadCoverageManifest(g *snapshotGroup) (*snapsh
 		return m, unusableEmptyRange
 	}
 	return m, ""
+}
+
+// coverageUncertainCandidate is a coverage_uncertain manifest awaiting the
+// window-dependent `relevant` decision (it cannot be made during the M1 pass,
+// because the window is only known afterwards).
+type coverageUncertainCandidate struct {
+	manifest *snapshotManifest
+	reason   string
+}
+
+// coverageUncertainRelevant reports whether a coverage_uncertain snapshot may
+// influence the verdict for THIS window (R186 "relevant", refined per R187).
+//
+// The test is "can its real extent be EXCLUDED from the window?":
+//
+//   - `unparseable` / `missing_range` declare nothing at all, so their real
+//     extent is entirely unknown and can never be excluded from any window —
+//     always relevant. (This is exactly the frozen T59 case: a usable [1,100]
+//     plus one unparseable snapshot in a [1,100] window ⇒ unknown.)
+//   - `invalid_range` is an untrustworthy declaration, but its ENVELOPE is
+//     still hard positional evidence. If that envelope cannot touch the
+//     window, the snapshot cannot change this window's verdict, so it is NOT
+//     relevant. The declaration is never swapped or repaired — only its
+//     envelope is compared.
+func coverageUncertainRelevant(m *snapshotManifest, reason string, winSince, winUntil int64) bool {
+	if m == nil || reason == unusableUnparseable || reason == unusableMissingRange {
+		return true
+	}
+	lo, hi := m.MinSeq, m.MaxSeq
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	return !(hi < winSince || lo > winUntil)
 }
 
 // mergeCoverageIntervals sorts by MinSeq ascending and unions overlapping or

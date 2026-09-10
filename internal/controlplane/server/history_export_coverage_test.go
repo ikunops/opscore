@@ -574,3 +574,135 @@ func TestCoverageNoManifestsIsUnknown(t *testing.T) {
 	covIntervals(t, res.Covered)
 	covIntervals(t, res.Gaps)
 }
+
+// ---------------------------------------------------------------------------
+// T60 — an uncertain snapshot provably OUTSIDE the window must NOT downgrade
+// (R187/B): this is the counter-example the frozen architecture demands.
+// ---------------------------------------------------------------------------
+func TestCoverageUncertainOutsideWindowDoesNotDowngrade(t *testing.T) {
+	dir := t.TempDir()
+	// usable [100,200] alone defines the (defaulted) window [100,200].
+	writeCovManifest(t, dir, "20260910T000001Z", 101, 100, 200, 101, false)
+	// invalid_range whose ENVELOPE is [10,50] — provably outside the window.
+	writeCovManifest(t, dir, "20260910T000002Z", 102, 50, 10, 5, false)
+
+	res, err := covScheduler(t, dir).Coverage(nil, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The entry is still reported for diagnostics ...
+	u := covUnusableReason(t, res, "20260910T000002Z")
+	if u.Reason != "invalid_range" || u.Class != "coverage_uncertain" {
+		t.Fatalf("unusable = %+v, want invalid_range/coverage_uncertain", u)
+	}
+	// ... but it cannot influence THIS window's verdict.
+	if res.ProvenanceUncertain {
+		t.Fatal("an envelope wholly outside the window must NOT be relevant (R187/B)")
+	}
+	covIntervals(t, res.Covered, CoverageInterval{100, 200})
+	covIntervals(t, res.Gaps)
+	if res.Completeness != "complete" {
+		t.Fatalf("completeness = %q, want complete", res.Completeness)
+	}
+}
+
+// T60b — relevance is a property of the QUERY, not of the file: widening the
+// window to reach the same snapshot's envelope makes it relevant again.
+func TestCoverageUncertainRelevanceDependsOnWindow(t *testing.T) {
+	dir := t.TempDir()
+	writeCovManifest(t, dir, "20260910T000001Z", 101, 100, 200, 101, false)
+	writeCovManifest(t, dir, "20260910T000002Z", 102, 50, 10, 5, false) // envelope [10,50]
+
+	res, err := covScheduler(t, dir).Coverage(i64p(1), i64p(200), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.ProvenanceUncertain {
+		t.Fatal("the same snapshot IS relevant once the window reaches its envelope")
+	}
+	if res.Completeness != "unknown" {
+		t.Fatalf("completeness = %q, want unknown", res.Completeness)
+	}
+}
+
+// T63 — uncertainty outside snapshots_considered (excluded by limit) is not
+// relevant either: `relevant` is scoped to the observation set.
+func TestCoverageUncertainOutsideConsideredSet(t *testing.T) {
+	dir := t.TempDir()
+	// The OLDER snapshot is corrupt; limit=1 keeps only the newest (usable).
+	if err := os.WriteFile(filepath.Join(dir, "alert-transitions-20260910T000001Z.manifest.json"),
+		[]byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeCovManifest(t, dir, "20260910T000002Z", 102, 1, 100, 100, false)
+
+	res, err := covScheduler(t, dir).Coverage(nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.SnapshotsConsidered != 1 {
+		t.Fatalf("snapshots_considered = %d, want 1", res.SnapshotsConsidered)
+	}
+	if res.ProvenanceUncertain {
+		t.Fatal("uncertainty outside snapshots_considered must NOT be relevant")
+	}
+	if res.Completeness != "complete" {
+		t.Fatalf("completeness = %q, want complete", res.Completeness)
+	}
+	if !res.Bounded {
+		t.Fatal("bounded must be true (the set was truncated by limit)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T62 — clipping happens BEFORE the merge, so `covered` never leaks outside
+// the window (R187/B frozen pipeline order).
+// ---------------------------------------------------------------------------
+func TestCoverageClipPrecedesMerge(t *testing.T) {
+	dir := t.TempDir()
+	writeCovManifest(t, dir, "20260910T000001Z", 101, 1, 50, 50, false)
+	writeCovManifest(t, dir, "20260910T000002Z", 102, 60, 100, 41, false)
+
+	res, err := covScheduler(t, dir).Coverage(i64p(40), i64p(80), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only the in-window parts survive: [40,50] and [60,80] — never [1,50].
+	covIntervals(t, res.Covered, CoverageInterval{40, 50}, CoverageInterval{60, 80})
+	covIntervals(t, res.Gaps, CoverageInterval{51, 59})
+	covIntervals(t, res.OutOfScope) // the window sits inside the observed extent
+	if res.Bounded {
+		t.Fatal("bounded must be false: the window is inside the observed extent")
+	}
+}
+
+// T61 — a window wholly outside the observed extent is reported exactly (both
+// sides), and never manufactures a gap.
+func TestCoverageDisjointWindowIsReportedExactly(t *testing.T) {
+	dir := t.TempDir()
+	writeCovManifest(t, dir, "20260910T000001Z", 101, 1, 100, 100, false)
+	s := covScheduler(t, dir)
+
+	// Right-disjoint.
+	res, err := s.Coverage(i64p(500), i64p(600), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	covIntervals(t, res.Covered)
+	covIntervals(t, res.Gaps)
+	covIntervals(t, res.OutOfScope, CoverageInterval{500, 600})
+	if !res.Bounded || res.Completeness != "complete" {
+		t.Fatalf("right-disjoint = bounded:%v completeness:%q, want true/complete", res.Bounded, res.Completeness)
+	}
+
+	// Left-disjoint: the observed extent sits entirely ABOVE the window.
+	dir2 := t.TempDir()
+	writeCovManifest(t, dir2, "20260910T000001Z", 101, 500, 600, 101, false)
+	res, err = covScheduler(t, dir2).Coverage(i64p(1), i64p(100), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	covIntervals(t, res.Covered)
+	covIntervals(t, res.Gaps)
+	covIntervals(t, res.OutOfScope, CoverageInterval{1, 100})
+}
