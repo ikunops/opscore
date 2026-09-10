@@ -882,13 +882,16 @@ func (s *Server) handleHistoryExportVerify(w http.ResponseWriter, r *http.Reques
 		}
 		limit = n
 	}
-	results, verr := s.historyScheduler.VerifySnapshots(limit)
+	results, chain, verr := s.historyScheduler.VerifySnapshotsDetailed(limit)
 	if verr != nil {
 		writeError(w, http.StatusInternalServerError, verr.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"checked": len(results),
+		// Phase 38: the aggregate chain verdict is a THIRD orthogonal
+		// dimension — it neither reads nor rewrites any other field.
+		"chain":   chain,
 		"results": results,
 	})
 }

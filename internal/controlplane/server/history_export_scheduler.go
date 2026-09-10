@@ -612,7 +612,27 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 	// v3 + signature, and a signing failure publishes NOTHING (the already
 	// linked artifacts are honestly reported as orphan_artifact).
 	if s.signer != nil {
-		manifest.SchemaVersion = manifestSchemaVersionV3
+		manifest.SchemaVersion = manifestSchemaVersionV4
+		// Phase 38: commit to the manifest this publication ACTUALLY follows —
+		// never `id-1`, because a crashed tick burns ids and leaves a legal gap.
+		prev, lerr := latestPublishedManifest(s.cfg.Dir, pubID)
+		if lerr != nil {
+			return "manifest: chain: " + lerr.Error(), ""
+		}
+		if prev == nil {
+			// Genesis: the first chain-bearing manifest declares the P38 chain
+			// start EXPLICITLY. It deliberately does not adopt an older v3 file
+			// as its predecessor: such a file cannot express a chain, and once
+			// pruned it is indistinguishable from a deleted first v4 link
+			// (R195 migration boundary).
+			manifest.Chain = &manifestChain{PrevPublicationID: 0}
+		} else {
+			dg, derr := manifestDigest(prev)
+			if derr != nil {
+				return "manifest: chain digest: " + derr.Error(), ""
+			}
+			manifest.Chain = &manifestChain{PrevPublicationID: prev.PublicationID, PrevManifestDigest: dg}
+		}
 		if s.beforeManifestSign != nil {
 			s.beforeManifestSign(s.cfg.Dir)
 		}

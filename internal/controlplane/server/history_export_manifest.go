@@ -38,6 +38,10 @@ const (
 	// explicit, scoped supersede of the P35 "schema v2" freeze, justified by
 	// the new Phase's capability and bounded to it).
 	manifestSchemaVersionV3 = 3
+	// manifestSchemaVersionV4 adds the publication-chain commitment (Phase 38).
+	// It is written only when signing is enabled; a v3 manifest (signature but
+	// no chain) reports chain_absent.
+	manifestSchemaVersionV4 = 4
 	// manifestSchemaVersion is the version the scheduler WRITES. It stays V2
 	// while no signing key is configured, so default behaviour is unchanged.
 	manifestSchemaVersion = manifestSchemaVersionV2
@@ -66,9 +70,11 @@ type snapshotManifest struct {
 	MaxSeq        int64                `json:"max_seq"`
 	Records       int64                `json:"records"`
 	Formats       []manifestFormatInfo `json:"formats"`
-	// Signature is the optional Phase 37 block (schema v3 only). It is nil for
-	// v2 manifests and for unsigned snapshots.
+	// Signature is the optional Phase 37 block (schema v3+). It is nil for v2
+	// manifests and for unsigned snapshots.
 	Signature *signatureBlock `json:"signature,omitempty"`
+	// Chain is the optional Phase 38 publication-chain commitment (schema v4+).
+	Chain *manifestChain `json:"chain,omitempty"`
 }
 
 type manifestFormatInfo struct {
@@ -95,11 +101,13 @@ func parseSnapshotManifest(data []byte) (*snapshotManifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("manifest json: %w", err)
 	}
-	// Phase 37: accept BOTH v2 and v3. A v2 manifest stays valid forever
-	// (read-only compatibility); refusing v3 here would make Phase 36 coverage
-	// treat every signed snapshot as unparseable (T78 anti-regression).
-	if m.SchemaVersion != manifestSchemaVersionV2 && m.SchemaVersion != manifestSchemaVersionV3 {
-		return nil, fmt.Errorf("unsupported manifest schema_version %d (want %d or %d)", m.SchemaVersion, manifestSchemaVersionV2, manifestSchemaVersionV3)
+	// Phase 37/38: accept v2, v3 and v4. A v2 manifest stays valid forever
+	// (read-only compatibility); refusing a newer version here would make the
+	// Phase 36 coverage surface treat every signed snapshot as unparseable.
+	if m.SchemaVersion != manifestSchemaVersionV2 &&
+		m.SchemaVersion != manifestSchemaVersionV3 &&
+		m.SchemaVersion != manifestSchemaVersionV4 {
+		return nil, fmt.Errorf("unsupported manifest schema_version %d (want %d, %d or %d)", m.SchemaVersion, manifestSchemaVersionV2, manifestSchemaVersionV3, manifestSchemaVersionV4)
 	}
 	if m.PublicationID <= 0 {
 		return nil, errors.New("manifest publication_id missing or invalid")
@@ -510,7 +518,11 @@ type VerifyResult struct {
 	// manifest itself could not be parsed (P35 `unknown` semantics apply, and
 	// no signature verdict is ever fabricated).
 	Signature *SignatureVerdict `json:"signature,omitempty"`
-	Detail    string            `json:"detail,omitempty"`
+	// Chain is the orthogonal Phase 38 position of this snapshot in the
+	// publication chain: predecessor_verified / retention_boundary / broken /
+	// absent. It never modifies Status or Signature.
+	Chain  string `json:"chain,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // VerifySnapshots checks the newest `limit` snapshot groups across BOTH
@@ -518,6 +530,15 @@ type VerifyResult struct {
 // ok / mismatch / missing / orphan_artifact / orphan_manifest / unknown.
 // Strictly read-only: nothing here writes, deletes, or repairs (M3).
 func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, error) {
+	results, _, err := s.VerifySnapshotsDetailed(limit)
+	return results, err
+}
+
+// VerifySnapshotsDetailed additionally returns the Phase 38 aggregate chain
+// verdict. The signature and chain dimensions are evaluated over the FULL
+// retained set before any limit truncation — a truncated window must never look
+// like a broken chain or a missing signature.
+func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyResult, ChainVerdict, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -526,12 +547,14 @@ func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, err
 	}
 	groups, unattributed, err := discoverSnapshotGroups(s.cfg.Dir, true)
 	if err != nil {
-		return nil, err
+		return nil, ChainVerdict{}, err
 	}
 	// Publication-id uniqueness is a NAMESPACE property: it is checked over the
 	// FULL manifest set BEFORE the limit window is applied (R177/B — a
 	// duplicate outside the requested page must still poison the namespace).
 	idCount := map[int64]int{}
+	sigByGroup := map[string]SignatureVerdict{}
+	var chainNodes []chainNode
 	for _, g := range groups {
 		if g.manifestFn == "" {
 			continue
@@ -540,11 +563,28 @@ func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, err
 		if rerr != nil {
 			continue
 		}
-		if m, perr := parseSnapshotManifest(data); perr == nil {
-			g.manifest = m
-			idCount[m.PublicationID]++
+		m, perr := parseSnapshotManifest(data)
+		if perr != nil {
+			continue
+		}
+		g.manifest = m
+		idCount[m.PublicationID]++
+		// Phase 37/38 dimensions, computed over the full retained set.
+		v := verifyManifestSignature(m, s.trust)
+		sigByGroup[g.identity] = v
+		if v.Verdict == sigVerdictOK && m.SchemaVersion >= manifestSchemaVersionV4 && m.Chain != nil {
+			if dg, derr := manifestDigest(m); derr == nil {
+				chainNodes = append(chainNodes, chainNode{
+					id:         m.PublicationID,
+					digest:     dg,
+					prevID:     m.Chain.PrevPublicationID,
+					prevDigest: m.Chain.PrevManifestDigest,
+					identity:   g.identity,
+				})
+			}
 		}
 	}
+	chainVerdict, chainPositions := verifyManifestChain(chainNodes)
 	if len(groups) > limit {
 		groups = groups[:limit]
 	}
@@ -693,31 +733,37 @@ func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, err
 			res.Status = status
 			res.Detail = strings.Join(details, "; ")
 		}
-		// ---- Phase 37: signature dimension (orthogonal; can only LOWER) -----
-		// Only produced when the manifest parsed: a broken manifest keeps the
-		// Phase 35 `unknown` semantics and never fabricates a signature verdict.
+		// ---- Phase 37/38: orthogonal dimensions (can only LOWER status) -----
+		// Both use the FULL-SET precomputed values: a manifest that cannot be
+		// parsed keeps the Phase 35 `unknown` semantics and never fabricates a
+		// signature or chain verdict.
 		if g.manifest != nil {
-			v := verifyManifestSignature(g.manifest, s.trust)
-			res.Signature = &v
-			if res.Status == "" {
-				res.Status = verifyStatusUnknown
-			}
-			res.Status = applySignatureVerdict(res.Status, v, g.manifest.SchemaVersion)
-			if v.Verdict != sigVerdictOK && v.Verdict != sigVerdictAbsent {
-				note := "signature: " + v.Verdict
-				if v.Detail != "" {
-					note += " (" + v.Detail + ")"
+			if v, ok := sigByGroup[g.identity]; ok {
+				vv := v
+				res.Signature = &vv
+				if res.Status == "" {
+					res.Status = verifyStatusUnknown
 				}
-				if res.Detail == "" {
-					res.Detail = note
-				} else {
-					res.Detail += "; " + note
+				res.Status = applySignatureVerdict(res.Status, vv, g.manifest.SchemaVersion)
+				if vv.Verdict != sigVerdictOK && vv.Verdict != sigVerdictAbsent {
+					note := "signature: " + vv.Verdict
+					if vv.Detail != "" {
+						note += " (" + vv.Detail + ")"
+					}
+					if res.Detail == "" {
+						res.Detail = note
+					} else {
+						res.Detail += "; " + note
+					}
 				}
 			}
 		}
+		if pos, ok := chainPositions[g.identity]; ok {
+			res.Chain = pos
+		}
 		out = append(out, res)
 	}
-	return out, nil
+	return out, chainVerdict, nil
 }
 
 func sortFormats(fs []VerifyFormatResult) {

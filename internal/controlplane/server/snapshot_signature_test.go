@@ -142,8 +142,8 @@ func onlyResult(t *testing.T, res []VerifyResult) VerifyResult {
 func TestSignatureValidVerifiesOK(t *testing.T) {
 	f := signedSnapshot(t)
 	m := readManifestFile(t, f.snapDir, f.manifestName())
-	if v, _ := m["schema_version"].(float64); int(v) != manifestSchemaVersionV3 {
-		t.Fatalf("signed manifest must be schema v3, got %v", m["schema_version"])
+	if v, _ := m["schema_version"].(float64); int(v) != manifestSchemaVersionV4 {
+		t.Fatalf("signed manifest must be schema v4 (v3 + chain), got %v", m["schema_version"])
 	}
 	res := onlyResult(t, mustVerify(t, f.sched))
 	if res.Signature == nil || res.Signature.Verdict != "signature_ok" {
