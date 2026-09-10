@@ -704,6 +704,74 @@ func TestChainGenesisDigestIsEmpty(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T101 — an unreadable / unparseable newest candidate is NOT skipped (R199).
+// "I cannot read it" is not "it does not exist": skipping it would roll the
+// chain back to an older node and hide the break.
+// ---------------------------------------------------------------------------
+func TestChainUnreadablePredecessorBlocksPublication(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(t *testing.T, path string)
+	}{
+		{
+			name: "unparseable_json",
+			corrupt: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte("{truncated"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "empty_file",
+			corrupt: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newChainFixture(t)
+			f.tick(t, at(0), 1, 10)
+			f.tick(t, at(1), 11, 20)
+			tc.corrupt(t, filepath.Join(f.snapDir, "alert-transitions-"+safeTS(at(1))+".manifest.json"))
+
+			f.tick(t, at(2), 21, 30) // attempt the next publication
+
+			next := filepath.Join(f.snapDir, "alert-transitions-"+safeTS(at(2))+".manifest.json")
+			if _, err := os.Stat(next); !os.IsNotExist(err) {
+				t.Fatalf("publication must be REFUSED: an unreadable newest candidate cannot be skipped (stat err=%v)", err)
+			}
+			st := f.sched.Status()
+			if !strings.Contains(st.ManifestError, "manifest: chain:") {
+				t.Fatalf("manifest_error = %q, want a chain refusal", st.ManifestError)
+			}
+			if st.ChainError == "" {
+				t.Fatal("chain_error must surface the refused extension")
+			}
+		})
+	}
+}
+
+// T101 control — a readable, trusted newest candidate still extends normally,
+// proving the publisher was not simply disabled.
+func TestChainReadablePredecessorStillPublishes(t *testing.T) {
+	f := newChainFixture(t)
+	f.tick(t, at(0), 1, 10)
+	f.tick(t, at(1), 11, 20)
+	f.tick(t, at(2), 21, 30)
+
+	m := readManifestFile(t, f.snapDir, "alert-transitions-"+safeTS(at(2))+".manifest.json")
+	if v, _ := m["chain"].(map[string]any)["prev_publication_id"].(float64); int64(v) != 2 {
+		t.Fatalf("pub 3 must extend pub 2, got %v", m["chain"])
+	}
+	if _, verdict := mustVerifyDetailed(t, f.sched); verdict.Verdict != "chain_ok" {
+		t.Fatalf("chain = %+v, want chain_ok", verdict)
+	}
+}
+
 func TestChainDefaultIsUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	exp := time.Date(2026, 9, 10, 3, 0, 0, 0, time.UTC)
