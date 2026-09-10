@@ -892,3 +892,63 @@ func (s *Server) handleHistoryExportVerify(w http.ResponseWriter, r *http.Reques
 		"results": results,
 	})
 }
+
+// handleHistoryExportCoverage (Phase 36) reports the CROSS-SNAPSHOT seq
+// coverage over the newest snapshot manifests: union/merge, gaps, out-of-scope
+// ranges and indeterminate publication holes. `since`/`until` are seq bounds
+// (not wall-clock); omitted bounds default to the observed extent.
+//
+// Boundary (frozen): this surface never re-hashes artifacts and never checks
+// artifact presence — that belongs to the Phase 35 verify surface. It is
+// strictly read-only: nothing here writes, deletes, or repairs.
+func (s *Server) handleHistoryExportCoverage(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.historyScheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduled history export is disabled (configure --export-interval and --export-dir to enable)")
+		return
+	}
+	var since, until *int64
+	if v := r.URL.Query().Get("since"); v != "" {
+		n, perr := strconv.ParseInt(v, 10, 64)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, "since must be an integer seq value")
+			return
+		}
+		since = &n
+	}
+	if v := r.URL.Query().Get("until"); v != "" {
+		n, perr := strconv.ParseInt(v, 10, 64)
+		if perr != nil {
+			writeError(w, http.StatusBadRequest, "until must be an integer seq value")
+			return
+		}
+		until = &n
+	}
+	if since != nil && until != nil && *since > *until {
+		writeError(w, http.StatusBadRequest, "since must not be greater than until")
+		return
+	}
+	limit := 10
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, perr := strconv.Atoi(v)
+		if perr != nil || n <= 0 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	res, cerr := s.historyScheduler.Coverage(since, until, limit)
+	if cerr != nil {
+		writeError(w, http.StatusInternalServerError, cerr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}

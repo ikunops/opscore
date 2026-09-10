@@ -1646,6 +1646,10 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// Registered ONLY here (:8082), never :8080 (R21-1).
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/manifest", s.handleHistoryExportManifestList)
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/verify", s.handleHistoryExportVerify)
+	// Phase 36 (read-only): cross-snapshot seq coverage / gap analysis. It
+	// consumes manifest declarations only — never hashes or repairs anything.
+	// Registered ONLY here (:8082), never :8080 (R21-1).
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/coverage", s.handleHistoryExportCoverage)
 	return mux
 }
 
