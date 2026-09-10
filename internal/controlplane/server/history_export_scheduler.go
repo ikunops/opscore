@@ -182,9 +182,15 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 	if err != nil {
 		return nil, fmt.Errorf("history export: %w", err)
 	}
-	if signer != nil && trust != nil {
-		// Signing with a key our own verifier cannot resolve would make every
-		// freshly published snapshot look unverifiable. Refuse at construction.
+	if signer != nil {
+		// Signing with a key our own verifier cannot resolve would publish a
+		// batch of snapshots that are GUARANTEED to verify as key_unknown. Both
+		// failure modes are therefore fail-fast at construction (T79b):
+		//   - a signing key with NO trust anchor at all;
+		//   - a signing key absent from the configured anchor.
+		if trust == nil {
+			return nil, fmt.Errorf("history export: sign key configured (%s) but no trust anchor — also configure --export-trust-keys so published snapshots can actually be verified", signer.keyID)
+		}
 		if _, ok := trust.keys[signer.keyID]; !ok {
 			return nil, fmt.Errorf("history export: sign key %s is absent from the configured trust keys — signed snapshots would verify as key_unknown", signer.keyID)
 		}

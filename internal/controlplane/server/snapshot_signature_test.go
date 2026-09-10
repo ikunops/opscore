@@ -548,26 +548,58 @@ func TestSignerKeyIdentityConsistency(t *testing.T) {
 	}
 }
 
-// T79b — signing with a key our own anchor cannot resolve is refused at start.
-func TestSignKeyAbsentFromTrustAnchorFailsFast(t *testing.T) {
+// T79b — a signing key that our own anchor cannot resolve is refused at start.
+// Two distinct failure modes, both fail-fast (R192):
+//
+//	T79b-1: signing key configured + trust anchor OMITTED
+//	T79b-2: signing key configured + anchor present but lacking that key
+func TestSignKeyAnchorMismatchFailsFast(t *testing.T) {
 	root := t.TempDir()
 	keyDir := filepath.Join(root, "keys")
 	if err := os.MkdirAll(keyDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	privPath, _, _, _ := genKeyPair(t, keyDir, "keyA")
+	privPath, pubPathA, _, _ := genKeyPair(t, keyDir, "keyA")
 	_, otherPub, _, _ := genKeyPair(t, keyDir, "other")
-
 	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions()}}
+
+	// T79b-1: no trust anchor at all.
 	_, err := NewHistoryExportScheduler(HistoryExportConfig{
-		Store: st, Dir: root, Interval: time.Hour, Formats: []string{"json"},
+		Store: st, Dir: filepath.Join(root, "d1"), Interval: time.Hour, Formats: []string{"json"},
+		SignKeyPath: privPath,
+	})
+	if err == nil {
+		t.Fatal("T79b-1: a sign key with NO trust anchor must fail fast (signing disabled is the only way to omit the anchor)")
+	}
+	if !strings.Contains(err.Error(), "trust anchor") {
+		t.Fatalf("T79b-1: err = %v, want a trust-anchor diagnostic", err)
+	}
+
+	// T79b-2: an anchor exists but does not contain the signing key.
+	_, err = NewHistoryExportScheduler(HistoryExportConfig{
+		Store: st, Dir: filepath.Join(root, "d2"), Interval: time.Hour, Formats: []string{"json"},
 		SignKeyPath: privPath, TrustKeyPaths: []string{otherPub},
 	})
 	if err == nil {
-		t.Fatal("a sign key missing from the trust anchor must fail fast")
+		t.Fatal("T79b-2: a sign key absent from the configured anchor must fail fast")
 	}
 	if !strings.Contains(err.Error(), "trust keys") {
-		t.Fatalf("err = %v, want a trust-anchor diagnostic", err)
+		t.Fatalf("T79b-2: err = %v, want a trust-anchor diagnostic", err)
+	}
+
+	// Control: the matching anchor constructs fine.
+	if _, err := NewHistoryExportScheduler(HistoryExportConfig{
+		Store: st, Dir: filepath.Join(root, "d3"), Interval: time.Hour, Formats: []string{"json"},
+		SignKeyPath: privPath, TrustKeyPaths: []string{pubPathA},
+	}); err != nil {
+		t.Fatalf("a sign key present in the anchor must be accepted: %v", err)
+	}
+
+	// Control: no sign key ⇒ the anchor is optional.
+	if _, err := NewHistoryExportScheduler(HistoryExportConfig{
+		Store: st, Dir: filepath.Join(root, "d4"), Interval: time.Hour, Formats: []string{"json"},
+	}); err != nil {
+		t.Fatalf("signing disabled must not require an anchor: %v", err)
 	}
 }
 
