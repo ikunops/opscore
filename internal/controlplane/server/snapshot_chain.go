@@ -92,48 +92,73 @@ type chainNode struct {
 // latestVerifiedChainPredecessor returns the chain-bearing manifest this
 // publication must extend, or an error when the chain cannot be extended.
 //
-// The walk goes newest→oldest and NEVER skips an unusable candidate (R199):
+// TWO INDEPENDENT AXES are at work here (R200) and must not be conflated:
 //
-//	no manifest at all                          → (nil, nil): genesis
-//	newest manifest unreadable / unparseable    → (nil, err): fail-closed
-//	newest manifest is pre-chain (v2/v3)        → keep walking (not a candidate)
-//	newest chain-bearing manifest, trusted      → (m, nil): extend from it
-//	newest chain-bearing manifest, untrusted    → (nil, err): fail-closed
+//   - the DIRECTORY order is the snapshot identity (ts, ordinal) order, which is
+//     a storage concern;
+//   - the PREDECESSOR is defined on the PUBLICATION-ID axis: "the last manifest
+//     that actually published". The two can disagree when an exported snapshot's
+//     timestamp moves backwards, so the selection below sorts candidates by
+//     publication_id and takes the MAXIMUM — never "whichever came first in the
+//     directory walk".
 //
-// A newer manifest we cannot read or parse MIGHT be the newest chain-bearing
-// predecessor; treating "unreadable" as "absent" would silently roll the chain
-// back to an older node and hide the break. Evidence honesty applies on the
-// publish side exactly as it does on the verify side.
+// Fail-closed (R198/R199) is preserved on top of that: a manifest we cannot
+// read or parse might be NEWER than the selected predecessor, in which case it
+// could be the real newest chain-bearing node — so it is refused rather than
+// skipped. Only a broken candidate OLDER than the selected predecessor is
+// harmless (it cannot sit at the head of the publication history).
 func latestVerifiedChainPredecessor(dir string, beforeID int64, trust *exportTrustStore) (*snapshotManifest, error) {
 	groups, _, err := discoverSnapshotGroups(dir, false)
 	if err != nil {
 		return nil, err
 	}
-	// discoverSnapshotGroups returns manifests newest-first by identity.
+	var candidates []*snapshotManifest
+	var broken []string
 	for _, g := range groups {
 		if g.manifestFn == "" {
 			continue
 		}
 		data, rerr := os.ReadFile(filepath.Join(dir, g.manifestFn))
 		if rerr != nil {
-			return nil, fmt.Errorf("newest manifest %s is unreadable (%v) — refusing to extend the chain (fail-closed)", g.identity, rerr)
+			broken = append(broken, g.identity)
+			continue
 		}
 		m, perr := parseSnapshotManifest(data)
 		if perr != nil {
-			return nil, fmt.Errorf("newest manifest %s cannot be parsed (%v) — refusing to extend the chain (fail-closed)", g.identity, perr)
+			broken = append(broken, g.identity)
+			continue
 		}
 		if m.SchemaVersion < manifestSchemaVersionV4 || m.Chain == nil {
-			continue // pre-chain history is not a chain candidate; keep walking
+			continue // pre-chain history is not a chain candidate
 		}
 		if m.PublicationID >= beforeID {
 			return nil, fmt.Errorf("manifest %d is not older than the allocated publication id %d — refusing to extend the chain (fail-closed)", m.PublicationID, beforeID)
 		}
-		if v := verifyManifestSignature(m, trust); v.Verdict != sigVerdictOK {
-			return nil, fmt.Errorf("latest chain-bearing manifest %d cannot be trusted (%s) — refusing to extend the chain (fail-closed)", m.PublicationID, v.Verdict)
-		}
-		return m, nil
+		candidates = append(candidates, m)
 	}
-	return nil, nil // no chain-bearing manifest on disk: this publication is the genesis
+
+	var best *snapshotManifest
+	for _, m := range candidates {
+		if best == nil || m.PublicationID > best.PublicationID {
+			best = m
+		}
+	}
+
+	// A candidate we could not read/parse that is NEWER than the selected
+	// predecessor may be the true head of the publication history.
+	for _, identity := range broken {
+		if best == nil || snapshotIdentityLess(best.Snapshot, identity) {
+			return nil, fmt.Errorf("manifest %s is unreadable or unparseable and newer than the selected predecessor — refusing to extend the chain (fail-closed)", identity)
+		}
+	}
+
+	if best == nil {
+		return nil, nil // no chain-bearing manifest: this publication is the genesis
+	}
+	if v := verifyManifestSignature(best, trust); v.Verdict != sigVerdictOK {
+		return nil, fmt.Errorf("latest chain-bearing manifest %d cannot be trusted (%s) — refusing to extend the chain (fail-closed)", best.PublicationID, v.Verdict)
+	}
+	return best, nil
 }
 
 // verifyManifestChain evaluates the retained P38 chain over the supplied nodes

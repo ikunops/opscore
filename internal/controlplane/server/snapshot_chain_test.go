@@ -772,6 +772,48 @@ func TestChainReadablePredecessorStillPublishes(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T102 — the predecessor is chosen on the PUBLICATION-ID axis, never the
+// snapshot-identity (directory) order (R200). When an exported snapshot's
+// timestamp moves backwards the two orders disagree, and a predecessor picked
+// by directory order would be written (and signed) into the chain wrongly.
+// ---------------------------------------------------------------------------
+func TestChainPredecessorFollowsPublicationOrder(t *testing.T) {
+	f := newChainFixture(t)
+	signer, err := newExportSigner(f.privPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Publication order 101 → 102 → 103, but identity order T1 < T2 < T3 maps to
+	// 101 → 103 → 102: the MAXIMUM identity is NOT the maximum publication id.
+	a := v4Manifest(101, "20260910T010000Z", &manifestChain{PrevPublicationID: 0})
+	writeSignedManifest(t, f.snapDir, signer, a)
+	dgA, err := manifestDigest(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := v4Manifest(102, "20260910T030000Z", &manifestChain{PrevPublicationID: 101, PrevManifestDigest: dgA})
+	writeSignedManifest(t, f.snapDir, signer, c)
+	dgC, err := manifestDigest(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := v4Manifest(103, "20260910T020000Z", &manifestChain{PrevPublicationID: 102, PrevManifestDigest: dgC})
+	writeSignedManifest(t, f.snapDir, signer, b)
+
+	f.burn(t, 103)          // watermark past the existing ids
+	f.tick(t, at(5), 1, 10) // publish the next snapshot (pub 104)
+
+	m := readManifestFile(t, f.snapDir, "alert-transitions-"+safeTS(at(5))+".manifest.json")
+	got := int64(m["chain"].(map[string]any)["prev_publication_id"].(float64))
+	if got != 103 {
+		t.Fatalf("predecessor = %d, want 103 (maximum publication_id, NOT the newest identity)", got)
+	}
+	if _, verdict := mustVerifyDetailed(t, f.sched); verdict.Verdict != "chain_ok" {
+		t.Fatalf("chain = %+v, want chain_ok", verdict)
+	}
+}
+
 func TestChainDefaultIsUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	exp := time.Date(2026, 9, 10, 3, 0, 0, 0, time.UTC)
