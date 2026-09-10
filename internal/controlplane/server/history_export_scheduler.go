@@ -81,6 +81,7 @@ type HistoryExportStatus struct {
 	ManifestError   string    `json:"manifest_error,omitempty"`        // Phase 35: manifest publish failure (artifacts stay published)
 	PublicationStateError string `json:"publication_state_error,omitempty"` // Phase 35 M7: watermark unavailable ⇒ fail-closed skip
 	SignatureError  string    `json:"signature_error,omitempty"`         // Phase 37: signing failure (fail-closed, manifest not published)
+	ChainError      string    `json:"chain_error,omitempty"`             // Phase 38: chain extension refused (fail-closed)
 	SigningEnabled  bool      `json:"signing_enabled"`                   // Phase 37: a signing key is configured
 	SignerKeyID     string    `json:"signer_key_id,omitempty"`           // Phase 37: derived (never configured) key id
 	TrustedKeys     int       `json:"trusted_keys"`                      // Phase 37: size of the independent trust anchor
@@ -615,7 +616,10 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 		manifest.SchemaVersion = manifestSchemaVersionV4
 		// Phase 38: commit to the manifest this publication ACTUALLY follows —
 		// never `id-1`, because a crashed tick burns ids and leaves a legal gap.
-		prev, lerr := latestPublishedManifest(s.cfg.Dir, pubID)
+		// If the newest chain-bearing manifest exists but cannot be trusted, the
+		// publication is REFUSED rather than silently skipping back to an older
+		// node (R198: skipping would disguise an already-broken chain).
+		prev, lerr := latestVerifiedChainPredecessor(s.cfg.Dir, pubID, s.trust)
 		if lerr != nil {
 			return "manifest: chain: " + lerr.Error(), ""
 		}
@@ -865,6 +869,10 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 	// path where the manifest was deliberately NOT published).
 	if strings.HasPrefix(s.manifestError, "manifest: sign:") {
 		st.SignatureError = s.manifestError
+	}
+	// Phase 38: a refused chain extension is its own fail-closed state.
+	if strings.HasPrefix(s.manifestError, "manifest: chain:") {
+		st.ChainError = s.manifestError
 	}
 	if !s.lastRunAt.IsZero() {
 		t := s.lastRunAt

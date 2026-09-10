@@ -89,22 +89,25 @@ type chainNode struct {
 	identity   string
 }
 
-// latestPublishedManifest returns the newest CHAIN-BEARING manifest already on
-// disk with a publication_id STRICTLY BELOW beforeID — i.e. the manifest this
-// publication actually follows (never `id-1`: crashed ticks burn ids and leave
-// legal gaps).
+// latestVerifiedChainPredecessor returns the chain-bearing manifest this
+// publication must extend, or an error when the chain cannot be extended.
 //
-// Only v4 manifests with a chain block are eligible. Pre-P38 (v2/v3) files are
-// pre-chain history: adopting one as predecessor would create an unverifiable
-// hop, and once retention pruned it, it would be indistinguishable from a
-// deleted chain link (R195 migration boundary). The first v4 therefore declares
-// genesis with prev_publication_id == 0.
-func latestPublishedManifest(dir string, beforeID int64) (*snapshotManifest, error) {
+// Three outcomes (R198 — fail-closed, never skip-and-continue):
+//
+//	(nil, nil)  → no chain-bearing manifest yet: this publication is the genesis
+//	(m,   nil)  → m is the newest chain-bearing manifest AND is signature_ok
+//	(nil, err)  → the newest chain-bearing manifest exists but CANNOT be trusted
+//	              ⇒ the publication is REFUSED
+//
+// Falling back to an older node is explicitly forbidden: it would disguise an
+// already-broken chain (P101 → P102 tampered → P103) as a clean shorter one and
+// silently swallow the break.
+func latestVerifiedChainPredecessor(dir string, beforeID int64, trust *exportTrustStore) (*snapshotManifest, error) {
 	groups, _, err := discoverSnapshotGroups(dir, false)
 	if err != nil {
 		return nil, err
 	}
-	var best *snapshotManifest
+	var latest *snapshotManifest
 	for _, g := range groups {
 		if g.manifestFn == "" {
 			continue
@@ -123,11 +126,17 @@ func latestPublishedManifest(dir string, beforeID int64) (*snapshotManifest, err
 		if m.PublicationID >= beforeID {
 			continue
 		}
-		if best == nil || m.PublicationID > best.PublicationID {
-			best = m
+		if latest == nil || m.PublicationID > latest.PublicationID {
+			latest = m
 		}
 	}
-	return best, nil
+	if latest == nil {
+		return nil, nil // genesis
+	}
+	if v := verifyManifestSignature(latest, trust); v.Verdict != sigVerdictOK {
+		return nil, fmt.Errorf("latest chain-bearing manifest %d cannot be trusted (%s) — refusing to extend the chain (fail-closed)", latest.PublicationID, v.Verdict)
+	}
+	return latest, nil
 }
 
 // verifyManifestChain evaluates the retained P38 chain over the supplied nodes
@@ -164,13 +173,18 @@ func verifyManifestChain(nodes []chainNode, chainBearing int) (ChainVerdict, map
 		v.Detail = fmt.Sprintf("%d chain-bearing manifest(s) cannot be cryptographically verified (signature not valid)", unverifiable)
 	}
 
-	// The anchor MUST declare genesis explicitly. A first v4 node that claims a
-	// predecessor we cannot see is a break: the anchor is the start of the P38
-	// chain, not "whatever file happens to be oldest after a deletion".
-	if sorted[0].prevID != 0 {
+	// The anchor MUST declare genesis explicitly: prev_publication_id == 0 AND no
+	// predecessor digest. A first v4 node that claims a predecessor we cannot see
+	// — or a digest with no predecessor id — is a BREAK; the anchor is the start
+	// of the P38 chain, not "whatever file happens to be oldest after a deletion".
+	if sorted[0].prevID != 0 || sorted[0].prevDigest != "" {
 		v.Verdict = chainVerdictBroken
 		v.BrokenAt = append(v.BrokenAt, sorted[0].id)
-		v.Detail = fmt.Sprintf("chain anchor %d commits to predecessor %d which is not retained", sorted[0].id, sorted[0].prevID)
+		if sorted[0].prevID != 0 {
+			v.Detail = fmt.Sprintf("chain anchor %d commits to predecessor %d which is not retained", sorted[0].id, sorted[0].prevID)
+		} else {
+			v.Detail = fmt.Sprintf("chain anchor %d carries a predecessor digest without a predecessor id", sorted[0].id)
+		}
 		positions[sorted[0].identity] = chainPosBroken
 	} else {
 		positions[sorted[0].identity] = chainPosRetentionBoundary

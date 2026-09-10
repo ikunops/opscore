@@ -623,6 +623,87 @@ func TestChainNonGenesisWithoutDigestBreaks(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// T100 — an untrusted latest predecessor BLOCKS the next publication (R198).
+// Extending a chain from a node whose P37 provenance no longer holds would
+// launder it into a trusted link; skipping back to an older node would disguise
+// the break. Both are refused.
+// ---------------------------------------------------------------------------
+func TestChainTamperedPredecessorBlocksPublication(t *testing.T) {
+	f := newChainFixture(t)
+	f.tick(t, at(0), 1, 10)
+	f.tick(t, at(1), 11, 20)
+	// Tamper the LATEST chain-bearing manifest (its signature no longer holds).
+	editManifest(t, f.snapDir, "alert-transitions-"+safeTS(at(1))+".manifest.json", func(m map[string]any) {
+		m["max_seq"] = float64(4242)
+	})
+
+	f.tick(t, at(2), 21, 30) // attempt the next publication
+
+	next := filepath.Join(f.snapDir, "alert-transitions-"+safeTS(at(2))+".manifest.json")
+	if _, err := os.Stat(next); !os.IsNotExist(err) {
+		t.Fatalf("publication must be REFUSED when the latest predecessor is untrusted (stat err=%v)", err)
+	}
+	st := f.sched.Status()
+	if !strings.Contains(st.ManifestError, "manifest: chain:") {
+		t.Fatalf("manifest_error = %q, want a chain refusal", st.ManifestError)
+	}
+	if st.ChainError == "" {
+		t.Fatal("chain_error must surface the refused extension")
+	}
+}
+
+// T100 control — with a trusted latest predecessor the chain simply extends.
+func TestChainTrustedPredecessorAllowsPublication(t *testing.T) {
+	f := newChainFixture(t)
+	f.tick(t, at(0), 1, 10)
+	f.tick(t, at(1), 11, 20)
+	f.tick(t, at(2), 21, 30)
+
+	m := readManifestFile(t, f.snapDir, "alert-transitions-"+safeTS(at(2))+".manifest.json")
+	if v, _ := m["chain"].(map[string]any)["prev_publication_id"].(float64); int64(v) != 2 {
+		t.Fatalf("pub 3 must extend pub 2, got %v", m["chain"])
+	}
+	_, verdict := mustVerifyDetailed(t, f.sched)
+	if verdict.Verdict != "chain_ok" {
+		t.Fatalf("chain = %+v, want chain_ok", verdict)
+	}
+}
+
+// T100b — genesis carries no digest (SHOULD); a genesis that does is malformed
+// rather than silently accepted.
+func TestChainGenesisDigestIsEmpty(t *testing.T) {
+	f := newChainFixture(t)
+	f.tick(t, at(0), 1, 10)
+	m := readManifestFile(t, f.snapDir, "alert-transitions-"+safeTS(at(0))+".manifest.json")
+	chain := m["chain"].(map[string]any)
+	if _, present := chain["prev_manifest_digest"]; present {
+		t.Fatal("genesis must not carry a predecessor digest")
+	}
+
+	signer, err := newExportSigner(f.privPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir2 := t.TempDir()
+	bad := v4Manifest(1, "20260910T010000Z", &manifestChain{PrevPublicationID: 0, PrevManifestDigest: strings.Repeat("cd", 32)})
+	writeSignedManifest(t, dir2, signer, bad)
+	s2, err := NewHistoryExportScheduler(HistoryExportConfig{
+		Store: f.store, Dir: dir2, Interval: time.Hour, Formats: []string{"json"},
+		TrustKeyPaths: []string{f.pubPath},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, verdict := mustVerifyDetailed(t, s2)
+	if verdict.Verdict != "chain_broken" {
+		t.Fatalf("a genesis digest without a predecessor id must break: %+v", verdict)
+	}
+	if got := chainOfID(t, res, "20260910T010000Z"); got != chainPosBroken {
+		t.Fatalf("position = %q, want %q", got, chainPosBroken)
+	}
+}
+
 func TestChainDefaultIsUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	exp := time.Date(2026, 9, 10, 3, 0, 0, 0, time.UTC)
