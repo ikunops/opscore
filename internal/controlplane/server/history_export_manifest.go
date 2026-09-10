@@ -29,7 +29,18 @@ import (
 // manifest NEVER claims that every seq in [min,max] exists.
 
 const (
-	manifestSchemaVersion = 2
+	// manifestSchemaVersionV2 is the pre-signature schema. It stays READ-ONLY
+	// COMPATIBLE forever: a v2 manifest verifies exactly as before and simply
+	// reports signature_absent — the arrival of v3 never turns an old snapshot
+	// into an error.
+	manifestSchemaVersionV2 = 2
+	// manifestSchemaVersionV3 adds the optional signature block (Phase 37 — an
+	// explicit, scoped supersede of the P35 "schema v2" freeze, justified by
+	// the new Phase's capability and bounded to it).
+	manifestSchemaVersionV3 = 3
+	// manifestSchemaVersion is the version the scheduler WRITES. It stays V2
+	// while no signing key is configured, so default behaviour is unchanged.
+	manifestSchemaVersion = manifestSchemaVersionV2
 	seqContinuityValue    = "not_asserted"
 
 	// verifyGroupStatus values (A5/A6, R176).
@@ -41,7 +52,7 @@ const (
 	verifyStatusUnknown        = "unknown"
 )
 
-// snapshotManifest is the on-disk manifest document (schema_version 2).
+// snapshotManifest is the on-disk manifest document (schema_version 2 or 3).
 type snapshotManifest struct {
 	SchemaVersion int                  `json:"schema_version"`
 	PublicationID int64                `json:"publication_id"`
@@ -55,6 +66,9 @@ type snapshotManifest struct {
 	MaxSeq        int64                `json:"max_seq"`
 	Records       int64                `json:"records"`
 	Formats       []manifestFormatInfo `json:"formats"`
+	// Signature is the optional Phase 37 block (schema v3 only). It is nil for
+	// v2 manifests and for unsigned snapshots.
+	Signature *signatureBlock `json:"signature,omitempty"`
 }
 
 type manifestFormatInfo struct {
@@ -81,8 +95,11 @@ func parseSnapshotManifest(data []byte) (*snapshotManifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("manifest json: %w", err)
 	}
-	if m.SchemaVersion != manifestSchemaVersion {
-		return nil, fmt.Errorf("unsupported manifest schema_version %d (want %d)", m.SchemaVersion, manifestSchemaVersion)
+	// Phase 37: accept BOTH v2 and v3. A v2 manifest stays valid forever
+	// (read-only compatibility); refusing v3 here would make Phase 36 coverage
+	// treat every signed snapshot as unparseable (T78 anti-regression).
+	if m.SchemaVersion != manifestSchemaVersionV2 && m.SchemaVersion != manifestSchemaVersionV3 {
+		return nil, fmt.Errorf("unsupported manifest schema_version %d (want %d or %d)", m.SchemaVersion, manifestSchemaVersionV2, manifestSchemaVersionV3)
 	}
 	if m.PublicationID <= 0 {
 		return nil, errors.New("manifest publication_id missing or invalid")
@@ -489,7 +506,11 @@ type VerifyResult struct {
 	SeqContinuity string              `json:"seq_continuity"`
 	Formats       []VerifyFormatResult `json:"formats,omitempty"`
 	ExtraFiles    []string            `json:"extra_files,omitempty"`
-	Detail        string              `json:"detail,omitempty"`
+	// Signature is the orthogonal Phase 37 dimension. It is absent when the
+	// manifest itself could not be parsed (P35 `unknown` semantics apply, and
+	// no signature verdict is ever fabricated).
+	Signature *SignatureVerdict `json:"signature,omitempty"`
+	Detail    string            `json:"detail,omitempty"`
 }
 
 // VerifySnapshots checks the newest `limit` snapshot groups across BOTH
@@ -671,6 +692,28 @@ func (s *HistoryExportScheduler) VerifySnapshots(limit int) ([]VerifyResult, err
 			}
 			res.Status = status
 			res.Detail = strings.Join(details, "; ")
+		}
+		// ---- Phase 37: signature dimension (orthogonal; can only LOWER) -----
+		// Only produced when the manifest parsed: a broken manifest keeps the
+		// Phase 35 `unknown` semantics and never fabricates a signature verdict.
+		if g.manifest != nil {
+			v := verifyManifestSignature(g.manifest, s.trust)
+			res.Signature = &v
+			if res.Status == "" {
+				res.Status = verifyStatusUnknown
+			}
+			res.Status = applySignatureVerdict(res.Status, v, g.manifest.SchemaVersion)
+			if v.Verdict != sigVerdictOK && v.Verdict != sigVerdictAbsent {
+				note := "signature: " + v.Verdict
+				if v.Detail != "" {
+					note += " (" + v.Detail + ")"
+				}
+				if res.Detail == "" {
+					res.Detail = note
+				} else {
+					res.Detail += "; " + note
+				}
+			}
 		}
 		out = append(out, res)
 	}

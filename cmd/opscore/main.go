@@ -463,6 +463,10 @@ func cmdServe(args []string) {
 	exportDir := fs.String("export-dir", "", "destination directory for scheduled history snapshots (required when export-interval > 0)")
 	exportFormats := fs.String("export-formats", "json,csv", "comma-separated export formats (json,csv)")
 	exportRetain := fs.Int("export-retain", 96, "local snapshot retention cap (0 = keep all; default 96)")
+	// Phase 37 (snapshot provenance): OPT-IN signing. An empty --export-sign-key
+	// keeps the previous behaviour exactly (schema v2, unsigned manifests).
+	exportSignKey := fs.String("export-sign-key", "", "Ed25519 private key (PKCS#8 PEM or raw 64 bytes) used to sign published snapshot manifests (empty = signing disabled, schema v2)")
+	exportTrustKeys := fs.String("export-trust-keys", "", "comma-separated trusted Ed25519 public keys used by the verify surface as an independent trust anchor")
 	fs.Parse(args)
 
 	logger := newLogger()
@@ -591,12 +595,14 @@ func cmdServe(args []string) {
 	if exportEnabled {
 		formats := parseExportFormats(*exportFormats)
 		sc, err := server.NewHistoryExportScheduler(server.HistoryExportConfig{
-			Store:    bundle.transitionStore,
-			Dir:      *exportDir,
-			Interval: *exportInterval,
-			Formats:  formats,
-			Retain:   *exportRetain,
-			Logger:   logger,
+			Store:         bundle.transitionStore,
+			Dir:           *exportDir,
+			Interval:      *exportInterval,
+			Formats:       formats,
+			Retain:        *exportRetain,
+			Logger:        logger,
+			SignKeyPath:   *exportSignKey,
+			TrustKeyPaths: parseExportFormats(*exportTrustKeys),
 		})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)

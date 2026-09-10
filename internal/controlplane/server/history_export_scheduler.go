@@ -55,6 +55,18 @@ type HistoryExportConfig struct {
 	// ExportedAt is the STORE's provenance and is NEVER derived from Clock
 	// (P34-CLOCK-1). Defaults to time.Now.
 	Clock func() time.Time
+	// SignKeyPath is the Phase 37 Ed25519 signing key (PKCS#8 PEM or raw 64
+	// bytes). EMPTY = signing disabled: manifests are published as schema v2
+	// exactly as before (default behaviour is unchanged).
+	SignKeyPath string
+	// SignKeyID is an OPTIONAL consistency assertion only. key_id is ALWAYS
+	// derived from the private key; a non-empty value that disagrees with the
+	// derived id is a fail-fast configuration error (never "sign with A, claim B").
+	SignKeyID string
+	// TrustKeyPaths are the trusted Ed25519 public keys used by the verify
+	// surface. They form the trust anchor and are loaded from an independent
+	// configuration source — never from a manifest, and never from the signing key.
+	TrustKeyPaths []string
 }
 
 // HistoryExportStatus is the read-only scheduler state surfaced via
@@ -68,6 +80,10 @@ type HistoryExportStatus struct {
 	PruneError      string    `json:"prune_error,omitempty"`
 	ManifestError   string    `json:"manifest_error,omitempty"`        // Phase 35: manifest publish failure (artifacts stay published)
 	PublicationStateError string `json:"publication_state_error,omitempty"` // Phase 35 M7: watermark unavailable ⇒ fail-closed skip
+	SignatureError  string    `json:"signature_error,omitempty"`         // Phase 37: signing failure (fail-closed, manifest not published)
+	SigningEnabled  bool      `json:"signing_enabled"`                   // Phase 37: a signing key is configured
+	SignerKeyID     string    `json:"signer_key_id,omitempty"`           // Phase 37: derived (never configured) key id
+	TrustedKeys     int       `json:"trusted_keys"`                      // Phase 37: size of the independent trust anchor
 	SkipCount       int64     `json:"skip_count"`
 	Published       int64     `json:"published"`
 	Failed          int64     `json:"failed"`
@@ -88,6 +104,12 @@ type HistoryExportScheduler struct {
 	clock  func() time.Time
 	logger *slog.Logger
 
+	// Phase 37: signer is nil unless a signing key is configured (in which case
+	// manifests are written as schema v3 and signed); trust is the verification
+	// trust anchor, loaded from an independent configuration source.
+	signer *exportSigner
+	trust  *exportTrustStore
+
 	mu       sync.Mutex
 	started  bool
 	running  bool // a tick is currently active (non-reentrant guard, P34-I1)
@@ -97,6 +119,7 @@ type HistoryExportScheduler struct {
 	pruneError     string
 	manifestError  string
 	pubStateError  string
+	signatureError string
 	skipCount      int64
 	published      int64
 	failed         int64
@@ -107,6 +130,11 @@ type HistoryExportScheduler struct {
 	// publishManifest — i.e. inside the manifest reservation window. It lets
 	// tests probe the reservation lifecycle (T43). Production leaves it nil.
 	beforeManifestPublish func(dir, manifestName string)
+
+	// beforeManifestSign is a TEST-ONLY hook invoked after the manifest is
+	// fully built and just before it is signed. It lets tests force a signing
+	// failure and prove the fail-closed path (T68). Production leaves it nil.
+	beforeManifestSign func(dir string)
 }
 
 // NewHistoryExportScheduler validates the config and builds a scheduler
@@ -142,6 +170,25 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 	if clock == nil {
 		clock = time.Now
 	}
+	// Phase 37: load the signer (if configured) and the independent trust
+	// anchor. Both are fail-fast: an unreadable/invalid key, a duplicate trust
+	// key id, or a configured key id that disagrees with the derived one aborts
+	// construction rather than producing manifests nobody can verify.
+	signer, err := newExportSigner(cfg.SignKeyPath, cfg.SignKeyID)
+	if err != nil {
+		return nil, fmt.Errorf("history export: %w", err)
+	}
+	trust, err := newExportTrustStore(cfg.TrustKeyPaths)
+	if err != nil {
+		return nil, fmt.Errorf("history export: %w", err)
+	}
+	if signer != nil && trust != nil {
+		// Signing with a key our own verifier cannot resolve would make every
+		// freshly published snapshot look unverifiable. Refuse at construction.
+		if _, ok := trust.keys[signer.keyID]; !ok {
+			return nil, fmt.Errorf("history export: sign key %s is absent from the configured trust keys — signed snapshots would verify as key_unknown", signer.keyID)
+		}
+	}
 	// Phase 35 provisioning: a FRESH export directory (no manifests) gets its
 	// publication watermark initialized to 0. This is provisioning, never
 	// recovery — a runtime loss/corruption of the state file surfaces as the
@@ -152,6 +199,8 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		cfg:    cfg,
 		clock:  clock,
 		logger: cfg.Logger,
+		signer: signer,
+		trust:  trust,
 	}, nil
 }
 
@@ -550,6 +599,21 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 		Records:       int64(len(res.Transitions)),
 		Formats:       formats,
 	}
+	// ---- Phase 37: fail-closed signing (A4) --------------------------------
+	// Signing happens ONLY when a key is configured, and only after the manifest
+	// content is final. Without a key the output stays byte-for-byte the Phase 36
+	// v2 document (default behaviour unchanged); with a key the manifest becomes
+	// v3 + signature, and a signing failure publishes NOTHING (the already
+	// linked artifacts are honestly reported as orphan_artifact).
+	if s.signer != nil {
+		manifest.SchemaVersion = manifestSchemaVersionV3
+		if s.beforeManifestSign != nil {
+			s.beforeManifestSign(s.cfg.Dir)
+		}
+		if serr := s.signer.signManifest(&manifest, generatedAt); serr != nil {
+			return "manifest: sign: " + serr.Error(), ""
+		}
+	}
 	tmpPath := filepath.Join(s.cfg.Dir, names["manifest"]+".tmp")
 	target := filepath.Join(s.cfg.Dir, names["manifest"])
 	mf, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
@@ -755,6 +819,7 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 		PruneError:            s.pruneError,
 		ManifestError:         s.manifestError,
 		PublicationStateError: s.pubStateError,
+		SignatureError:        s.signatureError,
 		SkipCount:             s.skipCount,
 		Published:             s.published,
 		Failed:                s.failed,
@@ -762,6 +827,18 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 		Interval:              s.cfg.Interval.String(),
 		Formats:               s.cfg.Formats,
 		Retain:                s.cfg.Retain,
+		SigningEnabled:        s.signer != nil,
+	}
+	if s.trust != nil {
+		st.TrustedKeys = len(s.trust.keys)
+	}
+	if s.signer != nil {
+		st.SignerKeyID = s.signer.keyID
+	}
+	// Phase 37: surface a signing failure distinctly (it is the fail-closed
+	// path where the manifest was deliberately NOT published).
+	if strings.HasPrefix(s.manifestError, "manifest: sign:") {
+		st.SignatureError = s.manifestError
 	}
 	if !s.lastRunAt.IsZero() {
 		t := s.lastRunAt
