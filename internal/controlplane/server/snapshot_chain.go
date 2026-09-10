@@ -92,41 +92,40 @@ type chainNode struct {
 // latestVerifiedChainPredecessor returns the chain-bearing manifest this
 // publication must extend, or an error when the chain cannot be extended.
 //
-// TWO INDEPENDENT AXES are at work here (R200) and must not be conflated:
+// TWO INDEPENDENT AXES are at work here (R200) and are never mixed:
 //
-//   - the DIRECTORY order is the snapshot identity (ts, ordinal) order, which is
-//     a storage concern;
+//   - the DIRECTORY order is the snapshot identity (ts, ordinal) order, a
+//     storage concern used only to find files;
 //   - the PREDECESSOR is defined on the PUBLICATION-ID axis: "the last manifest
-//     that actually published". The two can disagree when an exported snapshot's
-//     timestamp moves backwards, so the selection below sorts candidates by
-//     publication_id and takes the MAXIMUM — never "whichever came first in the
-//     directory walk".
+//     that actually published". A snapshot's timestamp may move backwards, so
+//     the selection takes the MAXIMUM publication_id among readable candidates.
 //
-// Fail-closed (R198/R199) is preserved on top of that: a manifest we cannot
-// read or parse might be NEWER than the selected predecessor, in which case it
-// could be the real newest chain-bearing node — so it is refused rather than
-// skipped. Only a broken candidate OLDER than the selected predecessor is
-// harmless (it cannot sit at the head of the publication history).
+// An UNREADABLE / UNPARSEABLE manifest has no knowable publication_id, so it
+// cannot be ordered on the publication axis at all (R201). It must therefore
+// never be judged "older" via its identity — that would be exactly the
+// cross-axis inference R200 forbids — and the publication is REFUSED:
+//
+//	readable   → publication axis decides (maximum id), fail-closed on any
+//	             candidate that is not older than the allocated id or that is
+//	             not signature_ok
+//	unreadable → publication_id unknown → not orderable → fail-closed
 func latestVerifiedChainPredecessor(dir string, beforeID int64, trust *exportTrustStore) (*snapshotManifest, error) {
 	groups, _, err := discoverSnapshotGroups(dir, false)
 	if err != nil {
 		return nil, err
 	}
 	var candidates []*snapshotManifest
-	var broken []string
 	for _, g := range groups {
 		if g.manifestFn == "" {
 			continue
 		}
 		data, rerr := os.ReadFile(filepath.Join(dir, g.manifestFn))
 		if rerr != nil {
-			broken = append(broken, g.identity)
-			continue
+			return nil, fmt.Errorf("manifest %s is unreadable (%v) — its publication position cannot be established, refusing to extend the chain (fail-closed)", g.identity, rerr)
 		}
 		m, perr := parseSnapshotManifest(data)
 		if perr != nil {
-			broken = append(broken, g.identity)
-			continue
+			return nil, fmt.Errorf("manifest %s cannot be parsed (%v) — its publication position cannot be established, refusing to extend the chain (fail-closed)", g.identity, perr)
 		}
 		if m.SchemaVersion < manifestSchemaVersionV4 || m.Chain == nil {
 			continue // pre-chain history is not a chain candidate
@@ -143,15 +142,6 @@ func latestVerifiedChainPredecessor(dir string, beforeID int64, trust *exportTru
 			best = m
 		}
 	}
-
-	// A candidate we could not read/parse that is NEWER than the selected
-	// predecessor may be the true head of the publication history.
-	for _, identity := range broken {
-		if best == nil || snapshotIdentityLess(best.Snapshot, identity) {
-			return nil, fmt.Errorf("manifest %s is unreadable or unparseable and newer than the selected predecessor — refusing to extend the chain (fail-closed)", identity)
-		}
-	}
-
 	if best == nil {
 		return nil, nil // no chain-bearing manifest: this publication is the genesis
 	}

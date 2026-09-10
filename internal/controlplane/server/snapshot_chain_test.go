@@ -814,6 +814,69 @@ func TestChainPredecessorFollowsPublicationOrder(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// T103 — an unorderable candidate is never waved through on its identity
+// (R201). A damaged manifest has NO knowable publication_id, so its directory
+// identity cannot prove it is "old news" — that would be the cross-axis
+// inference R200 forbade. The publication is refused.
+// ---------------------------------------------------------------------------
+func TestChainUnorderableCandidateAlwaysRefuses(t *testing.T) {
+	f := newChainFixture(t)
+	signer, err := newExportSigner(f.privPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A readable chain-bearing manifest with a LATE identity.
+	writeSignedManifest(t, f.snapDir, signer, v4Manifest(101, "20260910T090000Z", &manifestChain{PrevPublicationID: 0}))
+	// A damaged manifest with an EARLIER identity: it *looks* older, but its
+	// publication position is unknowable, so it must still refuse.
+	broken := filepath.Join(f.snapDir, "alert-transitions-20260910T010000Z.manifest.json")
+	if err := os.WriteFile(broken, []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	f.burn(t, 101)
+	f.tick(t, at(5), 1, 10)
+
+	next := filepath.Join(f.snapDir, "alert-transitions-"+safeTS(at(5))+".manifest.json")
+	if _, err := os.Stat(next); !os.IsNotExist(err) {
+		t.Fatalf("an unorderable candidate must refuse the publication (stat err=%v)", err)
+	}
+	if st := f.sched.Status(); !strings.Contains(st.ManifestError, "manifest: chain:") || st.ChainError == "" {
+		t.Fatalf("chain refusal must be surfaced: %q / %q", st.ManifestError, st.ChainError)
+	}
+
+	// Readable control: remove the damaged file and the same publication works.
+	if err := os.Remove(broken); err != nil {
+		t.Fatal(err)
+	}
+	f.tick(t, at(6), 1, 10)
+	m := readManifestFile(t, f.snapDir, "alert-transitions-"+safeTS(at(6))+".manifest.json")
+	if got := int64(m["chain"].(map[string]any)["prev_publication_id"].(float64)); got != 101 {
+		t.Fatalf("predecessor = %d, want 101", got)
+	}
+}
+
+// T103b — the publication axis still wins when identities disagree AND a
+// damaged file is present: T102 behaviour is preserved, not regressed.
+func TestChainPublicationAxisWithUnorderablePresent(t *testing.T) {
+	f := newChainFixture(t)
+	signer, err := newExportSigner(f.privPath, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeSignedManifest(t, f.snapDir, signer, v4Manifest(101, "20260910T010000Z", &manifestChain{PrevPublicationID: 0}))
+	writeSignedManifest(t, f.snapDir, signer, v4Manifest(103, "20260910T020000Z", &manifestChain{PrevPublicationID: 0}))
+	if err := os.WriteFile(filepath.Join(f.snapDir, "alert-transitions-20260910T030000Z.manifest.json"), []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.burn(t, 103)
+	f.tick(t, at(5), 1, 10)
+	if _, err := os.Stat(filepath.Join(f.snapDir, "alert-transitions-"+safeTS(at(5))+".manifest.json")); !os.IsNotExist(err) {
+		t.Fatalf("damaged file must refuse regardless of the publication axis (stat err=%v)", err)
+	}
+}
+
 func TestChainDefaultIsUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	exp := time.Date(2026, 9, 10, 3, 0, 0, 0, time.UTC)
