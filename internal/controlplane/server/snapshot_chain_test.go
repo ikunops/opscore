@@ -427,9 +427,91 @@ func TestChainVerifyIsReadOnly(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T95 — no signing key ⇒ default output is unchanged (v2, no chain, no chain
-// verdict)
+// T98 — chain evidence that EXISTS but cannot be trusted is never chain_absent
+// (R196). "No chain evidence" and "chain evidence we cannot verify" are
+// different states and must not collapse into one.
 // ---------------------------------------------------------------------------
+func TestChainUnverifiableIsNotAbsent(t *testing.T) {
+	cases := []struct {
+		name    string
+		corrupt func(t *testing.T, snapDir, manifestName string)
+		reTrust bool
+	}{
+		{
+			name: "signature_invalid",
+			corrupt: func(t *testing.T, dir, name string) {
+				editManifest(t, dir, name, func(m map[string]any) { m["max_seq"] = float64(4242) })
+			},
+		},
+		{
+			name: "signature_malformed",
+			corrupt: func(t *testing.T, dir, name string) {
+				editManifest(t, dir, name, func(m map[string]any) { delete(m["signature"].(map[string]any), "sig") })
+			},
+		},
+		{
+			name:    "key_unknown",
+			corrupt: func(t *testing.T, dir, name string) {},
+			reTrust: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newChainFixture(t)
+			f.tick(t, at(0), 1, 10)
+			name := "alert-transitions-" + safeTS(at(0)) + ".manifest.json"
+			tc.corrupt(t, f.snapDir, name)
+
+			sched := f.sched
+			if tc.reTrust {
+				// Same directory, but the verifier only trusts an unrelated key.
+				keyDir := t.TempDir()
+				_, otherPub, _, _ := genKeyPair(t, keyDir, "other")
+				s2, err := NewHistoryExportScheduler(HistoryExportConfig{
+					Store: f.store, Dir: f.snapDir, Interval: time.Hour, Formats: []string{"json"},
+					TrustKeyPaths: []string{otherPub},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				sched = s2
+			}
+
+			res, verdict := mustVerifyDetailed(t, sched)
+			if verdict.Verdict == "chain_absent" {
+				t.Fatalf("chain-bearing manifest exists but cannot be verified — must NOT be chain_absent: %+v", verdict)
+			}
+			if verdict.Verdict != "chain_broken" {
+				t.Fatalf("chain = %+v, want chain_broken", verdict)
+			}
+			if verdict.Detail == "" {
+				t.Fatal("detail must explain why the chain cannot be established")
+			}
+			if got := chainOf(t, res, at(0)); got != chainPosBroken {
+				t.Fatalf("per-snapshot chain = %q, want %q", got, chainPosBroken)
+			}
+		})
+	}
+}
+
+// T98b — a v4 manifest with a valid signature but an unverifiable PARTNER still
+// breaks instead of being silently reduced to the verifiable subset.
+func TestChainPartialUnverifiableBreaks(t *testing.T) {
+	f := newChainFixture(t)
+	f.tick(t, at(0), 1, 10)
+	f.tick(t, at(1), 11, 20)
+
+	// Invalidate the SECOND node: the surviving first node alone would look
+	// like a clean single-node chain, which would hide the tampering.
+	editManifest(t, f.snapDir, "alert-transitions-"+safeTS(at(1))+".manifest.json", func(m map[string]any) {
+		m["max_seq"] = float64(7777)
+	})
+	_, verdict := mustVerifyDetailed(t, f.sched)
+	if verdict.Verdict != "chain_broken" {
+		t.Fatalf("chain = %+v, want chain_broken (a dropped chain-bearing node is not a smaller clean chain)", verdict)
+	}
+}
+
 func TestChainDefaultIsUnchanged(t *testing.T) {
 	dir := t.TempDir()
 	exp := time.Date(2026, 9, 10, 3, 0, 0, 0, time.UTC)

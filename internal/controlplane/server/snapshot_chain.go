@@ -134,17 +134,35 @@ func latestPublishedManifest(dir string, beforeID int64) (*snapshotManifest, err
 // (which MUST be the signature_ok v4 manifests of the FULL retained set — never
 // a limit-truncated window, or a truncation would look like a break).
 //
-// It returns both the aggregate verdict and the per-snapshot position.
-func verifyManifestChain(nodes []chainNode) (ChainVerdict, map[string]string) {
+// `chainBearing` is how many v4 chain-bearing manifests exist on disk, which is
+// NOT the same as how many we could verify. The distinction is evidence honesty
+// (R196): "no chain evidence at all" and "chain evidence that cannot be
+// cryptographically trusted" are different states and must not collapse.
+func verifyManifestChain(nodes []chainNode, chainBearing int) (ChainVerdict, map[string]string) {
 	positions := map[string]string{}
+	if chainBearing == 0 {
+		return ChainVerdict{Verdict: chainVerdictAbsent, Detail: "no chain-bearing manifests (pre-P38 history only)"}, positions
+	}
+	unverifiable := chainBearing - len(nodes)
 	if len(nodes) == 0 {
-		return ChainVerdict{Verdict: chainVerdictAbsent, Detail: "no signed chain-bearing manifests (pre-P38 history only)"}, positions
+		// Chain-bearing manifests EXIST — they simply cannot be trusted. That is
+		// not "no chain", so it must never be reported as chain_absent.
+		return ChainVerdict{
+			Verdict: chainVerdictBroken,
+			Detail:  fmt.Sprintf("%d chain-bearing manifest(s) exist but the predecessor chain cannot be cryptographically verified (signature not valid)", chainBearing),
+		}, positions
 	}
 	sorted := make([]chainNode, len(nodes))
 	copy(sorted, nodes)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].id < sorted[j].id })
 
 	v := ChainVerdict{Verdict: chainVerdictOK, AnchorPublicationID: sorted[0].id}
+	if unverifiable > 0 {
+		// Some chain-bearing nodes dropped out of the trusted set: the chain
+		// cannot be established even if the surviving hops happen to line up.
+		v.Verdict = chainVerdictBroken
+		v.Detail = fmt.Sprintf("%d chain-bearing manifest(s) cannot be cryptographically verified (signature not valid)", unverifiable)
+	}
 
 	// The anchor MUST declare genesis explicitly. A first v4 node that claims a
 	// predecessor we cannot see is a break: the anchor is the start of the P38

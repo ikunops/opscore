@@ -555,6 +555,8 @@ func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyRes
 	idCount := map[int64]int{}
 	sigByGroup := map[string]SignatureVerdict{}
 	var chainNodes []chainNode
+	chainBearing := 0
+	unverifiableChain := map[string]bool{}
 	for _, g := range groups {
 		if g.manifestFn == "" {
 			continue
@@ -572,7 +574,15 @@ func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyRes
 		// Phase 37/38 dimensions, computed over the full retained set.
 		v := verifyManifestSignature(m, s.trust)
 		sigByGroup[g.identity] = v
-		if v.Verdict == sigVerdictOK && m.SchemaVersion >= manifestSchemaVersionV4 && m.Chain != nil {
+		if m.SchemaVersion >= manifestSchemaVersionV4 && m.Chain != nil {
+			chainBearing++
+			if v.Verdict != sigVerdictOK {
+				// Chain evidence that exists but cannot be trusted: it is
+				// reported as a broken chain, never hidden as chain_absent
+				// (R196 — evidence honesty).
+				unverifiableChain[g.identity] = true
+				continue
+			}
 			if dg, derr := manifestDigest(m); derr == nil {
 				chainNodes = append(chainNodes, chainNode{
 					id:         m.PublicationID,
@@ -584,7 +594,10 @@ func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyRes
 			}
 		}
 	}
-	chainVerdict, chainPositions := verifyManifestChain(chainNodes)
+	chainVerdict, chainPositions := verifyManifestChain(chainNodes, chainBearing)
+	for identity := range unverifiableChain {
+		chainPositions[identity] = chainPosBroken
+	}
 	if len(groups) > limit {
 		groups = groups[:limit]
 	}
