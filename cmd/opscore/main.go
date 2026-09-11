@@ -320,12 +320,12 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPa
 			protection.DefaultBreakerConfig(),
 			time.Now,
 		),
-		Sem:       protection.NewSemaphoreSet(8),
-		Buckets:   protection.NewTokenBucketSet(protection.TokenBucketConfig{Capacity: 100, Refill: 10}, time.Now),
-		Quotas:    qs,
-		Evidence:  evidence,
-		Audit:     &storageAuditWriter{store: stor.Audit()},
-		Timeout:   protection.NewTimeoutConfig(),
+		Sem:        protection.NewSemaphoreSet(8),
+		Buckets:    protection.NewTokenBucketSet(protection.TokenBucketConfig{Capacity: 100, Refill: 10}, time.Now),
+		Quotas:     qs,
+		Evidence:   evidence,
+		Audit:      &storageAuditWriter{store: stor.Audit()},
+		Timeout:    protection.NewTimeoutConfig(),
 		Provenance: sink,
 	})
 	return protectionBundle{
@@ -467,6 +467,9 @@ func cmdServe(args []string) {
 	// keeps the previous behaviour exactly (schema v2, unsigned manifests).
 	exportSignKey := fs.String("export-sign-key", "", "Ed25519 private key (PKCS#8 PEM or raw 64 bytes) used to sign published snapshot manifests (empty = signing disabled, schema v2)")
 	exportTrustKeys := fs.String("export-trust-keys", "", "comma-separated trusted Ed25519 public keys used by the verify surface as an independent trust anchor")
+	// Phase 39: the chain digest ledger is retained independently of snapshot
+	// retention, so a legal prune no longer breaks the chain proof.
+	exportLedgerCapacity := fs.Int("export-ledger-capacity", 4096, "max chain-ledger entries to retain (independent of --export-retain; 0 = keep all)")
 	fs.Parse(args)
 
 	logger := newLogger()
@@ -595,14 +598,15 @@ func cmdServe(args []string) {
 	if exportEnabled {
 		formats := parseExportFormats(*exportFormats)
 		sc, err := server.NewHistoryExportScheduler(server.HistoryExportConfig{
-			Store:         bundle.transitionStore,
-			Dir:           *exportDir,
-			Interval:      *exportInterval,
-			Formats:       formats,
-			Retain:        *exportRetain,
-			Logger:        logger,
-			SignKeyPath:   *exportSignKey,
-			TrustKeyPaths: parseExportFormats(*exportTrustKeys),
+			Store:          bundle.transitionStore,
+			Dir:            *exportDir,
+			Interval:       *exportInterval,
+			Formats:        formats,
+			Retain:         *exportRetain,
+			Logger:         logger,
+			SignKeyPath:    *exportSignKey,
+			TrustKeyPaths:  parseExportFormats(*exportTrustKeys),
+			LedgerCapacity: *exportLedgerCapacity,
 		})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)
@@ -612,22 +616,22 @@ func cmdServe(args []string) {
 	}
 
 	srv, err := server.New(server.Config{
-		Storage:        stor,
-		Dispatcher:     dispatcher,
-		Runtime:        runtime,
-		HostStore:      hostStore,
-		AccessSecret:   *jwtSecret + ":access",
-		RefreshSecret:  *jwtSecret + ":refresh",
-		Logger:         logger,
-		DefaultTarget:  defaultTarget,
-		DemoMode:       demoOn,
-		UseSudo:        *tSudo && !demoOn,
-		AllowRegister:  *allowRegister,
-		BootstrapAdmin: &server.BootstrapAdmin{Username: *adminUser, Password: *adminPass},
-		Gate:            bundle.gate,
-		AlertTracker:    bundle.alertTracker,
-		AlertPolicy:     bundle.alertPolicy,
-		TransitionStore: bundle.transitionStore,
+		Storage:          stor,
+		Dispatcher:       dispatcher,
+		Runtime:          runtime,
+		HostStore:        hostStore,
+		AccessSecret:     *jwtSecret + ":access",
+		RefreshSecret:    *jwtSecret + ":refresh",
+		Logger:           logger,
+		DefaultTarget:    defaultTarget,
+		DemoMode:         demoOn,
+		UseSudo:          *tSudo && !demoOn,
+		AllowRegister:    *allowRegister,
+		BootstrapAdmin:   &server.BootstrapAdmin{Username: *adminUser, Password: *adminPass},
+		Gate:             bundle.gate,
+		AlertTracker:     bundle.alertTracker,
+		AlertPolicy:      bundle.alertPolicy,
+		TransitionStore:  bundle.transitionStore,
 		HistoryScheduler: exportScheduler,
 	})
 	if err != nil {

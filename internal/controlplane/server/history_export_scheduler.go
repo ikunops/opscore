@@ -67,31 +67,38 @@ type HistoryExportConfig struct {
 	// surface. They form the trust anchor and are loaded from an independent
 	// configuration source — never from a manifest, and never from the signing key.
 	TrustKeyPaths []string
+	// LedgerCapacity bounds the Phase 39 chain digest ledger
+	// (`chain-ledger.jsonl`), which is retained INDEPENDENTLY of the snapshot
+	// retention so a legal prune no longer destroys the chain proof. Older
+	// entries are dropped first, which only shrinks the verifiable range.
+	// 0 disables the cap (keep everything).
+	LedgerCapacity int
 }
 
 // HistoryExportStatus is the read-only scheduler state surfaced via
 // GET /management/v1/protection/alerts/history/export/scheduler.
 type HistoryExportStatus struct {
-	Enabled         bool      `json:"enabled"`
-	Running         bool      `json:"running"`
-	LastRunAt       *time.Time `json:"last_run_at,omitempty"`       // scheduler attempt time (scheduler clock)
-	LastExportedAt  *time.Time `json:"last_exported_at,omitempty"`  // store provenance (res.ExportedAt)
-	LastError       string    `json:"last_error,omitempty"`
-	PruneError      string    `json:"prune_error,omitempty"`
-	ManifestError   string    `json:"manifest_error,omitempty"`        // Phase 35: manifest publish failure (artifacts stay published)
-	PublicationStateError string `json:"publication_state_error,omitempty"` // Phase 35 M7: watermark unavailable ⇒ fail-closed skip
-	SignatureError  string    `json:"signature_error,omitempty"`         // Phase 37: signing failure (fail-closed, manifest not published)
-	ChainError      string    `json:"chain_error,omitempty"`             // Phase 38: chain extension refused (fail-closed)
-	SigningEnabled  bool      `json:"signing_enabled"`                   // Phase 37: a signing key is configured
-	SignerKeyID     string    `json:"signer_key_id,omitempty"`           // Phase 37: derived (never configured) key id
-	TrustedKeys     int       `json:"trusted_keys"`                      // Phase 37: size of the independent trust anchor
-	SkipCount       int64     `json:"skip_count"`
-	Published       int64     `json:"published"`
-	Failed          int64     `json:"failed"`
-	Dir             string    `json:"dir,omitempty"`
-	Interval        string    `json:"interval,omitempty"`
-	Formats         []string  `json:"formats,omitempty"`
-	Retain          int       `json:"retain"`
+	Enabled               bool       `json:"enabled"`
+	Running               bool       `json:"running"`
+	LastRunAt             *time.Time `json:"last_run_at,omitempty"`      // scheduler attempt time (scheduler clock)
+	LastExportedAt        *time.Time `json:"last_exported_at,omitempty"` // store provenance (res.ExportedAt)
+	LastError             string     `json:"last_error,omitempty"`
+	PruneError            string     `json:"prune_error,omitempty"`
+	ManifestError         string     `json:"manifest_error,omitempty"`          // Phase 35: manifest publish failure (artifacts stay published)
+	PublicationStateError string     `json:"publication_state_error,omitempty"` // Phase 35 M7: watermark unavailable ⇒ fail-closed skip
+	SignatureError        string     `json:"signature_error,omitempty"`         // Phase 37: signing failure (fail-closed, manifest not published)
+	ChainError            string     `json:"chain_error,omitempty"`             // Phase 38: chain extension refused (fail-closed)
+	LedgerError           string     `json:"ledger_error,omitempty"`            // Phase 39: ledger append/backfill problem (manifest stays published)
+	SigningEnabled        bool       `json:"signing_enabled"`                   // Phase 37: a signing key is configured
+	SignerKeyID           string     `json:"signer_key_id,omitempty"`           // Phase 37: derived (never configured) key id
+	TrustedKeys           int        `json:"trusted_keys"`                      // Phase 37: size of the independent trust anchor
+	SkipCount             int64      `json:"skip_count"`
+	Published             int64      `json:"published"`
+	Failed                int64      `json:"failed"`
+	Dir                   string     `json:"dir,omitempty"`
+	Interval              string     `json:"interval,omitempty"`
+	Formats               []string   `json:"formats,omitempty"`
+	Retain                int        `json:"retain"`
 }
 
 // HistoryExportScheduler materializes the durable alert-transition history to
@@ -111,9 +118,9 @@ type HistoryExportScheduler struct {
 	signer *exportSigner
 	trust  *exportTrustStore
 
-	mu       sync.Mutex
-	started  bool
-	running  bool // a tick is currently active (non-reentrant guard, P34-I1)
+	mu             sync.Mutex
+	started        bool
+	running        bool // a tick is currently active (non-reentrant guard, P34-I1)
 	lastRunAt      time.Time
 	lastExportedAt time.Time
 	lastError      string
@@ -121,6 +128,7 @@ type HistoryExportScheduler struct {
 	manifestError  string
 	pubStateError  string
 	signatureError string
+	ledgerError    string
 	skipCount      int64
 	published      int64
 	failed         int64
@@ -273,6 +281,7 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 		// tick attempted no formats, so both reset to zero.
 		s.published, s.failed = 0, 0
 		s.manifestError, s.pubStateError = "", ""
+		s.ledgerError = ""
 		s.mu.Unlock()
 		return
 	}
@@ -281,6 +290,7 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 		s.lastError = "durable history corrupt — skipped"
 		s.published, s.failed = 0, 0
 		s.manifestError, s.pubStateError = "", ""
+		s.ledgerError = ""
 		s.mu.Unlock()
 		return
 	}
@@ -367,6 +377,7 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 //     and publish the manifest through its reserved slot (tmp → Sync → Link
 //     no-replace). A partial export publishes NO manifest ⇒ its artifacts are
 //     reported as orphan_artifact by the verify surface (M5).
+//
 // A crash between steps 2 and 3 leaves only .tmp + sentinel debris; never a
 // corrupt formal file, and never a silently-overwritten one.
 // Returns (per-format error strings, manifest publish error, watermark error).
@@ -631,6 +642,15 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 			// (R195 migration boundary).
 			manifest.Chain = &manifestChain{PrevPublicationID: 0}
 		} else {
+			// Phase 39 recovery: a manifest-first crash leaves a published
+			// manifest whose ledger entry was never written. Backfill it now.
+			// The predecessor passed the P37 signature check inside
+			// latestVerifiedChainPredecessor, and recordLedgerEntry re-checks it,
+			// so a tampered manifest can never be washed into valid ledger
+			// evidence (R204).
+			if rerr := s.recordLedgerEntry(prev, generatedAt); rerr != nil {
+				s.setLedgerError(rerr.Error())
+			}
 			dg, derr := manifestDigest(prev)
 			if derr != nil {
 				return "manifest: chain digest: " + derr.Error(), ""
@@ -675,7 +695,45 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 		return "manifest: link: " + lerr.Error(), ""
 	}
 	os.Remove(tmpPath)
+	// Phase 39: the ledger entry is appended ONLY after the manifest is durably
+	// published. This is the single success point — ledger-first would create
+	// phantom publication evidence, so it is never attempted. A ledger failure
+	// never un-publishes the manifest; it is surfaced as ledger_error and the
+	// next tick's recovery backfills it.
+	if s.signer != nil {
+		if rerr := s.recordLedgerEntry(&manifest, generatedAt); rerr != nil {
+			s.setLedgerError(rerr.Error())
+		}
+	}
 	return "", ""
+}
+
+// recordLedgerEntry appends the signed ledger entry describing a published
+// manifest. It is IDEMPOTENT (same id + same digest is a no-op; a different
+// digest is refused as a conflict) and only ever signs a manifest whose P37
+// signature verifies — a tampered manifest must never be washed into valid
+// ledger evidence.
+func (s *HistoryExportScheduler) recordLedgerEntry(m *snapshotManifest, at time.Time) error {
+	if s.signer == nil || m == nil {
+		return nil
+	}
+	if v := verifyManifestSignature(m, s.trust); v.Verdict != sigVerdictOK {
+		return fmt.Errorf("ledger: refusing to record publication %d (%s)", m.PublicationID, v.Verdict)
+	}
+	e, err := entryForManifest(m, at)
+	if err != nil {
+		return err
+	}
+	if err := s.signer.signLedgerEntry(&e, at); err != nil {
+		return err
+	}
+	return appendLedgerEntry(s.cfg.Dir, s.cfg.LedgerCapacity, e)
+}
+
+func (s *HistoryExportScheduler) setLedgerError(msg string) {
+	s.mu.Lock()
+	s.ledgerError = msg
+	s.mu.Unlock()
 }
 
 // writeTmp streams one format into tmpPath and returns the FileInfo of the file
@@ -774,6 +832,7 @@ func serializeHistoryExportForFormat(w io.Writer, fmtName string, res protection
 //     so no orphan artifact ever survives its owner (M6/A6.3);
 //   - unattributable files (no valid-identity prefix at all) are NEVER deleted
 //     by prune — fail-closed retention, surfaced by verify as unknown instead.
+//
 // Oldest excess units are removed together.
 func (s *HistoryExportScheduler) prune() error {
 	if s.cfg.Retain <= 0 {
@@ -850,6 +909,7 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 		ManifestError:         s.manifestError,
 		PublicationStateError: s.pubStateError,
 		SignatureError:        s.signatureError,
+		LedgerError:           s.ledgerError,
 		SkipCount:             s.skipCount,
 		Published:             s.published,
 		Failed:                s.failed,

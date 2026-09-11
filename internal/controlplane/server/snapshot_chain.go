@@ -64,7 +64,17 @@ type ChainVerdict struct {
 	Verdict             string  `json:"verdict"`
 	AnchorPublicationID int64   `json:"anchor_publication_id,omitempty"`
 	BrokenAt            []int64 `json:"broken_at,omitempty"`
-	Detail              string  `json:"detail,omitempty"`
+	// Phase 39: the oldest publication_id whose chain position is currently
+	// PROVEN. Anything older lies outside the verifiable range — a shrink, and
+	// emphatically not a tampering claim (prefix eviction and prefix deletion
+	// are indistinguishable).
+	VerifiableFromPublicationID int64 `json:"verifiable_from_publication_id,omitempty"`
+	// Phase 39: how many ledger entries the backtrack actually consumed.
+	LedgerEntriesUsed int `json:"ledger_entries_used,omitempty"`
+	// Phase 39: ledger entries that exist but cannot be trusted (untrusted
+	// signature, conflicting duplicate id). Exposed, never silently ignored.
+	LedgerErrors []string `json:"ledger_errors,omitempty"`
+	Detail       string   `json:"detail,omitempty"`
 }
 
 // manifestDigest is the canonical digest used both for chain commitments and
@@ -159,18 +169,52 @@ func latestVerifiedChainPredecessor(dir string, beforeID int64, trust *exportTru
 // NOT the same as how many we could verify. The distinction is evidence honesty
 // (R196): "no chain evidence at all" and "chain evidence that cannot be
 // cryptographically trusted" are different states and must not collapse.
-func verifyManifestChain(nodes []chainNode, chainBearing int) (ChainVerdict, map[string]string) {
+// verifyChainWithLedger evaluates the retained Phase 38 chain AND, for the
+// region retention has already reclaimed, the Phase 39 ledger.
+//
+// `chainBearing` is how many v4 chain-bearing manifests exist on disk, which is
+// NOT the same as how many we could verify (R196 evidence honesty).
+//
+// Ledger backtracking (R203/R204):
+//   - the retained hops are verified exactly as in Phase 38 (rules unchanged);
+//   - the boundary BELOW the oldest retained node is then walked backwards
+//     through the ledger, using only entries actually referenced, so phantom or
+//     orphan entries can never participate;
+//   - a matching entry extends the verified range; a digest mismatch, an
+//     untrusted entry, a conflicting id or a cycle is a BREAK;
+//   - running out of entries simply ENDS the verifiable range. That is a
+//     shrink, never a break: prefix eviction and prefix deletion are
+//     indistinguishable and neither is ever reported as tampering.
+func verifyChainWithLedger(nodes []chainNode, chainBearing int, ls *ledgerState) (ChainVerdict, map[string]string) {
 	positions := map[string]string{}
+	if ls == nil {
+		ls = &ledgerState{usable: map[int64]ledgerEntry{}, conflicts: map[int64]bool{}}
+	}
+	problemsByID := map[int64]ledgerProblem{}
+	for _, p := range ls.unusable {
+		problemsByID[p.PublicationID] = p
+	}
+	collectLedgerErrors := func() []string {
+		var out []string
+		for _, p := range ls.unusable {
+			out = append(out, fmt.Sprintf("ledger entry %d: %s (%s)", p.PublicationID, p.Verdict, p.Detail))
+		}
+		for id := range ls.conflicts {
+			out = append(out, fmt.Sprintf("ledger entry %d: conflicting digests recorded for the same publication_id", id))
+		}
+		sort.Strings(out)
+		return out
+	}
+
 	if chainBearing == 0 {
 		return ChainVerdict{Verdict: chainVerdictAbsent, Detail: "no chain-bearing manifests (pre-P38 history only)"}, positions
 	}
 	unverifiable := chainBearing - len(nodes)
 	if len(nodes) == 0 {
-		// Chain-bearing manifests EXIST — they simply cannot be trusted. That is
-		// not "no chain", so it must never be reported as chain_absent.
 		return ChainVerdict{
-			Verdict: chainVerdictBroken,
-			Detail:  fmt.Sprintf("%d chain-bearing manifest(s) exist but the predecessor chain cannot be cryptographically verified (signature not valid)", chainBearing),
+			Verdict:      chainVerdictBroken,
+			LedgerErrors: collectLedgerErrors(),
+			Detail:       fmt.Sprintf("%d chain-bearing manifest(s) exist but the predecessor chain cannot be cryptographically verified (signature not valid)", chainBearing),
 		}, positions
 	}
 	sorted := make([]chainNode, len(nodes))
@@ -178,35 +222,88 @@ func verifyManifestChain(nodes []chainNode, chainBearing int) (ChainVerdict, map
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].id < sorted[j].id })
 
 	v := ChainVerdict{Verdict: chainVerdictOK, AnchorPublicationID: sorted[0].id}
+	v.LedgerErrors = collectLedgerErrors()
 	if unverifiable > 0 {
-		// Some chain-bearing nodes dropped out of the trusted set: the chain
-		// cannot be established even if the surviving hops happen to line up.
 		v.Verdict = chainVerdictBroken
 		v.Detail = fmt.Sprintf("%d chain-bearing manifest(s) cannot be cryptographically verified (signature not valid)", unverifiable)
 	}
 
-	// The anchor MUST declare genesis explicitly: prev_publication_id == 0 AND no
-	// predecessor digest. A first v4 node that claims a predecessor we cannot see
-	// — or a digest with no predecessor id — is a BREAK; the anchor is the start
-	// of the P38 chain, not "whatever file happens to be oldest after a deletion".
-	if sorted[0].prevID != 0 || sorted[0].prevDigest != "" {
+	// ---- boundary below the oldest retained node ---------------------------
+	switch {
+	case sorted[0].prevID == 0 && sorted[0].prevDigest == "":
+		// Explicit genesis.
+		positions[sorted[0].identity] = chainPosRetentionBoundary
+		v.VerifiableFromPublicationID = sorted[0].id
+	case sorted[0].prevID == 0:
+		// A digest with no predecessor id is a malformed anchor.
 		v.Verdict = chainVerdictBroken
 		v.BrokenAt = append(v.BrokenAt, sorted[0].id)
-		if sorted[0].prevID != 0 {
-			v.Detail = fmt.Sprintf("chain anchor %d commits to predecessor %d which is not retained", sorted[0].id, sorted[0].prevID)
-		} else {
+		positions[sorted[0].identity] = chainPosBroken
+		if v.Detail == "" {
 			v.Detail = fmt.Sprintf("chain anchor %d carries a predecessor digest without a predecessor id", sorted[0].id)
 		}
-		positions[sorted[0].identity] = chainPosBroken
-	} else {
-		positions[sorted[0].identity] = chainPosRetentionBoundary
+	default:
+		if ls.total == 0 {
+			// NO ledger at all (pre-P39 deployment): Phase 38 semantics apply —
+			// an anchor committing to a predecessor nobody can produce is a break.
+			v.Verdict = chainVerdictBroken
+			v.BrokenAt = append(v.BrokenAt, sorted[0].id)
+			positions[sorted[0].identity] = chainPosBroken
+			if v.Detail == "" {
+				v.Detail = fmt.Sprintf("chain anchor %d commits to predecessor %d which is not retained", sorted[0].id, sorted[0].prevID)
+			}
+			break
+		}
+		// A ledger exists, so the boundary below the oldest retained node may be
+		// provable: walk it backwards.
+		from, used, brokenDetail := backtrackLedger(ls, problemsByID, sorted[0].prevID, sorted[0].prevDigest)
+		v.LedgerEntriesUsed += used
+		switch {
+		case brokenDetail != "":
+			v.Verdict = chainVerdictBroken
+			v.BrokenAt = append(v.BrokenAt, sorted[0].id)
+			positions[sorted[0].identity] = chainPosBroken
+			if v.Detail == "" {
+				v.Detail = brokenDetail
+			}
+		case used > 0:
+			positions[sorted[0].identity] = chainPosRetentionBoundary
+			v.VerifiableFromPublicationID = from
+		default:
+			positions[sorted[0].identity] = chainPosRetentionBoundary
+			v.VerifiableFromPublicationID = sorted[0].id
+		}
 	}
 
+	// A publication_id is ONE logical node (R204): when the disk manifest and its
+	// ledger entry disagree about the digest, the node has been replaced. A
+	// CONFLICTING duplicate id is likewise a break — never a silent
+	// last-write-wins.
+	for _, n := range sorted {
+		if ls.conflicts[n.id] {
+			v.Verdict = chainVerdictBroken
+			v.BrokenAt = append(v.BrokenAt, n.id)
+			positions[n.identity] = chainPosBroken
+			if v.Detail == "" {
+				v.Detail = fmt.Sprintf("ledger records conflicting digests for publication_id %d", n.id)
+			}
+			continue
+		}
+		e, ok := ls.usable[n.id]
+		if !ok || e.ManifestDigest == n.digest {
+			continue
+		}
+		v.Verdict = chainVerdictBroken
+		v.BrokenAt = append(v.BrokenAt, n.id)
+		positions[n.identity] = chainPosBroken
+		if v.Detail == "" {
+			v.Detail = fmt.Sprintf("manifest %d and its ledger entry record different digests", n.id)
+		}
+	}
+
+	// ---- hop-by-hop over the retained set (Phase 38 rules, unchanged) -------
 	for i := 1; i < len(sorted); i++ {
 		prev, cur := sorted[i-1], sorted[i]
-		// A non-genesis hop MUST carry BOTH commitments: the id AND the exact
-		// canonical digest of its predecessor. An empty digest is never a
-		// wildcard — chain_ok must mean every hop is id+digest bound (R197).
 		if cur.prevID == prev.id && cur.prevDigest == prev.digest {
 			positions[cur.identity] = chainPosPredecessorVerified
 			continue
@@ -226,4 +323,48 @@ func verifyManifestChain(nodes []chainNode, chainBearing int) (ChainVerdict, map
 		}
 	}
 	return v, positions
+}
+
+// backtrackLedger walks the ledger backwards from a committed predecessor.
+//
+// It returns the oldest proven publication_id, how many entries were used, and
+// a non-empty detail when the walk proves a BREAK (digest mismatch, untrusted
+// entry, conflicting id, or a cycle). Running out of entries is NOT a break.
+func backtrackLedger(ls *ledgerState, problems map[int64]ledgerProblem, id int64, digest string) (int64, int, string) {
+	if ls == nil {
+		return 0, 0, ""
+	}
+	if len(ls.usable) == 0 && len(problems) == 0 && len(ls.conflicts) == 0 {
+		return 0, 0, "" // no ledger at all: nothing provable below this node
+	}
+	oldest := int64(0)
+	used := 0
+	curID, curDigest := id, digest
+	for curID != 0 {
+		if used > len(ls.usable)+len(problems)+1 {
+			return oldest, used, fmt.Sprintf("ledger walk from %d exceeds the recorded entry count (cycle or corruption)", id)
+		}
+		if ls.conflicts[curID] {
+			return oldest, used, fmt.Sprintf("ledger records conflicting digests for publication_id %d", curID)
+		}
+		e, ok := ls.usable[curID]
+		if !ok {
+			if p, bad := problems[curID]; bad {
+				return oldest, used, fmt.Sprintf("ledger entry %d is not trustworthy (%s)", curID, p.Verdict)
+			}
+			// Entry unavailable (evicted, or never recorded): the verifiable
+			// range ends here — a shrink, not a tampering claim.
+			return oldest, used, ""
+		}
+		if curDigest != "" && e.ManifestDigest != curDigest {
+			return oldest, used, fmt.Sprintf("ledger entry %d records a digest that does not match the committed predecessor", curID)
+		}
+		used++
+		oldest = e.PublicationID
+		if e.PrevPublicationID != 0 && e.PrevManifestDigest == "" {
+			return oldest, used, "" // cannot continue along a digest-less commitment
+		}
+		curID, curDigest = e.PrevPublicationID, e.PrevManifestDigest
+	}
+	return oldest, used, ""
 }

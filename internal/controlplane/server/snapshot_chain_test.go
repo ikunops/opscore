@@ -102,6 +102,14 @@ func (f *chainFixture) burn(t *testing.T, id int64) {
 	}
 }
 
+// dropLedger removes the Phase 39 ledger, reproducing a pre-P39 deployment.
+func (f *chainFixture) dropLedger(t *testing.T) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(f.snapDir, chainLedgerFile)); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+}
+
 func (f *chainFixture) drop(t *testing.T, exp time.Time) {
 	t.Helper()
 	base := filepath.Join(f.snapDir, "alert-transitions-"+safeTS(exp))
@@ -367,19 +375,41 @@ func TestChainMigrationBoundary(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T97 — deleting the P38 anchor is NOT a boundary, it is a break
+// T97 — deleting the P38 anchor. Phase 39 splits this into two semantics:
+// without a ledger it is a break (Phase 38 rule); with a ledger the anchor
+// commitment survives and the verifiable range simply starts at the anchor.
 // ---------------------------------------------------------------------------
-func TestChainAnchorDeletionBreaks(t *testing.T) {
-	f := newChainFixture(t)
-	f.tick(t, at(0), 1, 10) // anchor
-	f.tick(t, at(1), 11, 20)
+func TestChainAnchorDeletion(t *testing.T) {
+	t.Run("no_ledger_breaks", func(t *testing.T) {
+		f := newChainFixture(t)
+		f.tick(t, at(0), 1, 10) // anchor
+		f.tick(t, at(1), 11, 20)
+		f.drop(t, at(0))
+		f.dropLedger(t)
 
-	f.drop(t, at(0)) // delete the anchor
+		_, verdict := mustVerifyDetailed(t, f.sched)
+		if verdict.Verdict != "chain_broken" {
+			t.Fatalf("without a ledger, deleting the anchor must break the chain: %+v", verdict)
+		}
+	})
 
-	_, verdict := mustVerifyDetailed(t, f.sched)
-	if verdict.Verdict != "chain_broken" {
-		t.Fatalf("deleting the P38 anchor must break the chain (boundary is bound to the real chain start): %+v", verdict)
-	}
+	t.Run("with_ledger_stays_verifiable", func(t *testing.T) {
+		f := newChainFixture(t)
+		f.tick(t, at(0), 1, 10) // anchor
+		f.tick(t, at(1), 11, 20)
+		f.drop(t, at(0))
+
+		_, verdict := mustVerifyDetailed(t, f.sched)
+		if verdict.Verdict != "chain_ok" {
+			t.Fatalf("the ledger still holds the anchor commitment: %+v", verdict)
+		}
+		if verdict.VerifiableFromPublicationID != 1 {
+			t.Fatalf("verifiable_from = %d, want 1 (the anchor)", verdict.VerifiableFromPublicationID)
+		}
+		if verdict.LedgerEntriesUsed == 0 {
+			t.Fatal("the backtrack must have consumed the anchor ledger entry")
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -407,22 +437,60 @@ func TestChainAndCoverageAreIndependent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T93 — a present-but-unverifiable predecessor cannot be confirmed
+// T93 — a present-but-unverifiable predecessor. Phase 39 splits this too: the
+// on-disk manifest is unusable, but the ledger still carries its commitment, so
+// the chain remains verifiable (and the corrupt file is still reported by the
+// P35 status / P37 signature dimensions).
 // ---------------------------------------------------------------------------
-func TestChainUnverifiablePredecessorBreaks(t *testing.T) {
-	f := newChainFixture(t)
-	f.tick(t, at(0), 1, 10)
-	f.tick(t, at(1), 11, 20)
+func TestChainUnverifiablePredecessor(t *testing.T) {
+	corruptFirst := func(t *testing.T, f *chainFixture) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(f.snapDir, "alert-transitions-"+safeTS(at(0))+".manifest.json"), []byte("{broken"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 
-	// Corrupt the FIRST manifest's JSON so it cannot be parsed at all: the
-	// successor remains intact and still commits to it.
-	if err := os.WriteFile(filepath.Join(f.snapDir, "alert-transitions-"+safeTS(at(0))+".manifest.json"), []byte("{broken"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, verdict := mustVerifyDetailed(t, f.sched)
-	if verdict.Verdict != "chain_broken" {
-		t.Fatalf("an unverifiable predecessor must break the chain: %+v", verdict)
-	}
+	t.Run("no_ledger_breaks", func(t *testing.T) {
+		f := newChainFixture(t)
+		f.tick(t, at(0), 1, 10)
+		f.tick(t, at(1), 11, 20)
+		corruptFirst(t, f)
+		f.dropLedger(t)
+
+		_, verdict := mustVerifyDetailed(t, f.sched)
+		if verdict.Verdict != "chain_broken" {
+			t.Fatalf("without a ledger an unverifiable predecessor must break the chain: %+v", verdict)
+		}
+	})
+
+	t.Run("with_ledger_stays_verifiable", func(t *testing.T) {
+		f := newChainFixture(t)
+		f.tick(t, at(0), 1, 10)
+		f.tick(t, at(1), 11, 20)
+		corruptFirst(t, f)
+
+		res, verdict := mustVerifyDetailed(t, f.sched)
+		if verdict.Verdict != "chain_ok" {
+			t.Fatalf("the ledger still holds the predecessor commitment: %+v", verdict)
+		}
+		if verdict.VerifiableFromPublicationID != 1 {
+			t.Fatalf("verifiable_from = %d, want 1", verdict.VerifiableFromPublicationID)
+		}
+		// The corrupt file is still honestly reported on its own dimension: the
+		// P35 status degrades to unknown, and NO signature verdict is fabricated
+		// for a manifest that cannot be parsed (R191).
+		for _, r := range res {
+			if r.Snapshot != safeTS(at(0)) {
+				continue
+			}
+			if r.Status != "unknown" {
+				t.Fatalf("corrupt manifest status = %q, want unknown", r.Status)
+			}
+			if r.Signature != nil {
+				t.Fatalf("no signature verdict may be fabricated for an unparseable manifest: %+v", r.Signature)
+			}
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

@@ -521,8 +521,11 @@ type VerifyResult struct {
 	// Chain is the orthogonal Phase 38 position of this snapshot in the
 	// publication chain: predecessor_verified / retention_boundary / broken /
 	// absent. It never modifies Status or Signature.
-	Chain  string `json:"chain,omitempty"`
-	Detail string `json:"detail,omitempty"`
+	Chain string `json:"chain,omitempty"`
+	// ChainSource (Phase 39) names the trusted evidence backing that position:
+	// disk / ledger / disk+ledger.
+	ChainSource string `json:"chain_source,omitempty"`
+	Detail      string `json:"detail,omitempty"`
 }
 
 // VerifySnapshots checks the newest `limit` snapshot groups across BOTH
@@ -594,9 +597,28 @@ func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyRes
 			}
 		}
 	}
-	chainVerdict, chainPositions := verifyManifestChain(chainNodes, chainBearing)
+	ledgerView, lerr := loadLedgerState(s.cfg.Dir, s.trust)
+	if lerr != nil {
+		return nil, ChainVerdict{}, fmt.Errorf("chain ledger: %w", lerr)
+	}
+	chainVerdict, chainPositions := verifyChainWithLedger(chainNodes, chainBearing, ledgerView)
 	for identity := range unverifiableChain {
 		chainPositions[identity] = chainPosBroken
+	}
+	// Phase 39: which trusted source backs each retained node. disk+ledger means
+	// the same publication_id is described consistently by both.
+	chainSources := map[string]string{}
+	for _, g := range groups {
+		if g.manifest == nil {
+			continue
+		}
+		src := "disk"
+		if e, ok := ledgerView.usable[g.manifest.PublicationID]; ok {
+			if dg, derr := ledgerDigestOf(g.manifest); derr == nil && dg == e.ManifestDigest {
+				src = "disk+ledger"
+			}
+		}
+		chainSources[g.identity] = src
 	}
 	if len(groups) > limit {
 		groups = groups[:limit]
@@ -773,6 +795,9 @@ func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyRes
 		}
 		if pos, ok := chainPositions[g.identity]; ok {
 			res.Chain = pos
+		}
+		if src, ok := chainSources[g.identity]; ok {
+			res.ChainSource = src
 		}
 		out = append(out, res)
 	}
