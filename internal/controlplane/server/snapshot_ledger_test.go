@@ -525,3 +525,63 @@ func TestLedgerKeepsCrashGapDiscriminator(t *testing.T) {
 		t.Fatalf("a deleted published node must break the chain: %+v", verdict)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T123 — a normal append never rewrites the ledger, and a malformed line is
+// never washed away as a side effect of recording something new (R205).
+// ---------------------------------------------------------------------------
+func TestLedgerAppendDoesNotWashMalformedEvidence(t *testing.T) {
+	f := newChainFixture(t)
+	f.tick(t, at(0), 1, 10)
+
+	// Inject a malformed line after the valid one.
+	f.writeLedgerLines(t, append(f.ledgerLines(t), "{ this-is-not-json"))
+
+	f.tick(t, at(1), 11, 20) // a legitimate publication
+
+	lines := f.ledgerLines(t)
+	foundBad := false
+	for _, ln := range lines {
+		if strings.Contains(ln, "this-is-not-json") {
+			foundBad = true
+		}
+		if strings.Contains(ln, "\"publication_id\":2") {
+			t.Fatalf("the append must be refused while unparseable evidence is present, got a line for id 2: %s", ln)
+		}
+	}
+	if !foundBad {
+		t.Fatalf("the malformed line was silently discarded: %v", lines)
+	}
+	if st := f.sched.Status(); strings.TrimSpace(st.LedgerError) == "" {
+		t.Fatal("a refused append must be surfaced as ledger_error")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T124 — capacity compaction is an explicit PREFIX eviction only; it never
+// reinterprets or rebuilds entries, and survivors stay byte-identical.
+// ---------------------------------------------------------------------------
+func TestLedgerCompactionIsPrefixOnly(t *testing.T) {
+	f := newLedgerFixture(t, 2)
+	f.tick(t, at(0), 1, 10)
+	f.tick(t, at(1), 11, 20)
+
+	before := f.ledgerLines(t)
+	f.tick(t, at(2), 21, 30) // third publication ⇒ compaction to the newest two
+	after := f.ledgerLines(t)
+
+	if len(after) != 2 {
+		t.Fatalf("ledger lines = %d, want 2 (capacity)", len(after))
+	}
+	if ids := f.ledgerIDs(t); ids[0] != 2 || ids[1] != 3 {
+		t.Fatalf("ledger ids = %v, want [2 3] (oldest prefix evicted only)", ids)
+	}
+	// The surviving PRE-EXISTING line must be byte-identical to its original:
+	// compaction copies, it never reinterprets or rebuilds.
+	if after[0] != before[1] {
+		t.Fatalf("compaction rewrote a pre-existing entry:\n got %s\nwant %s", after[0], before[1])
+	}
+	if strings.Contains(strings.Join(after, ""), `"publication_id":1`) {
+		t.Fatal("the evicted prefix must be gone")
+	}
+}

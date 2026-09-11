@@ -197,54 +197,137 @@ func loadLedgerState(dir string, trust *exportTrustStore) (*ledgerState, error) 
 	return ls, nil
 }
 
-// appendLedgerEntry appends one entry with logical-uniqueness enforcement.
+// ledgerRawLine is one physical line of the ledger, preserved verbatim when it
+// cannot be parsed (exceptional evidence must never be silently discarded).
+type ledgerRawLine struct {
+	raw   string
+	entry *ledgerEntry // nil when the line is not parseable
+}
+
+func readLedgerRawLines(dir string) ([]ledgerRawLine, error) {
+	path := filepath.Join(dir, chainLedgerFile)
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	return scanLedgerRawLines(f)
+}
+
+func scanLedgerRawLines(r io.Reader) ([]ledgerRawLine, error) {
+	var out []ledgerRawLine
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		text := scanner.Text()
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		rl := ledgerRawLine{raw: strings.TrimSpace(text)}
+		var e ledgerEntry
+		if jerr := json.Unmarshal([]byte(rl.raw), &e); jerr == nil {
+			rl.entry = &e
+		}
+		out = append(out, rl)
+	}
+	return out, scanner.Err()
+}
+
+// appendLedgerEntry adds one entry. Appending and capacity compaction are TWO
+// separate operations (R205):
 //
-//	same id + same digest    → idempotent no-op
-//	same id + different digest → error (conflict; nothing is appended)
+//   - a normal append performs a TRUE append: existing bytes are never rewritten;
+//   - a malformed line makes the append FAIL-CLOSED instead of quietly
+//     rebuilding a "clean" ledger around it — exceptional evidence must never
+//     disappear as a side effect of recording something new;
+//   - the only rewrite is an explicit, standalone PREFIX compaction that drops
+//     the oldest whole lines and preserves every surviving line verbatim.
 //
-// When the entry count exceeds capacity the OLDEST entries are dropped, which
-// only shrinks the verifiable range (never a break).
+//	same id + same digest     → idempotent no-op
+//	same id + different digest→ error (conflict; nothing is written)
 func appendLedgerEntry(dir string, capacity int, e ledgerEntry) error {
 	path := filepath.Join(dir, chainLedgerFile)
-	existing, err := readLedgerEntries(dir)
+	lines, err := readLedgerRawLines(dir)
 	if err != nil {
 		return err
 	}
-	for _, old := range existing {
-		if old.PublicationID != e.PublicationID {
+	unparseable := 0
+	for i := range lines {
+		rl := lines[i]
+		if rl.entry == nil {
+			unparseable++
 			continue
 		}
-		if sameLedgerIdentity(old, e) {
+		if rl.entry.PublicationID != e.PublicationID {
+			continue
+		}
+		if sameLedgerIdentity(*rl.entry, e) {
 			return nil // idempotent
 		}
 		return fmt.Errorf("ledger conflict: publication_id %d already recorded with a different digest", e.PublicationID)
 	}
-
-	lines := make([][]byte, 0, len(existing)+1)
-	for i := range existing {
-		raw, merr := serializeLedgerEntryBytes(&existing[i])
-		if merr != nil {
-			return merr
-		}
-		lines = append(lines, raw)
+	if unparseable > 0 {
+		return fmt.Errorf("ledger holds %d unparseable line(s); refusing to append — rewriting the file would silently discard that evidence", unparseable)
 	}
+
 	raw, merr := serializeLedgerEntryBytes(&e)
 	if merr != nil {
 		return merr
 	}
-	lines = append(lines, raw)
-
-	if capacity > 0 && len(lines) > capacity {
-		lines = lines[len(lines)-capacity:]
+	// TRUE append: nothing already on disk is rewritten.
+	f, oerr := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if oerr != nil {
+		return oerr
 	}
+	if _, werr := f.Write(raw); werr != nil {
+		f.Close()
+		return werr
+	}
+	if serr := f.Sync(); serr != nil {
+		f.Close()
+		return serr
+	}
+	if cerr := f.Close(); cerr != nil {
+		return cerr
+	}
+
+	if capacity > 0 {
+		return compactLedgerPrefix(path, capacity)
+	}
+	return nil
+}
+
+// compactLedgerPrefix drops only the OLDEST whole lines until at most `keep`
+// remain, preserving every surviving line byte-for-byte. It never reinterprets,
+// repairs, or reorders entries.
+func compactLedgerPrefix(path string, keep int) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	lines, serr := scanLedgerRawLines(f)
+	f.Close()
+	if serr != nil {
+		return serr
+	}
+	if len(lines) <= keep {
+		return nil
+	}
+	kept := lines[len(lines)-keep:]
 
 	tmp := path + ".tmp"
 	out, oerr := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if oerr != nil {
 		return oerr
 	}
-	for _, l := range lines {
-		if _, werr := out.Write(l); werr != nil {
+	for _, l := range kept {
+		if _, werr := io.WriteString(out, l.raw+"\n"); werr != nil {
 			out.Close()
 			os.Remove(tmp)
 			return werr
@@ -264,32 +347,6 @@ func appendLedgerEntry(dir string, capacity int, e ledgerEntry) error {
 		return rerr
 	}
 	return nil
-}
-
-func readLedgerEntries(dir string) ([]ledgerEntry, error) {
-	f, err := os.Open(filepath.Join(dir, chainLedgerFile))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-	var out []ledgerEntry
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var e ledgerEntry
-		if jerr := json.Unmarshal([]byte(line), &e); jerr != nil {
-			continue
-		}
-		out = append(out, e)
-	}
-	return out, scanner.Err()
 }
 
 // sameLedgerIdentity reports whether two entries describe the same node state.
