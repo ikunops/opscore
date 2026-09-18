@@ -1,6 +1,6 @@
 # ADR-052 — Phase 40: Publication Anchoring（发布锚定 / 域外见证）
 
-- **Status**: Proposed (Round 207, Scope stage)
+- **Status**: Proposed (Round 207, Scope stage) · **Revised per R207=B** (R40-1 / R40-2 / R40-3 已闭合，见 §12)
 - **Phase**: 40（Publication Anchoring）
 - **Base**: Phase 39 CLOSED（R206=A，origin/main = `826d0de1`）
 - **Author**: executor（WorkBuddy），方向自拍板授权（用户 2026-08-27）
@@ -99,6 +99,8 @@ canonicalAnchorPayload(a) = canonicalJSON({
   "prev_publication_id": int64,
   "prev_manifest_digest": string,
   "recorded_at":         string,  // RFC3339Nano
+  "key_id":              string,  // [R40-2] P37 派生值 SHA-256(raw pub)[:8]
+  "stream_id":           string,  // [R40-2] 派生值 SHA-256(raw pub || 0x00 || abs_export_dir)[:8]
 })
 anchorDigest = sha256(canonicalAnchorPayload(a))
 ```
@@ -106,6 +108,7 @@ anchorDigest = sha256(canonicalAnchorPayload(a))
 - `canonicalJSON` **完全复用 P37 的规范序列化器**（语义层：键序/空白无关，改值/类型/字段存在性即失败）。不引入第二套 canonical。
 - `anchor_seq` 是本地单调递增序号，**独立于 publication_id**。它的唯一作用是在见证侧暴露**推送空洞**（seq 不连续 ⇒ 见证序列不完整），它是**传输完整性**字段，不是发布关系字段，**永不参与 predecessor 裁决**（沿用 P38/R201 的两轴分离铁律）。
 - 锚定 payload 由 P37 的签名器签名，使见证端可独立验证来源。
+- **[R40-2] 身份字段必须存在且必须是派生值**。`key_id` 沿用 P37 的派生定义；`stream_id` 由「原始公钥字节 + 导出目录绝对路径」哈希派生。两者都**不是可配置项**——可配置的 deployment identity 只是一句声明，攻击者可改写为一致值，不提供任何区分能力；派生值才是证据。区分语义见 A7 与 ADR-053。
 
 ### A2 — 发布顺序（在 P39 冻结之后追加第 5 步）
 
@@ -161,20 +164,33 @@ manifest 定稿 → 签名 → atomic publish（唯一成功点）→ ledger app
   1. 保持 P35 以来「verify 严格只读」的纪律；
   2. 避免把外部系统变成**新的信任源**——如果 verify 自己去拉，见证端的可用性/可信性就被隐式抬升为验证前提；
   3. 调用方提供序列 ⇒ 该序列的**完整性与来源可靠性由调用方负责**，ADR 明确声明这一点（见 §7.3）。
-- 序列格式：`[{publication_id, anchor_seq, anchor_digest, ack_id?}, ...]`。
+- 序列格式：`[{publication_id, anchor_seq, anchor_digest, key_id, stream_id, ack_id?}, ...]`
+  （**[R40-2]** 身份字段 `key_id` / `stream_id` 由见证端回显，是区分「别人的序列」与「我们的流被重写」的唯一依据）。
 
-### A7 — 对齐下界（witness_trust）：不可对齐 ⇒ 不做任何断言
+### A7 — 身份与对齐（witness_trust）：[R40-2] 细分，禁止静默合流
 
-对账前必须先建立「这份序列确实来自我们的同一个发布流」：
+对账分两级：先判**身份**（这份序列是不是我们的流），再判**对齐**（能否据此断言）。
 
 | witness_trust | 条件 | 后果 |
 |---|---|---|
 | `not_provided` | 未提供序列 | 只输出本地 anchor 状态，**不产出**任何对账结论 |
-| `untrusted` | 序列中**没有任何**条目的 `(publication_id, anchor_seq, anchor_digest)` 与本地 `anchored` 记录完全一致 | **不做任何断言**。verdict = `anchor_unverifiable`，`orphan`/`missing` 列表**必须为空** |
-| `aligned` | 至少存在 1 个上述完全一致条目 | 才允许产出对账结论 |
+| `untrusted` + `trust_reason` | 见下表（四类**无断言**情形） | **不做任何断言**。verdict = `anchor_unverifiable`，`orphan`/`missing`/`divergent` 列表**必须为空** |
+| **`divergent`** | 身份证明一致（`stream_id` ∧ `key_id` 均与本地派生值相等）**且**存在共享 `publication_id`，但共享 id 上**三元组无一匹配** | **[R40-2] 可断言**：verdict = `anchor_broken`，`divergent_ids` 非空，**不得静默** |
+| `aligned` | 至少存在 1 个 `(publication_id, anchor_seq, anchor_digest)` 与本地 `anchored` 记录完全一致 | 才允许按 A8 产出 orphan / missing / mismatch 结论 |
 
-> 这是**对齐的密码学下界，不是完整性证明**。攻击者若能伪造整份序列，他也能伪造对齐——P40 不解决「见证端本身被攻陷」，见 §8 已知代价。
+`untrusted` 的 `trust_reason`（judge R40-2：原「三态合流」会静默吞掉主攻击信号，故按原因细分）：
+
+| trust_reason | 条件 | 为什么无断言 |
+|---|---|---|
+| `foreign_key_id` / `foreign_stream` | 序列条目的 `key_id` 或 `stream_id` 与本地派生值不符 | 这是**另一个部署 / 另一个导出流**的序列，与本地不构成同一比较对象 |
+| `no_overlap` | 身份证明一致，但**零共享** `publication_id` | 没有任何可比较样本，无从判断 |
+| `malformed_sequence` | 序列格式非法 / 必需字段缺失 | 输入不可用，不是证据 |
+| `no_local_window` | 本地 anchor log 缺失、为空或不可解析 ⇒ 无法计算证据窗口 | 本地参照系不存在（同时暴露 `anchor_error`） |
+
+> **这是对齐的密码学下界，不是完整性证明。** 攻击者若能伪造整份序列，他也能伪造对齐——P40 不解决「见证端本身被攻陷」，见 §8 已知代价。
 > 但**没有**这条下界会更糟：任意无关系统的日志都会被当成我们的见证，从而把「外部有、本地没有」批量误报成删除。
+>
+> **[R40-2] 关键区分**：`no_overlap`（零共享 id）与 `divergent`（共享 id 但系统性分歧）是**两种完全不同的信号**。后者正是 §2.2 主攻击场景的指纹——攻击者重写本地 anchor log 与链、见证端完好时，同一批 `publication_id` 会在两侧携带不同 digest。把它判为静默 `untrusted` 会让 P40 的核心价值在主场景失效。
 
 ### A8 — 对账判据（仅在 `aligned` 下计算）
 
@@ -185,10 +201,24 @@ manifest 定稿 → 签名 → atomic publish（唯一成功点）→ ledger app
 | 本地 `anchored` ∧ 见证存在 ∧ digest 相等 | `witnessed` | 最好的情形 |
 | 本地 `anchored` ∧ 见证存在 ∧ **digest 不等** | `anchor_broken` | 内容被替换（本地或见证侧之一被改），**确凿的不一致** |
 | 本地 `anchored` ∧ 见证**缺失** | `missing_witness` ⇒ verdict 至多 `anchor_incomplete` | **见证端裁剪与见证端丢失不可区分**（与 P39「eviction 与 prefix deletion 不可区分」同构）。**绝不**断言为篡改 |
-| 本地**无**该 publication_id ∧ 见证存在 | **`orphan_witness` ⇒ `anchor_broken`** | **本 Phase 的核心产出**：外部见证了一个本地根本不存在的发布。这是 P35~P39 给不出的结论 |
+| **[R40-1]** 本地**无**该 id ∧ 见证存在 ∧ 该条目 `anchor_seq` **落在本地证据窗口内** | **`orphan_witness` ⇒ `anchor_broken`** | **本 Phase 的核心产出（窗口内限定后仍然成立）**：外部见证了一个本地应当持有却根本不存在的发布。P35~P39 给不出这个结论 |
+| **[R40-1]** 本地**无**该 id ∧ 见证存在 ∧ `anchor_seq` **低于窗口下界** | `witness_outside_window` ⇒ **不判 broken**，至多 `anchor_incomplete` | 合法 prefix compaction 可能已移除该本地记录。**合法保留与恶意删除在本地不可区分**（同构 P39 eviction/deletion），**绝不**断言 |
+| **[R40-1]** 本地**无**该 id ∧ 见证存在 ∧ `anchor_seq` **高于窗口上界** | `witness_ahead_of_window` ⇒ `anchor_broken` | prefix compaction **只裁最旧整行**，尾部缺失不可能由任何合法操作产生 ⇒ 可断言 |
 | 本地 `pending` / `unanchored` ∧ 见证存在 | `witnessed_unconfirmed` | 见下 |
 
 **`pending`/`unanchored` 条目不参与「已确认」类断言**（沿用 A4）：它们尚未被确认送达，既不能当 `witnessed`，其「见证缺失」也不能当 `missing_witness`（否则「还没推送成功」会被读成「见证端把它丢了」）。
+
+### A10 — 本地证据窗口（[R40-1] 新增）
+
+> 这是 P39 `verifiable_from` 在 anchor 维度的等价物。judge 指出：不定义它，合法 compaction 会被误报成断裂——**与 P39 在 R203-① 消灭的「retain < 链长 ⇒ 合法 prune 报 chain_broken」是同一个 bug**。
+
+- **窗口** = 幸存 anchor 条目的 `anchor_seq` 连续段 `[min_seq, max_seq]`。
+- 连续性来自两条持久化纪律（A3）：真 `O_APPEND`（只增） + prefix compaction（只裁最旧**整行**）。又因 `anchor_seq` **只在成功追加时消耗**（与 P35「失败尝试零消耗 publication id」同构），幸存段在合法操作下**必然连续**。
+- **推论（可断言）**：若幸存段的 `anchor_seq` 出现空洞 ⇒ 该文件被非 compaction 手段改写过 ⇒ `window_discontinuous` ⇒ `anchor_broken` + `anchor_error`。
+- **compaction 下限**：至少保留最后 1 条 ⇒ 窗口永不为空。`capacity = 0`（全留）⇒ 从不 compaction。
+- **窗口边界必须随结果输出**（judge 必修要求「对账结果必须携带本地证据窗口边界或等价的可解释性信息」）：
+  `anchor_window{min_seq, max_seq, entries, continuous: bool}`。
+- 若本地 anchor log 不存在/为空/不可解析 ⇒ 无法建立窗口 ⇒ `trust_reason = no_local_window`，**不做任何断言**（A7）。
 
 ### A9 — 第四维正交
 
@@ -215,16 +245,20 @@ per-publication：
  "anchor_digest": "…",
  "anchored_at": "…",
  "attempts": 1,
- "witness": "witnessed|digest_mismatch|missing_witness|orphan_witness|witnessed_unconfirmed|not_evaluated"}
+ "witness": "witnessed|digest_mismatch|missing_witness|orphan_witness|witness_outside_window|witness_ahead_of_window|witnessed_unconfirmed|not_evaluated"}
 ```
 
 aggregate：
 
 ```json
 {"enabled": true,
- "witness_trust": "not_provided|untrusted|aligned",
+ "witness_trust": "not_provided|untrusted|divergent|aligned",
+ "trust_reason": "foreign_key_id|foreign_stream|no_overlap|malformed_sequence|no_local_window|null",
  "verdict": "anchor_absent|anchor_ok|anchor_incomplete|anchor_broken|anchor_unverifiable",
+ "anchor_window": {"min_seq": 7, "max_seq": 18, "entries": 12, "continuous": true},
  "orphan_witness_ids": [100],
+ "outside_window_ids": [41],
+ "divergent_ids": [99],
  "missing_witness_ids": [98],
  "digest_mismatch_ids": [],
  "pending_ids": [101],
@@ -239,9 +273,9 @@ verdict 语义（**严格区分「不可证明」与「检测到问题」**）�
 |---|---|
 | `anchor_absent` | 功能未启用，无任何本地 anchor 记录（与 P38 `chain_absent` 同构：允许「没有」这一态） |
 | `anchor_ok` | aligned 且并集内无 mismatch / 无 orphan / 无 missing |
-| `anchor_incomplete` | 存在 `pending` / `unanchored` / `missing_witness` / 未对齐所需的样本 ⇒ **不可完整证明**，但**未检测到不一致** |
-| `anchor_broken` | 出现 `orphan_witness` 或 `digest_mismatch` |
-| `anchor_unverifiable` | `witness_trust = untrusted` ⇒ 不做断言 |
+| `anchor_incomplete` | 存在 `pending` / `unanchored` / `missing_witness` / `witness_outside_window` ⇒ **不可完整证明**，但**未检测到不一致** |
+| `anchor_broken` | 出现 `orphan_witness`（窗口内）/ `witness_ahead_of_window` / `digest_mismatch` / **`divergent`（R40-2）** / `window_discontinuous` |
+| `anchor_unverifiable` | `witness_trust ∈ {untrusted}` ⇒ 不做断言（`divergent` **不属于**此类，它是可断言的分歧） |
 
 ---
 
@@ -258,6 +292,8 @@ verdict 语义（**严格区分「不可证明」与「检测到问题」**）�
 9. **不解释见证端的裁剪/保留策略**：`missing_witness` 与见证端裁剪不可区分，二者都**不得**报为篡改（A8）。
 10. **不推断「从未推送」与「推送后被见证端丢弃」的区别**——二者在本地视图同形，输出 `missing_witness`，不细分。
 11. `go.mod` / `go.sum` 零改动；冻结包零 diff；不新增依赖。
+12. **[R40-3] 不做任何 re-dispatch（手动或自动），显式冻结为非目标。** 理由不是省略而是**排除**：`unanchored` 是终态（A5「不得追溯抹平」），而任何 re-dispatch 通道都会把「发布当时未被见证」变成「后来补上了锚定」——那正是 A5 要禁止的追溯抹平。补推能力的代价是**摧毁 `unanchored` 的证据价值**，因此不在 P40 内收窄一个最小手动触发，整体留待未来 Phase 显式解冻。
+13. **[R207 附注] reconcile 本地零副作用**：`POST .../anchor/reconcile` 只做内存计算，**不落盘、不写 audit、不发网络请求**（A6 已有「不发网络」，此处把「不落盘/不写 audit」一并冻结）。
 
 ---
 
@@ -269,7 +305,9 @@ verdict 语义（**严格区分「不可证明」与「检测到问题」**）�
 4. **「不可完整证明」≠「检测到不一致」**——`anchor_incomplete` 与 `anchor_broken` 必须分离，不得合并成单一「有问题」。
 5. **「没有该功能」≠「该功能失败」**——`anchor_absent`（未启用）与 `unanchored`（启用但未送达）不得混淆。
 6. **不可解析的本地 anchor 行 ⇒ fail-closed + 暴露 `anchor_error`**，绝不静默跳过或重建清洗（A3，直接沿用 P39/R205 教训）。
-7. **两轴分离**：`anchor_seq` 只用于传输空洞检测，**永不参与** predecessor / 发布关系裁决（沿用 P38/R200/R201）。
+7. **两轴分离**：`anchor_seq` 只用于传输空洞检测与证据窗口导出，**永不参与** predecessor / 发布关系裁决（沿用 P38/R200/R201）。
+8. **[R40-1] 「本地没有」必须先定性再断言**：窗口**外**的缺席与合法 prefix compaction 不可区分 ⇒ 不得断言（至多 `anchor_incomplete`）；只有窗口**内**的孤儿才允许 ⇒ `anchor_broken`。**不得为消除误报而阉割窗口内的孤儿判定**——那是本 Phase 的核心产出。
+9. **[R40-2] 分歧是证据，不是噪声**：身份证明一致（`stream_id` ∧ `key_id`）但共享 `publication_id` 上三元组无一匹配 ⇒ 必须输出**可断言**的 `divergent` ⇒ `anchor_broken`；**绝不**与「零重叠」「格式非法」合流为同一个静默 `untrusted`。
 
 ---
 
@@ -316,6 +354,9 @@ verdict 语义（**严格区分「不可证明」与「检测到问题」**）�
 | T140 | anchor 不改变 P35 status / P37 signature / P38 chain / P39 ledger 任何取值 |
 | T141 | `history_export_coverage.go` 零 diff |
 | T142 | 冻结包零 diff、`go.mod`/`go.sum` 零改动 |
+| T143 | **[R40-1]** 合法 prefix compaction 移除本地记录后的 witness-only id（seq 低于窗口下界）⇒ `witness_outside_window`，**不**判 broken；同一 fixture 下 seq 在窗口内的 witness-only id ⇒ `orphan_witness` ⇒ broken。**用例必须能区分两种情形** |
+| T144 | **[R40-2]** 共享 `publication_id` 但三元组无一匹配 ⇒ `witness_trust=divergent` + `anchor_broken` + `divergent_ids` 非空；与 `no_overlap` / `foreign_stream` 的 `untrusted`（列表为空）可判别 |
+| T145 | **[R207 建议，non-vacuousness]** §2.2 攻击复现红例：在 P39 面上重签并删档 ⇒ P35~P39 全绿；启用 P40 并持有见证序列后 ⇒ 被观测为 `anchor_broken` |
 
 ---
 
@@ -333,4 +374,18 @@ P40 锚定：把「发布曾经发生」投放到域外 ⇒ 使「本地缺失�
 
 - **不替代** P38/P39：删除留痕（P38）与持续可证明（P39）在**无密钥泄露**前提下依然成立；P40 只在「密钥/主机同域失守」这一更强前提下提供额外一层。
 - **不降级** P38/P39 的任何判据：逐跳双承诺、`verifiable_from` 边界、ledger 提交顺序全部原样保留。
-- **不触碰** P36：`indeterminate` 空洞在本 Phase 内**不升级**（§6.5）。P36 coverage 输出零变化。若 judge 认为「空洞 + orphan_witness 应当联动升级 P36 的 `indeterminate`」，请在裁决中明示——本 ADR 选择保守，把联动留给后续 Phase。
+- **不触碰** P36：`indeterminate` 空洞在本 Phase 内**不升级**（§6.5）。P36 coverage 输出零变化。**R207 裁决已确认维持保守**：orphan 信号在 anchor 维度已完整暴露（`orphan_witness_ids` + `anchor_broken`）；跨维语义演进若未来要做，走 R206 式显式确认，不在 P40 顺路携带。
+
+---
+
+## 12. R207=B 必修闭合表
+
+| 必修 | 修订落在 | 修订要点 |
+|---|---|---|
+| **R40-1** orphan_witness 与合法 compaction 同形 | §A8 行 4→6、**新增 §A10**、§5 结果模型、§7 第 8 条、§10 T143 | 引入**本地证据窗口**（幸存 `anchor_seq` 连续段）。窗口**内**孤儿 ⇒ `orphan_witness` ⇒ `anchor_broken`（核心产出未被阉割）；窗口**外**（seq 低于下界）⇒ `witness_outside_window`，**不判 broken**；高于上界 ⇒ `witness_ahead_of_window` ⇒ broken（prefix compaction 只裁最旧，尾部缺失不可能合法产生）。窗口不连续 ⇒ `window_discontinuous` ⇒ broken。结果**强制携带** `anchor_window{min_seq,max_seq,entries,continuous}`。 |
+| **R40-2** untrusted 三态合流吞掉主攻击信号 | §A1、**§A7 重写**、§5 结果模型、§7 第 9 条、§10 T144 | `witness_trust` 增第四态 **`divergent`**：身份证明一致 + 共享 id + 三元组无一匹配 ⇒ **可断言** ⇒ `anchor_broken` + `divergent_ids`。`untrusted` 按 `trust_reason` 细分为 `foreign_key_id` / `foreign_stream` / `no_overlap` / `malformed_sequence` / `no_local_window`。区分机制：**在 canonicalAnchorPayload 中加入两个派生身份字段** `key_id`（P37 派生）+ `stream_id`（`SHA-256(raw pub ‖ 0x00 ‖ abs_export_dir)[:8]`，**派生非配置**——可配置的 deployment identity 只是声明，攻击者可改写一致，不具区分能力）。对齐下界维持 ≥1 完全一致（裁决 2）。 |
+| **R40-3** A5 悬置未冻结 | §6 新增第 **12** 条 | 选**冻结为非目标**：不做任何手动/自动 re-dispatch。理由不是省略而是**排除**——任何补推通道都会把 `unanchored` 洗成 `anchored`，直接摧毁 A5 的终态语义与证据价值。 |
+
+**R207 附注处理**：§6 新增第 13 条，把 reconcile 的「不落盘 / 不写 audit / 不发网络」冻结为本地零副作用；A1 身份字段按 R40-2 已加 `key_id` + `stream_id`。
+
+**T145**（R207 建议，非强制）已采纳：§2.2 攻击复现作为 non-vacuousness 红例——P39 面全绿 ⇒ 加 P40 后被观测。
