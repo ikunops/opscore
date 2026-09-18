@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -73,6 +74,20 @@ type HistoryExportConfig struct {
 	// entries are dropped first, which only shrinks the verifiable range.
 	// 0 disables the cap (keep everything).
 	LedgerCapacity int
+	// AnchorEndpoint is the Phase 40 witness endpoint (http(s)://…, or
+	// file://<dir> for the offline dev witness). EMPTY = anchoring disabled:
+	// no anchor log is created, nothing is dispatched, and every Phase 40 field
+	// disappears from the read surface (ADR-053 I9 — default zero regression).
+	AnchorEndpoint string
+	// AnchorTimeout bounds one delivery attempt. <= 0 ⇒ 5s.
+	AnchorTimeout time.Duration
+	// AnchorMaxAttempts bounds the delivery attempts of one anchor_seq. Once
+	// exhausted the entry becomes `unanchored`, which is TERMINAL (re-dispatch
+	// is frozen out of scope). <= 0 ⇒ 8.
+	AnchorMaxAttempts int
+	// AnchorCapacity bounds `chain-anchor.jsonl` by whole `anchor_seq` groups.
+	// 0 disables the cap. An UNCONFIRMED group is never evicted to make room.
+	AnchorCapacity int
 }
 
 // HistoryExportStatus is the read-only scheduler state surfaced via
@@ -89,12 +104,20 @@ type HistoryExportStatus struct {
 	SignatureError        string     `json:"signature_error,omitempty"`         // Phase 37: signing failure (fail-closed, manifest not published)
 	ChainError            string     `json:"chain_error,omitempty"`             // Phase 38: chain extension refused (fail-closed)
 	LedgerError           string     `json:"ledger_error,omitempty"`            // Phase 39: ledger append/backfill problem (manifest stays published)
-	SigningEnabled        bool       `json:"signing_enabled"`                   // Phase 37: a signing key is configured
-	SignerKeyID           string     `json:"signer_key_id,omitempty"`           // Phase 37: derived (never configured) key id
-	TrustedKeys           int        `json:"trusted_keys"`                      // Phase 37: size of the independent trust anchor
-	SkipCount             int64      `json:"skip_count"`
-	Published             int64      `json:"published"`
-	Failed                int64      `json:"failed"`
+	// Phase 40: anchor_enabled / counts / error / window. All omitempty, so a
+	// disabled anchor leaves the read surface byte-identical to Phase 39.
+	AnchorEnabled    bool          `json:"anchor_enabled,omitempty"`
+	AnchoredCount    int           `json:"anchored_count,omitempty"`
+	PendingCount     int           `json:"pending_count,omitempty"`
+	UnanchoredCount  int           `json:"unanchored_count,omitempty"`
+	AnchorError      string        `json:"anchor_error,omitempty"`
+	AnchorWindow     *anchorWindow `json:"anchor_window,omitempty"`
+	SigningEnabled   bool          `json:"signing_enabled"`         // Phase 37: a signing key is configured
+	SignerKeyID      string        `json:"signer_key_id,omitempty"` // Phase 37: derived (never configured) key id
+	TrustedKeys      int           `json:"trusted_keys"`            // Phase 37: size of the independent trust anchor
+	SkipCount        int64         `json:"skip_count"`
+	Published        int64         `json:"published"`
+	Failed           int64         `json:"failed"`
 	Dir                   string     `json:"dir,omitempty"`
 	Interval              string     `json:"interval,omitempty"`
 	Formats               []string   `json:"formats,omitempty"`
@@ -117,6 +140,14 @@ type HistoryExportScheduler struct {
 	// trust anchor, loaded from an independent configuration source.
 	signer *exportSigner
 	trust  *exportTrustStore
+
+	// Phase 40: the witness transport (nil ⇒ anchoring disabled) and its limits.
+	anchorTransport   anchorTransport
+	anchorError       string
+	anchoredCount     int
+	pendingCount      int
+	unanchoredCount   int
+	anchorWindow      *anchorWindow
 
 	mu             sync.Mutex
 	started        bool
@@ -144,6 +175,12 @@ type HistoryExportScheduler struct {
 	// fully built and just before it is signed. It lets tests force a signing
 	// failure and prove the fail-closed path (T68). Production leaves it nil.
 	beforeManifestSign func(dir string)
+
+	// beforeAnchorDispatch is a TEST-ONLY hook (Phase 40) invoked at the exact
+	// moment an anchor record is handed to the witness. It exists to pin R40-6 /
+	// I10: at dispatch time the seq's `pending` line must ALREADY be durable,
+	// otherwise a crash could leave a confirmed witness with no local record.
+	beforeAnchorDispatch func(dir string, seq int64)
 }
 
 // NewHistoryExportScheduler validates the config and builds a scheduler
@@ -210,12 +247,30 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 	// fail-closed DEGRADED skip inside allocatePublicationID (M7), never a
 	// max-scan guess (R175 v8).
 	ensurePublicationState(cfg.Dir)
+
+	// Phase 40: the witness transport is built here so a malformed endpoint is a
+	// fail-fast CONFIGURATION error, never a runtime surprise. An empty endpoint
+	// yields a nil transport, which disables anchoring entirely (I9).
+	transport, terr := newAnchorTransport(cfg.AnchorEndpoint, cfg.AnchorTimeout)
+	if terr != nil {
+		return nil, fmt.Errorf("history export: %w", terr)
+	}
+	if transport != nil {
+		if signer == nil {
+			return nil, errors.New("history export: --export-anchor-endpoint is set but no --export-sign-key is configured — anchor records would be unsigned")
+		}
+		if cfg.AnchorCapacity < 0 {
+			return nil, fmt.Errorf("history export: anchor capacity %d is negative", cfg.AnchorCapacity)
+		}
+	}
+
 	return &HistoryExportScheduler{
-		cfg:    cfg,
-		clock:  clock,
-		logger: cfg.Logger,
-		signer: signer,
-		trust:  trust,
+		cfg:             cfg,
+		clock:           clock,
+		logger:          cfg.Logger,
+		signer:          signer,
+		trust:           trust,
+		anchorTransport: transport,
 	}, nil
 }
 
@@ -281,7 +336,7 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 		// tick attempted no formats, so both reset to zero.
 		s.published, s.failed = 0, 0
 		s.manifestError, s.pubStateError = "", ""
-		s.ledgerError = ""
+		s.ledgerError, s.anchorError = "", ""
 		s.mu.Unlock()
 		return
 	}
@@ -290,10 +345,15 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 		s.lastError = "durable history corrupt — skipped"
 		s.published, s.failed = 0, 0
 		s.manifestError, s.pubStateError = "", ""
-		s.ledgerError = ""
+		s.ledgerError, s.anchorError = "", ""
 		s.mu.Unlock()
 		return
 	}
+
+	// Phase 40: re-deliver the pending backlog BEFORE publishing, so a freshly
+	// created record is never dispatched twice in the same tick. `unanchored` is
+	// terminal and is never revived (ADR-052 §6-12).
+	s.anchorHousekeeping(ctx)
 
 	// Publish ALL formats of this tick under ONE shared snapshot base identity
 	// (R162/B). Collision retries advance one ordinal for the whole group;
@@ -301,6 +361,8 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 	// never masked as a full success (P34-I2). The Phase 35 manifest is
 	// published only after EVERY format succeeded (M1).
 	pubErrs, manifestErr, pubStateErr := s.publishSnapshot(res)
+
+	s.refreshAnchorStatus()
 
 	s.mu.Lock()
 	if pubStateErr != "" {
@@ -705,6 +767,15 @@ func (s *HistoryExportScheduler) publishManifest(res protection.TransitionReadRe
 			s.setLedgerError(rerr.Error())
 		}
 	}
+	// Phase 40: the anchor record is the FIFTH and last step — strictly after the
+	// atomic publish (the only success point) and the ledger append. A failure
+	// here can never roll back a published fact; it is surfaced as anchor_error
+	// and the backlog is retried on the next tick (ADR-053 I6).
+	if s.anchorEnabled() {
+		if aerr := s.recordAnchorEntry(&manifest, generatedAt); aerr != nil {
+			s.setAnchorError(aerr.Error())
+		}
+	}
 	return "", ""
 }
 
@@ -917,7 +988,13 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 		Interval:              s.cfg.Interval.String(),
 		Formats:               s.cfg.Formats,
 		Retain:                s.cfg.Retain,
-		SigningEnabled:        s.signer != nil,
+		SigningEnabled:   s.signer != nil,
+		AnchorEnabled:    s.anchorEnabled(),
+		AnchoredCount:    s.anchoredCount,
+		PendingCount:     s.pendingCount,
+		UnanchoredCount:  s.unanchoredCount,
+		AnchorError:      s.anchorError,
+		AnchorWindow:     s.anchorWindow,
 	}
 	if s.trust != nil {
 		st.TrustedKeys = len(s.trust.keys)

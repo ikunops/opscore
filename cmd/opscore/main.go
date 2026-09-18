@@ -470,6 +470,12 @@ func cmdServe(args []string) {
 	// Phase 39: the chain digest ledger is retained independently of snapshot
 	// retention, so a legal prune no longer breaks the chain proof.
 	exportLedgerCapacity := fs.Int("export-ledger-capacity", 4096, "max chain-ledger entries to retain (independent of --export-retain; 0 = keep all)")
+	// Phase 40 (publication anchoring): OPT-IN witness endpoint. Empty = the
+	// whole Phase is inert: no anchor log, no dispatch, no new output (I9).
+	exportAnchorEndpoint := fs.String("export-anchor-endpoint", "", "witness endpoint that receives anchor records (http(s)://... or file://<dir> for the offline dev witness; empty = anchoring disabled)")
+	exportAnchorTimeout := fs.Duration("export-anchor-timeout", 5*time.Second, "timeout of one anchor delivery attempt")
+	exportAnchorMaxAttempts := fs.Int("export-anchor-max-attempts", 8, "max delivery attempts per anchor_seq (exhausted = terminal unanchored; re-dispatch is out of scope)")
+	exportAnchorCapacity := fs.Int("export-anchor-capacity", 4096, "max anchor_seq groups to retain (a whole group is never partially dropped; an unconfirmed group is never evicted; 0 = keep all)")
 	fs.Parse(args)
 
 	logger := newLogger()
@@ -607,6 +613,11 @@ func cmdServe(args []string) {
 			SignKeyPath:    *exportSignKey,
 			TrustKeyPaths:  parseExportFormats(*exportTrustKeys),
 			LedgerCapacity: *exportLedgerCapacity,
+			// Phase 40: anchoring.
+			AnchorEndpoint:    *exportAnchorEndpoint,
+			AnchorTimeout:     *exportAnchorTimeout,
+			AnchorMaxAttempts: *exportAnchorMaxAttempts,
+			AnchorCapacity:    *exportAnchorCapacity,
 		})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)

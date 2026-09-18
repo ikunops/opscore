@@ -955,3 +955,65 @@ func (s *Server) handleHistoryExportCoverage(w http.ResponseWriter, r *http.Requ
 	}
 	writeJSON(w, http.StatusOK, res)
 }
+
+// handleHistoryExportAnchor (Phase 40) reports the LOCAL anchor state. With no
+// witness sequence supplied it makes NO reconciliation claim (ADR-052 T133):
+// `witness_trust` is `not_provided` and every witness list stays empty.
+func (s *Server) handleHistoryExportAnchor(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.historyScheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduled history export is disabled (configure --export-interval and --export-dir to enable)")
+		return
+	}
+	res, rerr := s.historyScheduler.ReconcileAnchor(nil)
+	if rerr != nil {
+		writeError(w, http.StatusInternalServerError, rerr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleHistoryExportAnchorReconcile (Phase 40) compares the local anchor log
+// with a caller-supplied witness sequence. It is ZERO-SIDE-EFFECT by contract
+// (ADR-052 §6-13 / I7): it writes nothing to disk, audits nothing, and opens no
+// network connection — so an auditor may call it as often as they like.
+func (s *Server) handleHistoryExportAnchorReconcile(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.historyScheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduled history export is disabled (configure --export-interval and --export-dir to enable)")
+		return
+	}
+	if r.Body != nil {
+		defer r.Body.Close()
+	}
+	var payload struct {
+		Sequence []witnessItem `json:"sequence"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<20))
+	if derr := dec.Decode(&payload); derr != nil && derr != io.EOF {
+		writeError(w, http.StatusBadRequest, "malformed request body")
+		return
+	}
+	res, rerr := s.historyScheduler.ReconcileAnchor(payload.Sequence)
+	if rerr != nil {
+		writeError(w, http.StatusInternalServerError, rerr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}

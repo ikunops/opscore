@@ -1650,6 +1650,9 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// consumes manifest declarations only — never hashes or repairs anything.
 	// Registered ONLY here (:8082), never :8080 (R21-1).
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/coverage", s.handleHistoryExportCoverage)
+	// Phase 40: anchoring surfaces. Both are admin-only and strictly read-only.
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/anchor", s.handleHistoryExportAnchor)
+	mux.HandleFunc("POST /management/v1/protection/alerts/history/export/anchor/reconcile", s.handleHistoryExportAnchorReconcile)
 	return mux
 }
 

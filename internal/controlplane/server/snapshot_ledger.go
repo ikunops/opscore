@@ -197,43 +197,19 @@ func loadLedgerState(dir string, trust *exportTrustStore) (*ledgerState, error) 
 	return ls, nil
 }
 
-// ledgerRawLine is one physical line of the ledger, preserved verbatim when it
-// cannot be parsed (exceptional evidence must never be silently discarded).
-type ledgerRawLine struct {
-	raw   string
-	entry *ledgerEntry // nil when the line is not parseable
-}
-
-func readLedgerRawLines(dir string) ([]ledgerRawLine, error) {
-	path := filepath.Join(dir, chainLedgerFile)
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
+// ledgerGroupOf is the classifier the ledger injects into the shared append-only
+// primitive (appendonly_log.go). It returns the line's group number, which for
+// the ledger is the publication id it carries: a publication id is logically
+// unique here (a duplicate with a different digest is a CONFLICT and is refused
+// before it can ever be written), so one group is exactly one line — the
+// "oldest whole lines" rule of R205 generalises to "oldest whole groups" with
+// identical behaviour.
+func ledgerGroupOf(raw []byte) (int64, bool) {
+	var e ledgerEntry
+	if err := json.Unmarshal(raw, &e); err != nil {
+		return 0, false
 	}
-	defer f.Close()
-	return scanLedgerRawLines(f)
-}
-
-func scanLedgerRawLines(r io.Reader) ([]ledgerRawLine, error) {
-	var out []ledgerRawLine
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		text := scanner.Text()
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
-		rl := ledgerRawLine{raw: strings.TrimSpace(text)}
-		var e ledgerEntry
-		if jerr := json.Unmarshal([]byte(rl.raw), &e); jerr == nil {
-			rl.entry = &e
-		}
-		out = append(out, rl)
-	}
-	return out, scanner.Err()
+	return e.PublicationID, true
 }
 
 // appendLedgerEntry adds one entry. Appending and capacity compaction are TWO
@@ -244,33 +220,39 @@ func scanLedgerRawLines(r io.Reader) ([]ledgerRawLine, error) {
 //     rebuilding a "clean" ledger around it — exceptional evidence must never
 //     disappear as a side effect of recording something new;
 //   - the only rewrite is an explicit, standalone PREFIX compaction that drops
-//     the oldest whole lines and preserves every surviving line verbatim.
+//     the oldest whole groups and preserves every surviving line verbatim.
+//
+// Persistence itself lives in the shared append-only primitive (Phase 40), so
+// the Phase 39 discipline and the Phase 40 discipline cannot drift apart.
 //
 //	same id + same digest     → idempotent no-op
 //	same id + different digest→ error (conflict; nothing is written)
 func appendLedgerEntry(dir string, capacity int, e ledgerEntry) error {
 	path := filepath.Join(dir, chainLedgerFile)
-	lines, err := readLedgerRawLines(dir)
+	lines, _, err := readLogLines(path, ledgerGroupOf)
 	if err != nil {
 		return err
 	}
-	unparseable := 0
+	unclassified := 0
 	for i := range lines {
-		rl := lines[i]
-		if rl.entry == nil {
-			unparseable++
+		if !lines[i].classified {
+			unclassified++
 			continue
 		}
-		if rl.entry.PublicationID != e.PublicationID {
+		if lines[i].group != e.PublicationID {
 			continue
 		}
-		if sameLedgerIdentity(*rl.entry, e) {
+		var prev ledgerEntry
+		if jerr := json.Unmarshal(lines[i].raw, &prev); jerr != nil {
+			return fmt.Errorf("ledger line for id %d is not readable: %w", e.PublicationID, jerr)
+		}
+		if sameLedgerIdentity(prev, e) {
 			return nil // idempotent
 		}
 		return fmt.Errorf("ledger conflict: publication_id %d already recorded with a different digest", e.PublicationID)
 	}
-	if unparseable > 0 {
-		return fmt.Errorf("ledger holds %d unparseable line(s); refusing to append — rewriting the file would silently discard that evidence", unparseable)
+	if unclassified > 0 {
+		return fmt.Errorf("ledger holds %d unclassifiable line(s); refusing to append — rewriting the file would silently discard that evidence", unclassified)
 	}
 
 	raw, merr := serializeLedgerEntryBytes(&e)
@@ -278,73 +260,11 @@ func appendLedgerEntry(dir string, capacity int, e ledgerEntry) error {
 		return merr
 	}
 	// TRUE append: nothing already on disk is rewritten.
-	f, oerr := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if oerr != nil {
-		return oerr
+	if aerr := appendLogLine(path, raw); aerr != nil {
+		return aerr
 	}
-	if _, werr := f.Write(raw); werr != nil {
-		f.Close()
-		return werr
-	}
-	if serr := f.Sync(); serr != nil {
-		f.Close()
-		return serr
-	}
-	if cerr := f.Close(); cerr != nil {
-		return cerr
-	}
-
 	if capacity > 0 {
-		return compactLedgerPrefix(path, capacity)
-	}
-	return nil
-}
-
-// compactLedgerPrefix drops only the OLDEST whole lines until at most `keep`
-// remain, preserving every surviving line byte-for-byte. It never reinterprets,
-// repairs, or reorders entries.
-func compactLedgerPrefix(path string, keep int) error {
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	lines, serr := scanLedgerRawLines(f)
-	f.Close()
-	if serr != nil {
-		return serr
-	}
-	if len(lines) <= keep {
-		return nil
-	}
-	kept := lines[len(lines)-keep:]
-
-	tmp := path + ".tmp"
-	out, oerr := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-	if oerr != nil {
-		return oerr
-	}
-	for _, l := range kept {
-		if _, werr := io.WriteString(out, l.raw+"\n"); werr != nil {
-			out.Close()
-			os.Remove(tmp)
-			return werr
-		}
-	}
-	if serr := out.Sync(); serr != nil {
-		out.Close()
-		os.Remove(tmp)
-		return serr
-	}
-	if cerr := out.Close(); cerr != nil {
-		os.Remove(tmp)
-		return cerr
-	}
-	if rerr := os.Rename(tmp, path); rerr != nil {
-		os.Remove(tmp)
-		return rerr
+		return compactLogPrefixGroups(path, capacity, ledgerGroupOf)
 	}
 	return nil
 }
