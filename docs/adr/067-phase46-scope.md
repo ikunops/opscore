@@ -18,7 +18,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 
 1. 五个家族全部向 witness 推送锚定条目——但推送的是 **P40 anchorRequest 投影**（`dispatchAnchorPath`，snapshot_anchor.go:948 → anchorRequest :648-661：`v/key_id/stream_id/publication_id/anchor_seq/anchor_digest/manifest_digest/prev_*/recorded_at/sig`），**不是完整 anchorEntry**（无 Kind、无家族字段）。dev witness 逐字追加投影（:714-724）。
 2. 投影中的 `anchor_digest` = sha256(完整签名 payload)——**与本地锚定日志中同 seq 条目的 digest 可比**；`anchor_seq` 即该家族锚定流自身的 seq（轴一致）；`key_id/stream_id` 可与本地派生值**精确比对**（R40-2 机制）。
-3. 投影中的 `sig` 覆盖完整 payload 但 payload 不在投影内 ⇒ **投影不可验签**（评审 BLOCKER-1）。因此对账不验签名——签名验证是 witness 收货时的职责（P40 A1），本地对账信任「witness 逐字回显 + 调用方传输」，调用方责任沿袭 P40 §7.3。
+3. 投影中的 `sig` 覆盖完整 payload 但 payload 不在投影内 ⇒ **投影不可验签**（评审 BLOCKER-1）。因此对账不验签名——P40 的验签职责从来在**本地 load**（snapshot_anchor.go:511+），dev witness 逐字保管不验签；deleted 场景本地已无文件，投影验签既不可能也从来不是 witness 的义务。本地对账信任「witness 逐字回显 + 调用方传输」，调用方责任沿袭 P40 §7.3
 4. 对账面只有 publication 家族（ReconcileAnchor :1281）；P39/P41/P42/P43/P45 五处「账本被删本地不可区分」无一实现域内断言。
 5. 五家族的启用开关是静态配置门；**禁用不删文件**（P45 T237：未启用不建文件；全包无删除主账本的流程）——这是 deleted 判据健全性的承重前提（评审 MAJOR-3，本 ADR 首次显式声明并冻结）。
 
@@ -37,7 +37,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | `family_divergent` | 窗口内同 seq：投影 anchor_digest ≠ 本地条目 digest | 内容分歧（与本地全量条目比对——本地持有全文，无需投影可验签） |
 | `family_incomplete` / `family_intact` / `family_unverifiable` | witness 缺失部分本地条目（never broken）/ 全对齐 / 身份不符（异 stream/key） | |
 
-**对五个已知代价的兑现**：P39（ledger）/P41（lifecycle）/P42（verification）/P43（destruction）/P45（acceptance）的「域外可检测」各获得一个可断言 verdict。publication 家族**不在本 Phase**（P40 已有对账，且避免双 face 语义冲突，评审 MINOR-3）。
+**对五个已知代价的兑现**：P39（ledger）/P41（lifecycle）/P42（verification）/P43（destruction）/P45（acceptance）的「域外可检测」各获得一个可断言 verdict。publication 家族**的对账 FACE 不变**（P40 语义/响应零改动），但 `ledger` 家族**保留在本 Phase**——它的锚定流就是 chain-anchor.jsonl（同一链流）：P40 在其上表达「对齐性」断言（对齐门/ahead-of-window ⇒ broken），P46 在同一流上表达 P40 **无法表达**的「存在性/上界」断言（identity 门/deleted+truncated）。两面回答不同问题、信任门不同（P40 §2.2 私钥层级 vs P46 §7.3 调用方层级），分歧边界枚举：零共享 id 态下 P40=unverifiable 而 P46 可判 truncated/deleted——**不矛盾**（可断言域不同），两 face 并存各自成立（评审 MINOR-3 诚实闭合）。
 
 ## 4. 能力定义（A1~A8）
 
@@ -47,7 +47,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 - **A4 三段式窗口（对家族锚定日志，anchor_seq 轴）**：投影 seq < 本地窗口下界 ⇒ outside（合法裁剪与删除不可区分，**不断言、无宽免层**——评审 BLOCKER-2：原宽免设计三重不可行，废除）；∈ 窗口 ⇒ digest 对比本地条目；**> 上界 ⇒ `family_ledger_truncated`**。
 - **A5 缺席矩阵（评审 MAJOR-2 修正）**：主账本缺席 ∧ 锚定缺席 ⇒ deleted；主账本缺席 ∧ 锚定在 ⇒ incomplete；主账本在 ∧ 锚定缺席 ⇒ incomplete（A5 原则：锚定日志被删与从未锚定不可区分）；都在 ⇒ 窗口对比。
 - **A6 正交与零回归**：P40 路由/响应零改动；五家族判据取值零变化；`snapshot_anchor.go` 零 diff（投影解析是新面自己的事）；GET 本地面输出各家族存在性/窗口 + not_enabled；POST 无启用门但 deleted 判定内建「文件在 ⇒ 非 deleted」⇒ 两面词汇统一（评审 MAJOR-3 修正：同一家族两面结论不可能分歧——deleted 需要双双缺席，而「文件在」时 POST 也判不出 deleted）。
-- **A7 非目标**：①不做 witness 拉取；②不厂商化；③**不对投影做签名验证**（不可实现——评审 BLOCKER-1；签名验证是 witness 收货职责，本地对账信任回显 + §7.3 调用方责任）；④不动 P40 publication 对账；⑤不做跨部署对账；⑥对账零副作用；⑦**禁止各家族禁用时清理主账本文件**（承重前提冻结）；⑧不新增常驻组件；⑨不做「原地清空重建」的合法性区分（同目录同钥重建 ⇒ stream_id 不变 ⇒ 会判 deleted——机器无法区分制裁性重置与删除，A8 声明）。
+- **A7 非目标**：①不做 witness 拉取；②不厂商化；③**不对投影做签名验证**（不可实现——评审 BLOCKER-1；P40 验签职责在本地 load，deleted 场景本地已无文件；对账信任回显 + §7.3 调用方责任）；④不动 P40 publication 对账；⑤不做跨部署对账；⑥对账零副作用；⑦**禁止各家族禁用时清理主账本文件**（承重前提冻结）；⑧不新增常驻组件；⑨不做「原地清空重建」的合法性区分（同目录同钥重建 ⇒ stream_id 不变 ⇒ 会判 deleted——机器无法区分制裁性重置与删除，A8 声明）。
 - **A8 已知代价**：①**伪造层级 = P40 §7.3 调用方责任**：对账体可被任何能拿到 admin 面的人伪造（投影无需私钥即可构造）——栽赃 deleted/truncated 与掩盖分歧都可行；witness 收货时的验签（P40 A1）+ 调用方传输责任是仅有的防线。②合法「清空重建」（同目录同钥）⇒ 误报 deleted（A7-9）。③witness 保留策略不可知 ⇒ 缺失恒 incomplete。④下界外（seq < 窗口下界）的删除永不可断言（R40-1）。⑤信任锚不可用 ⇒ 身份比对失败 ⇒ 全家族 unverifiable（响亮）。
 
 ## 5. 测试契约（T258~T273）
@@ -84,4 +84,4 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | MAJOR-1 坏条目跳过 | A2 毒化语义（整家族 unverifiable） |
 | MAJOR-2 缺席矩阵漏支 | A5 四象限完整（T266 判别） |
 | MAJOR-3 禁用/被删前提 | §2 事实 5 + A3 承重前提冻结 + A7-7 非目标 + T269 判别；GET/POST 词汇统一（T273）；A8-2 清空重建代价 |
-| MINOR-1~3 / NOTE | §6-13 出处改 ADR-052；验链承诺撤回（投影无链字段——链验证是 witness 收货职责）；publication 双 face 冲突由「P46 不含 publication」消除；注册表按投影现实重写（ADR-068 §2）；T258/T270 分工明确（T258=字节冻结，T270=下界纪律）；4MiB 体量预算写入 ADR-068 §4 |
+| MINOR-1~3 / NOTE | §6-13 错引删除（T268/I5 无引用，效果达成）；验链承诺撤回（投影无链字段——链验证职责在本地 load，本就不可能由对账体承载）；ledger 家族双 face 分歧显式枚举（非排除式消除，见 §3 修正）；注册表按投影现实重写（ADR-068 §2）；T258/T270 分工明确（T258=字节冻结，T270=下界纪律）；4MiB 体量预算写入 ADR-068 §8 |

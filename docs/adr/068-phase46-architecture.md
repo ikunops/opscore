@@ -67,7 +67,7 @@ reconcileFamily(f, items):            // items = witness 回显投影（anchorRe
 
 - `POST .../export/witness-reconcile`：零副作用（不落盘/不写 audit/不发网络，T268）；body 上限 4MiB（沿用既有 reconcile 面预算——五家族投影 ~200B/条 ⇒ 4MiB ≈ 每家族 ~4000 条，覆盖默认 capacity；超限 ⇒ 400）。
 - `GET .../export/witness-reconcile`：本地五家族存在性/窗口/not_enabled 探针。
-- 响应 aggregate：`{families: {...}, }`，每家族 `{verdict, witness_entries, identity_ok, outside_count, divergent_seqs[], truncated_ranges[], missing_count, error?}`。
+- 响应 aggregate：`{families: {...}, }`，每家族 `{verdict, witness_entries, identity_ok, outside_count, divergent_seqs[], truncated_ranges[], missing_count, error?}。
 - **两面词汇统一**（评审 MAJOR-3）：deleted 判定内建「文件在 ⇒ 非 deleted」，GET/POST 对同一文件状态不可能给出分歧结论（T273）。
 
 ## 5. 不变量（I1~I10）
@@ -81,7 +81,7 @@ reconcileFamily(f, items):            // items = witness 回显投影（anchorRe
 | I5 | 对账零副作用 |
 | I6 | 「禁用不删文件」承重前提冻结（A7-7 非目标）；GET/POST 词汇统一 |
 | I7 | 家族间隔离 |
-| I8 | 身份 = 本地派生 key_id/streamID（R40-2）；**零签名验证**（投影不可验签——witness 收货职责，§7.3 调用方责任；评审 BLOCKER-1 闭合的代价声明） |
+| I8 | 身份 = 本地派生 key_id/streamID（R40-2）；**零签名验证**（投影不可验签——P40 验签职责在本地 load，deleted 场景本地已无文件；§7.3 调用方责任；评审 BLOCKER-1 闭合的代价声明） |
 | I9 | 冻结面零 diff；go.mod/go.sum 零改动；零回归 |
 | I10 | 对账顺序：先本地探针、后窗口对比（与 P45 I10 同族的承重顺序；投影分组为调用方声明——§7.3） |
 
