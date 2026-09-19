@@ -1653,6 +1653,12 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// Phase 40: anchoring surfaces. Both are admin-only and strictly read-only.
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/anchor", s.handleHistoryExportAnchor)
 	mux.HandleFunc("POST /management/v1/protection/alerts/history/export/anchor/reconcile", s.handleHistoryExportAnchorReconcile)
+	// Phase 42: verification attestation (WHETHER a verification ever happened).
+	// GET = the derived read-only view, POST = record one attestation now. The
+	// namespace follows the surface being EXTENDED (the export face), not the
+	// Phase that introduced it (R214 ruling 1).
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/verification", s.handleHistoryExportVerification)
+	mux.HandleFunc("POST /management/v1/protection/alerts/history/export/verification", s.handleHistoryExportVerification)
 	// Phase 41: signing-key lifecycle (time-bounded trust). GET = state,
 	// POST = append one lifecycle fact.
 	mux.HandleFunc("GET /management/v1/protection/export/key-lifecycle", s.handleHistoryExportKeyLifecycle)

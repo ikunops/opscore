@@ -100,6 +100,17 @@ type HistoryExportConfig struct {
 	// groups. 0 disables the cap. Bounds are lost from the OLDEST side, which
 	// can only remove an interval's evidence — never invent one.
 	KeyLifecycleCapacity int
+	// VerifyAttest (Phase 42) turns verification attestation on. FALSE by
+	// default: nothing is written, no new file appears and the new routes
+	// answer 503 (default zero regression, ADR-058 §1).
+	VerifyAttest bool
+	// VerifyInterval is the periodic attestation interval. 0 disables the
+	// timer entirely (no goroutine, no writes) — Q3's ruling, and the same
+	// opt-in discipline P34 uses.
+	VerifyInterval time.Duration
+	// VerifyCapacity bounds `verification-log.jsonl` by whole `report_seq`
+	// groups. 0 disables the cap.
+	VerifyCapacity int
 }
 
 // HistoryExportStatus is the read-only scheduler state surfaced via
@@ -127,6 +138,9 @@ type HistoryExportStatus struct {
 	// Phase 41: key lifecycle roll-up. nil (and therefore absent) unless a key
 	// authority trust anchor is configured.
 	KeyLifecycle   *keyLifecycleStatusSummary `json:"key_lifecycle,omitempty"`
+	// Phase 42: verification attestation roll-up. nil (and therefore absent)
+	// unless attestation is enabled.
+	Verification *verificationStatusSummary `json:"verification,omitempty"`
 	SigningEnabled bool                       `json:"signing_enabled"`         // Phase 37: a signing key is configured
 	SignerKeyID    string                     `json:"signer_key_id,omitempty"` // Phase 37: derived (never configured) key id
 	TrustedKeys    int                        `json:"trusted_keys"`            // Phase 37: size of the independent trust anchor
@@ -170,8 +184,14 @@ type HistoryExportScheduler struct {
 	keyAuthority      *keyAuthority
 	keyLifecycleError string
 
+	// Phase 42: verification attestation. The log is never cached — it is
+	// re-read on every evaluation, so a report recorded by another process is
+	// honoured immediately (the R41-6 discipline, inherited).
+	verificationError string
+
 	mu             sync.Mutex
 	started        bool
+	verifyRunning  bool // an attestation is currently in flight (non-reentrant)
 	running        bool // a tick is currently active (non-reentrant guard, P34-I1)
 	lastRunAt      time.Time
 	lastExportedAt time.Time
@@ -202,6 +222,12 @@ type HistoryExportScheduler struct {
 	// I10: at dispatch time the seq's `pending` line must ALREADY be durable,
 	// otherwise a crash could leave a confirmed witness with no local record.
 	beforeAnchorDispatch func(dir string, seq int64)
+
+	// beforeVerificationAppend is a TEST-ONLY hook (Phase 42) invoked just
+	// before a verification report is appended, with the seq it is about to
+	// consume. It pins the ordering "the log is durable before the anchor is
+	// dispatched" (ADR-058 §4.1) and the fail-closed refusals.
+	beforeVerificationAppend func(dir string, seq int64)
 }
 
 // NewHistoryExportScheduler validates the config and builds a scheduler
@@ -317,6 +343,28 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		return nil, fmt.Errorf("history export: key lifecycle capacity %d is negative", cfg.KeyLifecycleCapacity)
 	}
 
+	// Phase 42: verification attestation. Three fail-fast guards, all the same
+	// shape as Phase 37's "a signer the verifier cannot resolve is refused":
+	//   - an UNSIGNED report is indistinguishable from one forged afterwards,
+	//     so attesting without a signing key is not evidence at all (T79b / P41
+	//     I1 are the two earlier instances of this rule);
+	//   - likewise a report nobody can verify;
+	//   - an interval with attestation switched off is a self-contradiction.
+	if cfg.VerifyAttest {
+		if signer == nil {
+			return nil, errors.New("history export: --export-verify-attest is set but no --export-sign-key is configured — an unsigned verification report is indistinguishable from a forged one")
+		}
+		if trust == nil || len(trust.keys) == 0 {
+			return nil, errors.New("history export: --export-verify-attest is set but no --export-trust-keys is configured — the verification log could never be verified")
+		}
+	}
+	if cfg.VerifyInterval > 0 && !cfg.VerifyAttest {
+		return nil, errors.New("history export: --export-verify-interval is set but --export-verify-attest is not — enable attestation or drop the interval")
+	}
+	if cfg.VerifyCapacity < 0 {
+		return nil, fmt.Errorf("history export: verification capacity %d is negative", cfg.VerifyCapacity)
+	}
+
 	return &HistoryExportScheduler{
 		cfg:             cfg,
 		clock:           clock,
@@ -425,6 +473,11 @@ func (s *HistoryExportScheduler) Start(parent context.Context) {
 	s.mu.Unlock()
 
 	go s.run(parent)
+	// Phase 42: the attestation timer exists ONLY when it was asked for. A zero
+	// interval starts no goroutine and writes nothing (T194).
+	if s.cfg.VerifyAttest && s.cfg.VerifyInterval > 0 {
+		go s.runVerify(parent)
+	}
 }
 
 func (s *HistoryExportScheduler) run(parent context.Context) {
@@ -1136,6 +1189,14 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 	// the status document stays byte-identical to Phase 40 (ADR-055 §10).
 	if kl := keyLifecycleSummary(s.keyLifecycleConfig()); kl.Enabled {
 		st.KeyLifecycle = &kl
+	}
+	// Phase 42: likewise omitted unless attestation is enabled, so a default
+	// deployment's status document is byte-identical to Phase 41.
+	if vs := verificationSummary(s.verificationConfig()); vs.Enabled {
+		st.Verification = &vs
+		if vs.Error == "" && s.verificationError != "" {
+			st.Verification.Error = s.verificationError
+		}
 	}
 	if s.trust != nil {
 		st.TrustedKeys = len(s.trust.keys)

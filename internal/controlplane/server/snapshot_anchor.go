@@ -45,11 +45,18 @@ const chainAnchorFile = "chain-anchor.jsonl"
 // as the same group (ADR-055 §9).
 const keyLifecycleAnchorFile = "key-lifecycle-anchor.jsonl"
 
+// verificationAnchorFile (Phase 42) is the THIRD anchor record stream.
+const verificationAnchorFile = "verification-anchor.jsonl"
+
 // anchorKind values. The empty kind is the Phase 40 publication family, so
 // every byte ever written by Phase 40 stays identical.
 const (
 	anchorKindPublication  = ""
 	anchorKindKeyLifecycle = "key_lifecycle"
+	// anchorKindVerification (Phase 42) is the THIRD family: verification
+	// reports. Every field it uses is omitempty, so the two earlier families
+	// keep serializing byte-for-byte as they always have (ADR-058 §6.1 / T196b).
+	anchorKindVerification = "verification"
 )
 
 // Delivery states of one anchor_seq. Only `anchored` is a CONFIRMED state —
@@ -90,6 +97,12 @@ type anchorEntry struct {
 	EventType   string `json:"event_type,omitempty"`
 	NotAfter    string `json:"not_after,omitempty"`
 
+	// Phase 42 (the third anchor family). All omitempty, so the Phase 40 and
+	// Phase 41 entries stay byte-identical (ADR-058 §6.1 / T196b).
+	ReportSeq    int64  `json:"report_seq,omitempty"`    // verification report identity
+	ReportDigest string `json:"report_digest,omitempty"` // sha256(canonical report payload)
+	Overall      string `json:"overall,omitempty"`       // attested|unattested|contradicted
+
 	// ---- delivery state: mutable, never signed ----
 	State      string `json:"state"`
 	Attempts   int    `json:"attempts"`
@@ -116,6 +129,10 @@ type anchorSigned struct {
 	EventDigest string `json:"event_digest,omitempty"`
 	EventType   string `json:"event_type,omitempty"`
 	NotAfter    string `json:"not_after,omitempty"`
+	// Phase 42 — omitempty keeps BOTH earlier payloads byte-identical.
+	ReportSeq    int64  `json:"report_seq,omitempty"`
+	ReportDigest string `json:"report_digest,omitempty"`
+	Overall      string `json:"overall,omitempty"`
 }
 
 func anchorSignedFields(e *anchorEntry) anchorSigned {
@@ -133,6 +150,9 @@ func anchorSignedFields(e *anchorEntry) anchorSigned {
 		EventDigest:        e.EventDigest,
 		EventType:          e.EventType,
 		NotAfter:           e.NotAfter,
+		ReportSeq:          e.ReportSeq,
+		ReportDigest:       e.ReportDigest,
+		Overall:            e.Overall,
 	}
 }
 
@@ -934,6 +954,13 @@ func (s *HistoryExportScheduler) dispatchAnchorPath(ctx context.Context, path st
 // ---------------------------------------------------------------------------
 
 func keyLifecycleAnchorPath(dir string) string { return filepath.Join(dir, keyLifecycleAnchorFile) }
+
+// verificationAnchorPath (Phase 42) is the third anchor stream. The three
+// families are kept in separate files because their sequence spaces are
+// independent: the shared group classifier keys on `anchor_seq` alone, so one
+// file holding two families would let a compaction drop a group across the
+// families (ADR-055 §9, instantiated for the third time).
+func verificationAnchorPath(dir string) string { return filepath.Join(dir, verificationAnchorFile) }
 
 // anchorKeyLifecycleEvent records and dispatches the anchor of one lifecycle
 // event. The pending line is durable BEFORE the witness is contacted (R40-6).

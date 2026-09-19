@@ -482,6 +482,12 @@ func cmdServe(args []string) {
 	exportKeyAuthority := fs.String("export-key-authority", "", "Ed25519 PRIVATE key of the key authority (KAK) that signs signing-key lifecycle events; must differ from --export-sign-key (empty = the lifecycle ledger cannot be written)")
 	exportKeyAuthorityTrust := fs.String("export-key-authority-trust", "", "comma-separated trusted Ed25519 PUBLIC keys of the key authority, used to verify the signing-key lifecycle ledger (empty = the ledger cannot be verified, so every key stays unbounded)")
 	exportKeyLifecycleCapacity := fs.Int("export-key-lifecycle-capacity", 4096, "max signing-key lifecycle event groups to retain (oldest whole groups first; a lost bound only ever removes an interval's evidence, 0 = keep all)")
+	// Phase 42 (verification attestation): OPT-IN and OFF by default. It makes
+	// "was this ever verified?" an assertable fact instead of a silence that is
+	// indistinguishable from "everything is fine".
+	exportVerifyAttest := fs.Bool("export-verify-attest", false, "record signed verification reports (verification-log.jsonl) so 'never verified' becomes assertable instead of silent (requires --export-sign-key and --export-trust-keys)")
+	exportVerifyInterval := fs.Duration("export-verify-interval", 0, "interval of the periodic verification attestation (0 = only on demand; requires --export-verify-attest)")
+	exportVerifyCapacity := fs.Int("export-verify-capacity", 4096, "max verification report groups to retain (oldest whole groups first; compaction only ever lifts the assertion boundary, it never invents one, 0 = keep all)")
 	fs.Parse(args)
 
 	logger := newLogger()
@@ -628,6 +634,10 @@ func cmdServe(args []string) {
 			KeyAuthorityPath:       *exportKeyAuthority,
 			KeyAuthorityTrustPaths: parseExportFormats(*exportKeyAuthorityTrust),
 			KeyLifecycleCapacity:   *exportKeyLifecycleCapacity,
+			// Phase 42: verification attestation.
+			VerifyAttest:   *exportVerifyAttest,
+			VerifyInterval: *exportVerifyInterval,
+			VerifyCapacity: *exportVerifyCapacity,
 		})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)
