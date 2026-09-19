@@ -11,9 +11,9 @@
 | 文件 | 变更 | 内容 |
 |---|---|---|
 | `internal/controlplane/server/snapshot_acceptance.go` | **新增** | 条目模型 / KAK 签发与验证 / 持久化（共享原语）/ 对账算法 / 视图 / HTTP 面 |
-| `internal/controlplane/server/snapshot_acceptance_test.go` | **新增** | T236~T252 |
+| `internal/controlplane/server/snapshot_acceptance_test.go` | **新增** | T237~T257 |
 | `internal/controlplane/server/file_transition_store.go` | **修改** | Append 钩子（s.mu 内、Sync 后）：digest 捕获 + 接受条目追加；构造期注入 recorder |
-| `internal/protection/alerting.go` | **修改（仅 additive）** | `TransitionLoadResult`/`TransitionReadResult` 增 `Seqs []int64`（与 Transitions 平行，omitempty）；三处读投影填充 |
+| `internal/protection/alerting.go` | **修改（仅 additive）** | `TransitionLoadResult`（= ReadResult alias）增 `Seqs []int64`（与 Transitions 平行，omitempty）；只此一处 |
 | `internal/controlplane/server/history_export_scheduler.go` | **修改** | acceptance 配置字段 / 构造守卫 G1~G3 / 对账接线 / 状态面字段 |
 | `internal/controlplane/server/snapshot_anchor.go` | **修改（仅加法）** | 第五流 `acceptance-anchor.jsonl`：`anchorKindAcceptance` + 3 个 omitempty 字段 + `anchorAcceptanceEntry`（模式照抄 `anchorDestructionEntry`，**nil observer**） |
 | `internal/controlplane/server/snapshot_destruction.go` | **修改（仅常量）** | `destructionKindAcceptanceCompaction` |
@@ -30,7 +30,7 @@ type acceptanceEntry struct {
     V               int    `json:"v"` // 1
     EntrySeq        int64  `json:"entry_seq"`
     RecordSeq       int64  `json:"record_seq"`
-    RecordDigest    string `json:"record_digest"` // sha256(durable 行字节，含行尾前内容；不含换行)
+    RecordDigest    string `json:"record_digest"` // sha256(canonical durable 行字节：json.Marshal(newPersisted(seq,t)))
     RecordedAt      string `json:"recorded_at"`   // RFC3339Nano, store 时钟（P34-CLOCK-1 同源纪律）
     AuthorityKeyID  string `json:"authority_key_id"`
     PrevEntryDigest string `json:"prev_entry_digest,omitempty"` // 首行豁免（I3）
@@ -50,7 +50,7 @@ type acceptanceEntry struct {
 
 ## 3. 写路径接入（file_transition_store.go）
 
-Append 现有临界区 `s.mu` 内、`f.Sync()` 成功与水位推进之后（P32-I15 点）：
+Append 现有临界区 `s.mu` 内、`f.Sync()` 成功与水位推进之后（P32-I15 点，file_transition_store.go:462-470）：
 
 ```go
 if s.acceptance != nil {
@@ -64,7 +64,8 @@ if s.acceptance != nil {
 - **record-first**（ADR-065 A3）：崩溃窗 ⇒ record_unaccepted 响亮。
 - `record(seq, line, clock)` 内部：`entry_seq` 由账本自身 max+1 导出（**无水位文件**，R41-6 纪律）、KAK 签名、`appendLogLine`。自有互斥 `acceptanceMu`（并发域 = store.Append 持 s.mu 单写者 + compaction；锁序 **s.mu → acceptanceMu → destructionWriteMu → destructionDispatchMu**，与 P43/P44 既有锁序图合并后必须无环）。
 - **锁内无 witness I/O**（P43 N1/N2）：锚定派发收集后置——`record()` 只收集 pending，由 scheduler tick 尾部 `dispatchAcceptancePending()` 统一派发（dispatchMu 内）。
-- `acceptanceErr` 暴露于状态面（`input_error`）。
+- `acceptanceErr` 暴露于状态面（`input_error`）；**失败不补记**（补记弱化接受时语义），粘滞至下一次成功追加。
+- 账本路径 = export dir 同域（与 chain-ledger/chain-anchor/verification-log 一致）。
 - **compaction**：账本按 `entry_seq` 组级 prefix compaction，观察者 = `destructionObserver(kind=acceptance_compaction)`（销毁账本记账——它是证据销毁）；**acceptance-anchor 流自身 compaction 不被观察**（I5，nil observer，P43 既有无环结构）。
 - 容量满 ⇒ 拒绝新条目入账（Append 仍成功——记录已持久；该记录将 `record_unaccepted` + `input_error` 响亮）——**绝不**裁最旧组腾位（A5/家族纪律：丢最旧 = 洗掉接受证据）。
 
@@ -78,7 +79,7 @@ if s.acceptance != nil {
 Seqs []int64
 ```
 
-`FileBackedTransitionStore` 四个读投影从 `persistedTransition.Seq` 填充。**零格式变更、零语义变更**（既有消费方忽略新字段）。
+`FileBackedTransitionStore` 的 **ReadAll** 投影从 `persistedTransition.Seq` 填充（Load/ReadRecent 留 nil——对账仅消费 ReadAll）。**零格式变更、零语义变更**（既有消费方忽略新字段）。
 
 ## 5. 对账算法（`InputIntegrityView`）
 
@@ -87,6 +88,9 @@ input_integrity(c):
   if 未启用:              return {verdict: input_absent}          // 503 面
   load 接受账本（fail-closed：坏行/链断/签名不过 ⇒ input_unverifiable + input_error）
 
+  if snapshot.LoadErr != nil || snapshot.Corrupt:
+                            return {verdict: input_unverifiable, input_error}   // 绝不 input_ok 假绿
+  if 账本文件缺失/空:        return {verdict: input_absent}                      // 与「从未接受」同形，诚实
   snapshot := store.ReadAll()                              // 含 Seqs
   ledger  := map[record_seq → record_digest]（窗口 [min_entry, max_entry]，continuous）
   coverage_floor := 首条目 record_seq − 1
@@ -98,9 +102,10 @@ input_integrity(c):
         digest 不等  → record_modified（可断言）       ★核心产出
       ledger 无      → seq < coverage_floor → outside_coverage（启用前，不断言）
                        else                  → record_unaccepted（响亮）
-  for each ledger 条目 seq ∈ [snapshot.MinSeq, snapshot.MaxSeq] 且快照缺失:
-      → record_missing_in_span（可断言删除）
-  ledger 条目 seq < snapshot.MinSeq → outside_span（不断言，R40-1 纪律）
+  for each ledger 条目 seq:
+      seq ∈ [MinSeq, MaxSeq] 且快照缺失 → record_missing_in_span（可断言删除）
+      seq > MaxSeq                     → record_missing_in_span（可断言——上界无合法逐出）
+      seq < MinSeq                     → outside_span（不断言，R40-1 纪律）
 
   verdict = modified|missing 存在 ⇒ input_modified
             unaccepted 存在     ⇒ input_incomplete
@@ -137,4 +142,4 @@ input_integrity(c):
 
 ## 8. 测试映射
 
-ADR-065 §5 T236~T252 ↔ 本 ADR：T237→§3 钩子；T238→§5 字节重建+I2；T239/T240/T249→§5 span 纪律+I8；T241→I1；T242/T243→I2/I3；T244→I5；T247→I6；T248→I6；T250→I8。
+ADR-065 §5 T237~T257 ↔ 本 ADR：T238→§3 钩子；T239→§5 字节重建+I2 反向守卫；T240/T241/T250/T254→§5 span 纪律（含上界）+I8；T242→I1；T243/T244→I2/I3；T245→I5；T248→I6；T249→I6；T255→§5 corrupt 分支；T256→I7；T257→I4+I2；T251→I8。
