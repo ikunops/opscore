@@ -599,6 +599,7 @@ func appendDestructionEntryLocked(c destructionConfig, e *destructionEntry, at t
 	groupLines := map[int64]int{}
 	groupPayload := map[int64]destructionEntry{}
 	groupState := map[int64]string{}
+	groupLastLd := map[int64]string{}
 	for i := range lines {
 		var p destructionEntry
 		if jerr := json.Unmarshal(lines[i].raw, &p); jerr != nil {
@@ -624,6 +625,7 @@ func appendDestructionEntryLocked(c destructionConfig, e *destructionEntry, at t
 			return fmt.Errorf("destruction: refusing to append — destruction_seq %d breaks the line chain", p.DestructionSeq)
 		}
 		prevLine = ld
+		groupLastLd[p.DestructionSeq] = ld
 		groupLines[p.DestructionSeq]++
 		if groupLines[p.DestructionSeq] == 1 {
 			groupPayload[p.DestructionSeq] = p
@@ -678,6 +680,23 @@ func appendDestructionEntryLocked(c destructionConfig, e *destructionEntry, at t
 		base := groupPayload[e.DestructionSeq]
 		if !destructionPayloadEqual(base, *e) {
 			return fmt.Errorf("destruction: refusing to append — destruction_seq %d payload differs from its intended line", e.DestructionSeq)
+		}
+		// R43-9 (review round 3, N8): an advance is legal ONLY while the group
+		// is still the CHAIN TAIL. Two operations may hold groups open at once
+		// (Tick prune across os.Remove, a verifyTick compaction, an HTTP
+		// lifecycle event); if this group's incoming pointer is no longer the
+		// last physical line's digest, appending the advance here would be
+		// NON-ADJACENT and would read as a chain break — a false
+		// destruction_chain_broken with no tampering, permanent phase death.
+		// Refusing leaves the group `intended` ⇒ loud destruction_unconfirmed
+		// (ADR-consistent: no auto-advance, no false close), and the log and
+		// every other group stay healthy.
+		// Adjacency: the group's INTENT line must still be the chain tail. The
+		// advance line reuses the group's incoming pointer (I9), so appending it
+		// after any later line would place it non-adjacently and read as a
+		// chain break.
+		if prevLine != groupLastLd[e.DestructionSeq] {
+			return fmt.Errorf("destruction: refusing to advance destruction_seq %d — the group is no longer the chain tail (another destruction opened after it); it stays intended and will surface as destruction_unconfirmed", e.DestructionSeq)
 		}
 		// The group's incoming pointer is part of the payload, so the advance
 		// must carry the SAME one — that is what keeps the payloads identical
@@ -811,13 +830,24 @@ func completeDestructionLocked(c destructionConfig, seq int64, state string, at 
 	return nil
 }
 
+// destructionDispatchMu serializes the post-unlock anchor dispatches (review
+// round 3, N9): Tick, verifyTick and the HTTP face can dispatch concurrently,
+// and two interleaved nextAnchorSeqPath + append sequences on
+// destruction-anchor.jsonl would fork that witness stream. Deliberately a
+// DIFFERENT mutex from destructionWriteMu — the dispatch may re-enter the
+// write path through compaction observers, so a shared lock would deadlock.
+// Lock ordering is always dispatchMu → writeMu, never the reverse.
+var destructionDispatchMu sync.Mutex
+
 // dispatchDestructionPending runs the anchor hook for every durably appended
 // terminal record. I6-safe by contract: the hook logs its own failures and
 // never blocks. Called OUTSIDE the write mutex only.
 func dispatchDestructionPending(c destructionConfig, pending []destructionEntry) {
-	if c.anchorDispatch == nil {
+	if c.anchorDispatch == nil || len(pending) == 0 {
 		return
 	}
+	destructionDispatchMu.Lock()
+	defer destructionDispatchMu.Unlock()
 	for _, e := range pending {
 		_ = c.anchorDispatch(e)
 	}

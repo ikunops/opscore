@@ -1144,3 +1144,84 @@ func TestDestructionAnchorDispatchNeverDeadlocksOnTheWriteMutex(T *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// R43-9 (review round 3, N8) — two operations may hold groups open at once
+// (Tick prune across os.Remove, a verifyTick compaction, an HTTP lifecycle
+// event). Completing the OLDER group after a newer one opened must be
+// REFUSED (it would append non-adjacently and read as a chain break — a false
+// destruction_chain_broken with no tampering, permanent phase death). The
+// refused group stays `intended` ⇒ loud destruction_unconfirmed; the newer
+// group completes normally as the chain tail.
+// ---------------------------------------------------------------------------
+func TestDestructionOverlappingOpenGroupsNeverPoisonTheLog(T *testing.T) {
+	f := newDestructionFixture(T)
+	c := f.cfg()
+
+	g1, err := beginDestruction(c, destructionKindSnapshotRetention, "retain=1", nil, pubTargets(1), 1, dsT0)
+	if err != nil {
+		T.Fatal(err)
+	}
+	// A second operation opens while group 1 is still open (the cross-domain
+	// overlap the write mutex serializes per-line but cannot serialize across
+	// the in-between act).
+	g2, err := beginDestruction(c, destructionKindSnapshotRetention, "retain=1", nil, pubTargets(2), 1, dsT1)
+	if err != nil {
+		T.Fatal(err)
+	}
+	// Completing the OLDER group now would be a non-adjacent append — refused.
+	if err := completeDestruction(c, g1.DestructionSeq, destructionStateCompleted, dsT2); err == nil {
+		T.Fatal("R43-9: completing a group that is no longer the chain tail must be refused")
+	}
+	// The newer group is the tail and completes normally.
+	if err := completeDestruction(c, g2.DestructionSeq, destructionStateCompleted, dsT2); err != nil {
+		T.Fatalf("the chain-tail group must complete normally: %v", err)
+	}
+
+	st, err := loadDestructionState(c)
+	if err != nil {
+		T.Fatal(err)
+	}
+	if !st.verifiable {
+		T.Fatalf("no false chain_broken may arise from an overlapping-open refusal: %v", st.errs)
+	}
+	if g := st.bySeq[g1.DestructionSeq]; !g.usable || g.state != destructionStateIntended {
+		T.Fatalf("the refused group must stay usable-but-intended (it surfaces as destruction_unconfirmed, not as a problem), got %+v", g)
+	}
+	if g := st.bySeq[g2.DestructionSeq]; !g.usable || g.state != destructionStateCompleted {
+		T.Fatalf("the tail group must be usable and completed, got %+v", g)
+	}
+	view, err := (func() (DestructionView, error) {
+		f2 := newDestructionFixture(T) // placeholder to keep lints quiet; real view below
+		_ = f2
+		return viewOf(T, c)
+	})()
+	if err != nil {
+		T.Fatal(err)
+	}
+	if !containsInt(view.Unconfirmed, g1.DestructionSeq) {
+		T.Fatalf("the refused group must surface as unconfirmed, got %+v", view.Unconfirmed)
+	}
+}
+
+// viewOf builds the read-only view from a bare config via a scheduler-less
+// helper: the destruction view logic is a pure function of the log.
+func viewOf(T *testing.T, c destructionConfig) (DestructionView, error) {
+	T.Helper()
+	st, err := loadDestructionState(c)
+	if err != nil {
+		return DestructionView{}, err
+	}
+	out := DestructionView{Enabled: true}
+	out.Window = &st.window
+	for _, g := range st.groups {
+		if !g.usable {
+			out.Problems = append(out.Problems, destructionProblem{DestructionSeq: g.seq, Verdict: g.verdict, Detail: g.detail})
+			continue
+		}
+		if g.state == destructionStateIntended {
+			out.Unconfirmed = append(out.Unconfirmed, g.seq)
+		}
+	}
+	return out, nil
+}
