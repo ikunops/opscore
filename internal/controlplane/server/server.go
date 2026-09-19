@@ -1663,6 +1663,11 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// POST = append one lifecycle fact.
 	mux.HandleFunc("GET /management/v1/protection/export/key-lifecycle", s.handleHistoryExportKeyLifecycle)
 	mux.HandleFunc("POST /management/v1/protection/export/key-lifecycle", s.handleHistoryExportKeyLifecycle)
+	// Phase 43: destruction accountability (WHY ABSENT — the evidence that is
+	// gone, was it destroyed on the record or did it just vanish?). The
+	// namespace follows the surface being extended (the export face), the same
+	// ruling R214 gave Phase 42.
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/destruction", s.handleHistoryExportDestruction)
 	return mux
 }
 

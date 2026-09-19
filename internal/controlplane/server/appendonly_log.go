@@ -111,6 +111,16 @@ func appendLogLine(path string, line []byte) error {
 	return f.Close()
 }
 
+// compactionObserver is the Phase 43 hook: it is called with the drop set AFTER
+// it is computed and BEFORE the file is rewritten, and it may return a
+// completion callback that runs once the rewrite succeeded.
+//
+// Returning an error REFUSES the compaction and leaves the file byte-identical —
+// a prefix that cannot be accounted for is not destroyed (ADR-061 §6.1,
+// non-target 15). The observer is deliberately one-directional: it observes, it
+// never decides what is dropped.
+type compactionObserver func(path string, droppedGroups []int64, droppedLines []logLine) (complete func() error, err error)
+
 // compactLogPrefixGroups drops the oldest whole GROUPS until at most keepGroups
 // remain and copies every surviving line verbatim. It is the ONLY operation in
 // this file that rewrites bytes. keepGroups <= 0 means unbounded (nothing is
@@ -120,7 +130,14 @@ func appendLogLine(path string, line []byte) error {
 // file is left byte-identical: trimming a prefix around unreadable evidence is
 // precisely the "rebuild a clean file" failure the discipline forbids, and both
 // consumers inherit this guarantee from one place.
+//
+// It is a thin wrapper over the observed variant — every existing consumer keeps
+// its behaviour exactly, because a nil observer is a no-op.
 func compactLogPrefixGroups(path string, keepGroups int, classify groupClassifier) error {
+	return compactLogPrefixGroupsObserved(path, keepGroups, classify, nil)
+}
+
+func compactLogPrefixGroupsObserved(path string, keepGroups int, classify groupClassifier, observe compactionObserver) error {
 	if keepGroups <= 0 {
 		return nil
 	}
@@ -132,8 +149,50 @@ func compactLogPrefixGroups(path string, keepGroups int, classify groupClassifie
 		return fmt.Errorf("compaction refused: %d unclassifiable line(s) present; rewriting the file would silently discard that evidence", countUnclassified(lines))
 	}
 
-	// Groups are ordered by first appearance — a log is written oldest-first, so
-	// "the oldest groups" is the prefix of this order.
+	drop, kept := planLogPrefixDrop(lines, keepGroups)
+	if len(kept) == len(lines) {
+		return nil
+	}
+
+	var complete func() error
+	if observe != nil {
+		var dropped []logLine
+		var groups []int64
+		seen := map[int64]bool{}
+		for _, l := range lines {
+			if !drop[l.group] {
+				continue
+			}
+			dropped = append(dropped, l)
+			if !seen[l.group] {
+				seen[l.group] = true
+				groups = append(groups, l.group)
+			}
+		}
+		complete, err = observe(path, groups, dropped)
+		if err != nil {
+			// Fail-closed: the intent was recorded nowhere, so nothing is
+			// destroyed. The file stays byte-identical.
+			return err
+		}
+	}
+	if rerr := rewriteLogLines(path, kept); rerr != nil {
+		return rerr
+	}
+	if complete != nil {
+		return complete()
+	}
+	return nil
+}
+
+// planLogPrefixDrop computes which whole GROUPS a prefix compaction would drop
+// and which lines survive. Groups are ordered by first appearance — a log is
+// written oldest-first, so "the oldest groups" is the prefix of this order.
+func planLogPrefixDrop(lines []logLine, keepGroups int) (drop map[int64]bool, kept []logLine) {
+	drop = map[int64]bool{}
+	if keepGroups <= 0 {
+		return drop, append([]logLine(nil), lines...)
+	}
 	order := make([]int64, 0, len(lines))
 	seen := make(map[int64]bool, len(lines))
 	for _, l := range lines {
@@ -142,23 +201,18 @@ func compactLogPrefixGroups(path string, keepGroups int, classify groupClassifie
 			order = append(order, l.group)
 		}
 	}
-	if len(order) <= keepGroups {
-		return nil
+	if len(order) > keepGroups {
+		for _, g := range order[:len(order)-keepGroups] {
+			drop[g] = true
+		}
 	}
-	drop := make(map[int64]bool, len(order)-keepGroups)
-	for _, g := range order[:len(order)-keepGroups] {
-		drop[g] = true
-	}
-	kept := make([]logLine, 0, len(lines))
+	kept = make([]logLine, 0, len(lines))
 	for _, l := range lines {
 		if !drop[l.group] {
 			kept = append(kept, l)
 		}
 	}
-	if len(kept) == len(lines) {
-		return nil
-	}
-	return rewriteLogLines(path, kept)
+	return drop, kept
 }
 
 // rewriteLogLines replaces the file with exactly the given lines, each written

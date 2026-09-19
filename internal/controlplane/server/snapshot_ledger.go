@@ -228,6 +228,12 @@ func ledgerGroupOf(raw []byte) (int64, bool) {
 //	same id + same digest     → idempotent no-op
 //	same id + different digest→ error (conflict; nothing is written)
 func appendLedgerEntry(dir string, capacity int, e ledgerEntry) error {
+	return appendLedgerEntryObserved(dir, capacity, e, nil)
+}
+
+// appendLedgerEntryObserved is the Phase 43 form: the prefix compaction that
+// follows the append installs the destruction observer (ADR-061 §6.1).
+func appendLedgerEntryObserved(dir string, capacity int, e ledgerEntry, observe compactionObserver) error {
 	path := filepath.Join(dir, chainLedgerFile)
 	lines, _, err := readLogLines(path, ledgerGroupOf)
 	if err != nil {
@@ -264,7 +270,7 @@ func appendLedgerEntry(dir string, capacity int, e ledgerEntry) error {
 		return aerr
 	}
 	if capacity > 0 {
-		return compactLogPrefixGroups(path, capacity, ledgerGroupOf)
+		return compactLogPrefixGroupsObserved(path, capacity, ledgerGroupOf, observe)
 	}
 	return nil
 }

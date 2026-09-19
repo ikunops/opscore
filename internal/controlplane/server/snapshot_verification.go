@@ -509,6 +509,9 @@ type verificationConfig struct {
 	// Phase is inert even when keys happen to be configured, so a default
 	// deployment stays byte-identical to Phase 41 (ADR-058 §1).
 	on bool
+	// observe (Phase 43) is the destruction hook this log's prefix compaction
+	// installs. nil ⇒ the log compacts exactly as it did in Phase 42.
+	observe compactionObserver
 }
 
 func (c verificationConfig) enabled() bool {
@@ -976,7 +979,7 @@ func appendVerificationReport(c verificationConfig, r *VerificationReport, at ti
 }
 
 func compactVerificationPrefix(c verificationConfig) error {
-	return compactLogPrefixGroups(verificationLogPath(c.dir), c.capacity, verificationGroupOf)
+	return compactLogPrefixGroupsObserved(verificationLogPath(c.dir), c.capacity, verificationGroupOf, c.observe)
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1001,7 @@ func (s *HistoryExportScheduler) verificationConfig() verificationConfig {
 		trust:    s.trust,
 		streamID: s.lifecycleStreamID(),
 		on:       s.cfg.VerifyAttest,
+		observe:  s.destructionObserver(destructionKindVerificationCompaction),
 	}
 }
 
@@ -1168,7 +1172,8 @@ func (s *HistoryExportScheduler) anchorVerificationReport(r *VerificationReport)
 	if serr := s.signer.signAnchorEntry(&ae, s.cfg.Dir, s.clock()); serr != nil {
 		return serr
 	}
-	if aerr := appendAnchorEntryPath(path, s.cfg.AnchorCapacity, ae); aerr != nil {
+	if aerr := appendAnchorEntryPathObserved(path, s.cfg.AnchorCapacity, ae,
+		s.destructionObserver(destructionKindAnchorCompaction)); aerr != nil {
 		return aerr
 	}
 	if derr := s.dispatchAnchorPath(context.Background(), path, ae); derr != nil {

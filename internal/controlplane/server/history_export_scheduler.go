@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -111,6 +112,12 @@ type HistoryExportConfig struct {
 	// VerifyCapacity bounds `verification-log.jsonl` by whole `report_seq`
 	// groups. 0 disables the cap.
 	VerifyCapacity int
+	// DestructionLog (Phase 43) turns destruction accountability on. FALSE by
+	// default: no file, no hook, no behaviour change anywhere (ADR-061 §1.5).
+	DestructionLog bool
+	// DestructionCapacity bounds `destruction-log.jsonl` by whole
+	// `destruction_seq` groups. 0 disables the cap.
+	DestructionCapacity int
 }
 
 // HistoryExportStatus is the read-only scheduler state surfaced via
@@ -137,20 +144,24 @@ type HistoryExportStatus struct {
 	AnchorWindow    *anchorWindow `json:"anchor_window,omitempty"`
 	// Phase 41: key lifecycle roll-up. nil (and therefore absent) unless a key
 	// authority trust anchor is configured.
-	KeyLifecycle   *keyLifecycleStatusSummary `json:"key_lifecycle,omitempty"`
+	KeyLifecycle *keyLifecycleStatusSummary `json:"key_lifecycle,omitempty"`
 	// Phase 42: verification attestation roll-up. nil (and therefore absent)
 	// unless attestation is enabled.
 	Verification *verificationStatusSummary `json:"verification,omitempty"`
-	SigningEnabled bool                       `json:"signing_enabled"`         // Phase 37: a signing key is configured
-	SignerKeyID    string                     `json:"signer_key_id,omitempty"` // Phase 37: derived (never configured) key id
-	TrustedKeys    int                        `json:"trusted_keys"`            // Phase 37: size of the independent trust anchor
-	SkipCount      int64                      `json:"skip_count"`
-	Published      int64                      `json:"published"`
-	Failed         int64                      `json:"failed"`
-	Dir            string                     `json:"dir,omitempty"`
-	Interval       string                     `json:"interval,omitempty"`
-	Formats        []string                   `json:"formats,omitempty"`
-	Retain         int                        `json:"retain"`
+	// Phase 43: destruction accountability roll-up. nil (and therefore absent)
+	// unless the destruction log is enabled (ADR-061 §1.5 — default deployment
+	// stays byte-identical to Phase 42).
+	Destruction    *destructionStatusSummary `json:"destruction,omitempty"`
+	SigningEnabled bool                      `json:"signing_enabled"`         // Phase 37: a signing key is configured
+	SignerKeyID    string                    `json:"signer_key_id,omitempty"` // Phase 37: derived (never configured) key id
+	TrustedKeys    int                       `json:"trusted_keys"`            // Phase 37: size of the independent trust anchor
+	SkipCount      int64                     `json:"skip_count"`
+	Published      int64                     `json:"published"`
+	Failed         int64                     `json:"failed"`
+	Dir            string                    `json:"dir,omitempty"`
+	Interval       string                    `json:"interval,omitempty"`
+	Formats        []string                  `json:"formats,omitempty"`
+	Retain         int                       `json:"retain"`
 }
 
 // HistoryExportScheduler materializes the durable alert-transition history to
@@ -188,6 +199,9 @@ type HistoryExportScheduler struct {
 	// re-read on every evaluation, so a report recorded by another process is
 	// honoured immediately (the R41-6 discipline, inherited).
 	verificationError string
+
+	// Phase 43: destruction accountability. The log is never cached either.
+	destructionError string
 
 	mu             sync.Mutex
 	started        bool
@@ -365,6 +379,30 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		return nil, fmt.Errorf("history export: verification capacity %d is negative", cfg.VerifyCapacity)
 	}
 
+	// Phase 43: destruction accountability. G1/G2 are the same two guards P41
+	// already applies to the KAK, and for the same reason — a record nobody can
+	// verify is not accountability, it is the appearance of it:
+	//   G1  destruction log on with no KAK private key ⇒ the log cannot be
+	//       written at all (an "we record everything" that records nothing);
+	//   G2  destruction log on with no usable KAK trust anchor ⇒ we could sign
+	//       destruction records nobody can ever check (P37 T79b / P41 I1).
+	//   G3  (KAK == signing key) is inherited from the Phase 41 block above and
+	//       already fails construction whenever a KAK is configured at all.
+	if cfg.DestructionLog {
+		if kakSigner == nil {
+			return nil, errors.New("history export: --export-destruction-log is set but no --export-key-authority is configured — destruction records could never be signed")
+		}
+		if kakTrust == nil || len(kakTrust.keys) == 0 {
+			return nil, errors.New("history export: --export-destruction-log is set but no --export-key-authority-trust is configured — destruction records could never be verified")
+		}
+		if _, ok := kakTrust.keys[kakSigner.keyID]; !ok {
+			return nil, fmt.Errorf("history export: key authority %s is absent from the configured KAK trust keys — destruction records would verify as unauthorized", kakSigner.keyID)
+		}
+	}
+	if cfg.DestructionCapacity < 0 {
+		return nil, fmt.Errorf("history export: destruction capacity %d is negative", cfg.DestructionCapacity)
+	}
+
 	return &HistoryExportScheduler{
 		cfg:             cfg,
 		clock:           clock,
@@ -390,6 +428,7 @@ func (s *HistoryExportScheduler) keyLifecycleConfig() keyLifecycleConfig {
 		ka:           s.keyAuthority,
 		signingTrust: s.trust,
 		streamID:     s.lifecycleStreamID(),
+		observe:      s.destructionObserver(destructionKindKeyLifecycleCompaction),
 	}
 }
 
@@ -987,7 +1026,7 @@ func (s *HistoryExportScheduler) recordLedgerEntry(m *snapshotManifest, at time.
 	if err := s.signer.signLedgerEntry(&e, at); err != nil {
 		return err
 	}
-	return appendLedgerEntry(s.cfg.Dir, s.cfg.LedgerCapacity, e)
+	return appendLedgerEntryObserved(s.cfg.Dir, s.cfg.LedgerCapacity, e, s.destructionObserver(destructionKindLedgerCompaction))
 }
 
 func (s *HistoryExportScheduler) setLedgerError(msg string) {
@@ -1131,13 +1170,93 @@ func (s *HistoryExportScheduler) prune() error {
 	sort.SliceStable(order, func(i, j int) bool { return order[i] < order[j] })
 	excess := len(units) - s.cfg.Retain
 	for i := 0; i < excess; i++ {
-		for _, fn := range units[order[i]] {
+		names := units[order[i]]
+		// Phase 43: retention is the ONE destruction path that does not go
+		// through `compactLogPrefixGroups`, so it is hooked here — the only
+		// execution point (ADR-061 §6.3). The INTENT is recorded first, while
+		// the manifests (and therefore their digests) still exist.
+		seq, herr := s.beginPruneDestruction(names)
+		if herr != nil {
+			s.setDestructionError(herr.Error())
+		}
+		removed, failed := 0, false
+		for _, fn := range names {
 			if err := os.Remove(filepath.Join(s.cfg.Dir, fn)); err != nil {
-				return fmt.Errorf("prune remove %s: %w", fn, err)
+				failed = true
+				continue
 			}
+			removed++
+		}
+		if seq > 0 {
+			state := destructionStateCompleted
+			if failed || removed != len(names) {
+				// Never claim a completed destruction that only partly happened.
+				state = destructionStateAborted
+			}
+			if cerr := s.completePruneDestruction(seq, state); cerr != nil {
+				s.setDestructionError(cerr.Error())
+			}
+		}
+		if failed {
+			return fmt.Errorf("prune remove unit %s: %d of %d file(s) removed", order[i], removed, len(names))
 		}
 	}
 	return nil
+}
+
+// beginPruneDestruction records the intent line for one retention unit and
+// returns the group's seq (0 when the Phase is off or the unit carries no
+// readable manifest — there is nothing a destruction record could name).
+func (s *HistoryExportScheduler) beginPruneDestruction(names []string) (int64, error) {
+	c := s.destructionConfig()
+	if !c.writable() {
+		return 0, nil
+	}
+	targets, unavailable := s.destructionTargetsForUnit(names)
+	if len(targets) == 0 {
+		return 0, nil
+	}
+	policy := fmt.Sprintf("retain=%d", s.cfg.Retain)
+	// destroyed_count for the publication face = the number of publications the
+	// unit contained (review minor 9).
+	intent, err := beginDestruction(c, destructionKindSnapshotRetention, policy, unavailable, targets, len(targets), s.clock())
+	if err != nil {
+		return 0, err
+	}
+	return intent.DestructionSeq, nil
+}
+
+func (s *HistoryExportScheduler) completePruneDestruction(seq int64, state string) error {
+	return completeDestruction(s.destructionConfig(), seq, state, s.clock())
+}
+
+// destructionTargetsForUnit reads the manifests of one retention unit BEFORE it
+// is deleted: the digest must be captured while the content still exists (§4.3).
+// A manifest that cannot be read still yields a target — matched by id only,
+// which is weaker and reported as such (target_digest_unavailable).
+func (s *HistoryExportScheduler) destructionTargetsForUnit(names []string) (targets []destructionTarget, unavailable []string) {
+	for _, fn := range names {
+		if !strings.HasSuffix(fn, ".manifest.json") {
+			continue
+		}
+		data, rerr := os.ReadFile(filepath.Join(s.cfg.Dir, fn))
+		if rerr != nil {
+			continue
+		}
+		var m snapshotManifest
+		if jerr := json.Unmarshal(data, &m); jerr != nil || m.PublicationID == 0 {
+			continue
+		}
+		t := destructionTarget{PublicationID: m.PublicationID}
+		dg, derr := ledgerDigestOf(&m)
+		if derr != nil || dg == "" {
+			unavailable = append(unavailable, fmt.Sprintf("%d", m.PublicationID))
+		} else {
+			t.ManifestDigest = dg
+		}
+		targets = append(targets, t)
+	}
+	return targets, unavailable
 }
 
 // snapshotGroupKey returns the retention unit (ExportedAt) for an export-dir
@@ -1196,6 +1315,14 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 		st.Verification = &vs
 		if vs.Error == "" && s.verificationError != "" {
 			st.Verification.Error = s.verificationError
+		}
+	}
+	// Phase 43: likewise omitted unless the destruction log is enabled, so a
+	// default deployment's status document is byte-identical to Phase 42.
+	if ds := destructionSummary(s.destructionConfig()); ds.Enabled {
+		st.Destruction = &ds
+		if ds.Error == "" && s.destructionError != "" {
+			st.Destruction.Error = s.destructionError
 		}
 	}
 	if s.trust != nil {

@@ -488,6 +488,12 @@ func cmdServe(args []string) {
 	exportVerifyAttest := fs.Bool("export-verify-attest", false, "record signed verification reports (verification-log.jsonl) so 'never verified' becomes assertable instead of silent (requires --export-sign-key and --export-trust-keys)")
 	exportVerifyInterval := fs.Duration("export-verify-interval", 0, "interval of the periodic verification attestation (0 = only on demand; requires --export-verify-attest)")
 	exportVerifyCapacity := fs.Int("export-verify-capacity", 4096, "max verification report groups to retain (oldest whole groups first; compaction only ever lifts the assertion boundary, it never invents one, 0 = keep all)")
+	// Phase 43 (destruction accountability): OPT-IN and OFF by default. It makes
+	// "did that evidence leave on the record, or did it just disappear?"
+	// assertable. The signing authority is the Phase 41 KAK, so no new key flag
+	// is introduced and anchoring reuses --export-anchor-*.
+	exportDestructionLog := fs.Bool("export-destruction-log", false, "record authorized destruction events (destruction-log.jsonl) so an unrecorded disappearance becomes assertable instead of silent (requires --export-key-authority and --export-key-authority-trust)")
+	exportDestructionCapacity := fs.Int("export-destruction-capacity", 4096, "max destruction record groups to retain (oldest whole groups first; the log accounts for its own compaction, 0 = keep all)")
 	fs.Parse(args)
 
 	logger := newLogger()
@@ -637,8 +643,12 @@ func cmdServe(args []string) {
 			// Phase 42: verification attestation.
 			VerifyAttest:   *exportVerifyAttest,
 			VerifyInterval: *exportVerifyInterval,
-			VerifyCapacity: *exportVerifyCapacity,
-		})
+				VerifyCapacity: *exportVerifyCapacity,
+				// Phase 43: destruction accountability (KAK and anchor flags
+				// are deliberately reused — no new trust anchor is introduced).
+				DestructionLog:      *exportDestructionLog,
+				DestructionCapacity: *exportDestructionCapacity,
+			})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)
 			os.Exit(1)

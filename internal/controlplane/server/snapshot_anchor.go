@@ -48,6 +48,9 @@ const keyLifecycleAnchorFile = "key-lifecycle-anchor.jsonl"
 // verificationAnchorFile (Phase 42) is the THIRD anchor record stream.
 const verificationAnchorFile = "verification-anchor.jsonl"
 
+// destructionAnchorFile (Phase 43) is the FOURTH anchor record stream.
+const destructionAnchorFile = "destruction-anchor.jsonl"
+
 // anchorKind values. The empty kind is the Phase 40 publication family, so
 // every byte ever written by Phase 40 stays identical.
 const (
@@ -57,6 +60,10 @@ const (
 	// reports. Every field it uses is omitempty, so the two earlier families
 	// keep serializing byte-for-byte as they always have (ADR-058 §6.1 / T196b).
 	anchorKindVerification = "verification"
+	// anchorKindDestruction (Phase 43) is the FOURTH family: destruction
+	// records. Every field it uses is omitempty, so all three earlier families
+	// keep serializing byte-for-byte as they always have (ADR-061 §6.4 / T221).
+	anchorKindDestruction = "destruction"
 )
 
 // Delivery states of one anchor_seq. Only `anchored` is a CONFIRMED state —
@@ -103,6 +110,12 @@ type anchorEntry struct {
 	ReportDigest string `json:"report_digest,omitempty"` // sha256(canonical report payload)
 	Overall      string `json:"overall,omitempty"`       // attested|unattested|contradicted
 
+	// Phase 43 (the fourth anchor family). All omitempty, so Phase 40/41/42
+	// entries stay byte-identical (ADR-061 §6.4 / T221).
+	DestructionSeq     int64  `json:"destruction_seq,omitempty"`
+	DestructionDigest  string `json:"destruction_digest,omitempty"` // the group's entry_digest
+	DestructionVerdict string `json:"destruction_verdict,omitempty"`
+
 	// ---- delivery state: mutable, never signed ----
 	State      string `json:"state"`
 	Attempts   int    `json:"attempts"`
@@ -133,6 +146,10 @@ type anchorSigned struct {
 	ReportSeq    int64  `json:"report_seq,omitempty"`
 	ReportDigest string `json:"report_digest,omitempty"`
 	Overall      string `json:"overall,omitempty"`
+	// Phase 43 — omitempty keeps ALL earlier payloads byte-identical.
+	DestructionSeq     int64  `json:"destruction_seq,omitempty"`
+	DestructionDigest  string `json:"destruction_digest,omitempty"`
+	DestructionVerdict string `json:"destruction_verdict,omitempty"`
 }
 
 func anchorSignedFields(e *anchorEntry) anchorSigned {
@@ -153,14 +170,20 @@ func anchorSignedFields(e *anchorEntry) anchorSigned {
 		ReportSeq:          e.ReportSeq,
 		ReportDigest:       e.ReportDigest,
 		Overall:            e.Overall,
+		DestructionSeq:     e.DestructionSeq,
+		DestructionDigest:  e.DestructionDigest,
+		DestructionVerdict: e.DestructionVerdict,
 	}
 }
 
 // identityID is the id an anchor entry is addressed by: the publication id for
 // the Phase 40 family, the lifecycle event_seq for the Phase 41 family.
 func (e *anchorEntry) identityID() int64 {
-	if e.Kind == anchorKindKeyLifecycle {
+	switch e.Kind {
+	case anchorKindKeyLifecycle:
 		return e.EventSeq
+	case anchorKindDestruction:
+		return e.DestructionSeq
 	}
 	return e.PublicationID
 }
@@ -511,6 +534,13 @@ func appendAnchorEntry(dir string, capacity int, e anchorEntry) error {
 }
 
 func appendAnchorEntryPath(path string, capacity int, e anchorEntry) error {
+	return appendAnchorEntryPathObserved(path, capacity, e, nil)
+}
+
+// appendAnchorEntryPathObserved is the Phase 43 form: the compaction that may
+// follow the append installs the destruction observer, so a prefix this system
+// drops is accounted for (ADR-061 §6.1).
+func appendAnchorEntryPathObserved(path string, capacity int, e anchorEntry, observe compactionObserver) error {
 	lines, _, err := readLogLines(path, anchorGroupOf)
 	if err != nil {
 		return err
@@ -547,7 +577,7 @@ func appendAnchorEntryPath(path string, capacity int, e anchorEntry) error {
 		return aerr
 	}
 	if capacity > 0 {
-		return compactAnchorPrefixPath(path, capacity)
+		return compactAnchorPrefixPathObserved(path, capacity, observe)
 	}
 	return nil
 }
@@ -563,6 +593,10 @@ func compactAnchorPrefix(dir string, capacity int) error {
 // (ADR-053 §4.4 / T128). When the oldest group is unconfirmed the log is
 // deliberately left over capacity and the caller is told.
 func compactAnchorPrefixPath(path string, capacity int) error {
+	return compactAnchorPrefixPathObserved(path, capacity, nil)
+}
+
+func compactAnchorPrefixPathObserved(path string, capacity int, observe compactionObserver) error {
 	st, err := loadAnchorStatePath(path, filepath.Dir(path), nil)
 	if err != nil {
 		return err
@@ -574,7 +608,7 @@ func compactAnchorPrefixPath(path string, capacity int) error {
 		return fmt.Errorf("anchor capacity %d exceeded (%d groups) but seq %d is still %s — refusing to evict an unconfirmed group",
 			capacity, st.window.Entries, st.window.MinSeq, oldest.State)
 	}
-	return compactLogPrefixGroups(path, capacity, anchorGroupOf)
+	return compactLogPrefixGroupsObserved(path, capacity, anchorGroupOf, observe)
 }
 
 // ---------------------------------------------------------------------------
@@ -855,7 +889,11 @@ func (s *HistoryExportScheduler) recordAnchorEntry(m *snapshotManifest, at time.
 	// A crash in the other order would leave a confirmed witness whose local
 	// record never existed, which the reconciler would have to read as
 	// `witness_ahead_of_window` — i.e. as if something had been deleted.
-	if aerr := appendAnchorEntry(s.cfg.Dir, s.cfg.AnchorCapacity, e); aerr != nil {
+	// Phase 43: the publication anchor log's own prefix compaction is observed
+	// too, so a dropped anchor prefix is accounted for like any other
+	// destruction (ADR-061 §6.1).
+	if aerr := appendAnchorEntryPathObserved(anchorLogPath(s.cfg.Dir), s.cfg.AnchorCapacity, e,
+		s.destructionObserver(destructionKindAnchorCompaction)); aerr != nil {
 		return aerr
 	}
 	return s.dispatchAnchor(context.Background(), e)
@@ -962,6 +1000,40 @@ func keyLifecycleAnchorPath(dir string) string { return filepath.Join(dir, keyLi
 // families (ADR-055 §9, instantiated for the third time).
 func verificationAnchorPath(dir string) string { return filepath.Join(dir, verificationAnchorFile) }
 
+// destructionAnchorPath (Phase 43) is the fourth anchor stream — same reason as
+// the third: the shared classifier keys on `anchor_seq` alone.
+func destructionAnchorPath(dir string) string { return filepath.Join(dir, destructionAnchorFile) }
+
+// anchorDestructionEntry records and dispatches the anchor of one destruction
+// record. The pending line is durable BEFORE the witness is contacted (R40-6),
+// and per I6 the result is an EXIT: it never feeds the destruction verdict.
+func (s *HistoryExportScheduler) anchorDestructionEntry(e destructionEntry) error {
+	if !s.anchorEnabled() || s.signer == nil {
+		return nil
+	}
+	path := destructionAnchorPath(s.cfg.Dir)
+	seq, err := nextAnchorSeqPath(path)
+	if err != nil {
+		return err
+	}
+	ae := anchorEntry{
+		AnchorSeq:          seq,
+		Kind:               anchorKindDestruction,
+		DestructionSeq:     e.DestructionSeq,
+		DestructionDigest:  e.EntryDigest,
+		DestructionVerdict: e.State,
+		RecordedAt:         s.clock().UTC().Format(time.RFC3339Nano),
+		State:              anchorStatePending,
+	}
+	if serr := s.signer.signAnchorEntry(&ae, s.cfg.Dir, s.clock()); serr != nil {
+		return serr
+	}
+	if aerr := appendAnchorEntryPathObserved(path, s.cfg.AnchorCapacity, ae, s.destructionObserver(destructionKindAnchorCompaction)); aerr != nil {
+		return aerr
+	}
+	return s.dispatchAnchorPath(context.Background(), path, ae)
+}
+
 // anchorKeyLifecycleEvent records and dispatches the anchor of one lifecycle
 // event. The pending line is durable BEFORE the witness is contacted (R40-6).
 func (s *HistoryExportScheduler) anchorKeyLifecycleEvent(e keyLifecycleEntry) error {
@@ -986,7 +1058,8 @@ func (s *HistoryExportScheduler) anchorKeyLifecycleEvent(e keyLifecycleEntry) er
 	if serr := s.signer.signAnchorEntry(&ae, s.cfg.Dir, s.clock()); serr != nil {
 		return serr
 	}
-	if aerr := appendAnchorEntryPath(path, s.cfg.AnchorCapacity, ae); aerr != nil {
+	if aerr := appendAnchorEntryPathObserved(path, s.cfg.AnchorCapacity, ae,
+		s.destructionObserver(destructionKindAnchorCompaction)); aerr != nil {
 		return aerr
 	}
 	return s.dispatchAnchorPath(context.Background(), path, ae)

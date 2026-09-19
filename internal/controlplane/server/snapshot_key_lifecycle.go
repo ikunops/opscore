@@ -277,6 +277,9 @@ type keyLifecycleConfig struct {
 	ka           *keyAuthority
 	signingTrust *exportTrustStore // P37 trust set: WHO may ever be given a window
 	streamID     string            // P40 derived identity of this export directory
+	// observe (Phase 43) is the destruction hook this log's prefix compaction
+	// installs. nil ⇒ the log compacts exactly as it did in Phase 42.
+	observe compactionObserver
 }
 
 func (c keyLifecycleConfig) enabled() bool  { return c.ka != nil && c.ka.verifiable() }
@@ -800,7 +803,7 @@ func fingerprintOfPublicKey(pub ed25519.PublicKey) string {
 // compactKeyLifecyclePrefix bounds the log by whole event groups. It is the
 // ONLY rewrite and it copies survivors verbatim (shared primitive, R40-4).
 func compactKeyLifecyclePrefix(c keyLifecycleConfig) error {
-	return compactLogPrefixGroups(keyLifecycleLogPath(c.dir), c.capacity, keyLifecycleGroupOf)
+	return compactLogPrefixGroupsObserved(keyLifecycleLogPath(c.dir), c.capacity, keyLifecycleGroupOf, c.observe)
 }
 
 // ---------------------------------------------------------------------------
