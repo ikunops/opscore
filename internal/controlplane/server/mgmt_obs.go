@@ -1018,6 +1018,88 @@ func (s *Server) handleHistoryExportAnchorReconcile(w http.ResponseWriter, r *ht
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleHistoryExportWitnessReconcile (Phase 46) is the POST half of the
+// multi-family witness reconciliation face (ADR-067 A1 / ADR-068 §3-4).
+//
+//	body = {"families": {"ledger": [...], "key_lifecycle": [...],
+//	                     "destruction": [...], "verification": [...],
+//	                     "acceptance": [...]}}
+//
+// Each item is ONE projection exactly as the witness holds it (the Phase 40
+// anchorRequest JSON — a caller can feed witness.jsonl lines verbatim). The
+// face is ZERO-SIDE-EFFECT by contract (ADR-068 I5 / T268): it writes nothing
+// to disk, audits nothing, and opens no network connection, so an auditor may
+// call it as often as they like. The body cap is the same 4MiB budget the
+// Phase 40 reconcile face uses (ADR-068 §8: ~200B/projection ⇒ ~4000 per
+// family; larger deployments reconcile in idempotent batches). There is NO
+// enablement gate: files decide, not flags (ADR-067 A6) — which is exactly
+// why a legally disabled family that kept its files can never read deleted.
+func (s *Server) handleHistoryExportWitnessReconcile(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	// CSRF fail-closed (ADR-068 §1), the same same-origin check every other
+	// POST on this surface answers to — even though the face is zero-side-effect.
+	if !sameOriginOrFail(w, r) {
+		return
+	}
+	if s.historyScheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduled history export is disabled (configure --export-interval and --export-dir to enable)")
+		return
+	}
+	if r.Body != nil {
+		defer r.Body.Close()
+	}
+	raw, rerr := io.ReadAll(io.LimitReader(r.Body, 4<<20+1))
+	if rerr != nil {
+		writeError(w, http.StatusBadRequest, "cannot read request body")
+		return
+	}
+	if len(raw) > 4<<20 {
+		writeError(w, http.StatusBadRequest, "request body exceeds the 4MiB witness-reconcile budget (reconcile in batches)")
+		return
+	}
+	submitted, derr := decodeWitnessReconcileRequest(raw)
+	if derr != nil {
+		writeError(w, http.StatusBadRequest, derr.Error())
+		return
+	}
+	res, aerr := s.historyScheduler.ReconcileWitnessFamilies(submitted)
+	if aerr != nil {
+		writeError(w, http.StatusInternalServerError, aerr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// handleHistoryExportWitnessReconcileView (Phase 46) is the GET half: the
+// local five-family existence / window / not_enabled probe (ADR-068 §4).
+// Read-only, DELETED-FREE by construction (I6 / T273): it reports exactly the
+// file facts the POST absence matrix consumes, so the two faces can never
+// disagree about the same state.
+func (s *Server) handleHistoryExportWitnessReconcileView(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.historyScheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduled history export is disabled (configure --export-interval and --export-dir to enable)")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.historyScheduler.WitnessReconcileLocalView())
+}
+
 // handleHistoryExportKeyLifecycle (Phase 41) is the signing-key lifecycle face.
 //
 //	GET  — the ledger's read-only roll-up (never creates or repairs the file)

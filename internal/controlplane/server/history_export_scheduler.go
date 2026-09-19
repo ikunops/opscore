@@ -1578,3 +1578,156 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 func (s *HistoryExportScheduler) Done() <-chan struct{} {
 	return s.done
 }
+
+// ---------------------------------------------------------------------------
+// Phase 46 — the witness family registry (ADR-068 §2).
+//
+// Five families anchor into five independent record streams (P40/P41/P42/P43/
+// P45). Reconciliation consumes the projection bytes the witness ALREADY holds
+// — the Phase 40 anchorRequest wire shape — so this registry adds no protocol,
+// no writer and no dispatch change: it is a READ-ONLY index of where each
+// family's main ledger and anchor stream live, and how a local anchor digest
+// is derived from the family's existing load.
+// ---------------------------------------------------------------------------
+
+// The five registered family names (the POST body groups projections by them).
+const (
+	witnessFamilyLedger       = "ledger"
+	witnessFamilyKeyLifecycle = "key_lifecycle"
+	witnessFamilyDestruction  = "destruction"
+	witnessFamilyVerification = "verification"
+	witnessFamilyAcceptance   = "acceptance"
+)
+
+// witnessFamily is one anchored evidence family. Everything in it is a
+// read-only probe: two os.Stat path functions + the family's existing anchor
+// load. No locks are taken — the same concurrent-read stance every family's
+// GET status face already takes (each stream has a single O_APPEND writer).
+type witnessFamily struct {
+	// Name is the registry key the caller groups projections by (ADR-067 A2:
+	// the grouping itself is a caller declaration — §7.3 responsibility).
+	Name string
+	// LedgerPath is the family's MAIN ledger — the evidence file whose
+	// disappearance the family_ledger_deleted verdict asserts.
+	LedgerPath func(dir string) string
+	// AnchorPath is the family's own anchor stream: the anchor_seq axis the
+	// three-segment window runs on (ADR-068 §3).
+	AnchorPath func(dir string) string
+	// LocalDigest returns the anchor_digest the LOCAL anchor log records for
+	// seq, served from the entry set the family's existing anchor load
+	// produces (ADR-068 §2). ok=false means "not in the entry set" — never a
+	// digest claim. P46 verifies NO signatures (I8): the load runs
+	// signature-blind (trust=nil), because the projection cannot be verified
+	// and the digest is a locally DERIVED value, not a stored one.
+	LocalDigest func(dir string, seq int64) (string, bool)
+}
+
+// witnessFamilyRegistry is the static five-family table (ADR-068 §2). The
+// registry is CLOSED: an unknown family name is a caller error, never a
+// family with an empty projection set.
+func witnessFamilyRegistry() []witnessFamily {
+	return []witnessFamily{
+		{
+			Name:        witnessFamilyLedger,
+			LedgerPath:  func(dir string) string { return filepath.Join(dir, chainLedgerFile) },
+			AnchorPath:  anchorLogPath,
+			LocalDigest: witnessAnchorDigestFunc(anchorLogPath),
+		},
+		{
+			Name:        witnessFamilyKeyLifecycle,
+			LedgerPath:  keyLifecycleLogPath,
+			AnchorPath:  keyLifecycleAnchorPath,
+			LocalDigest: witnessAnchorDigestFunc(keyLifecycleAnchorPath),
+		},
+		{
+			Name:        witnessFamilyDestruction,
+			LedgerPath:  destructionLogPath,
+			AnchorPath:  destructionAnchorPath,
+			LocalDigest: witnessAnchorDigestFunc(destructionAnchorPath),
+		},
+		{
+			Name:        witnessFamilyVerification,
+			LedgerPath:  verificationLogPath,
+			AnchorPath:  verificationAnchorPath,
+			LocalDigest: witnessAnchorDigestFunc(verificationAnchorPath),
+		},
+		{
+			Name:        witnessFamilyAcceptance,
+			LedgerPath:  acceptanceLogPath,
+			AnchorPath:  acceptanceAnchorPath,
+			LocalDigest: witnessAnchorDigestFunc(acceptanceAnchorPath),
+		},
+	}
+}
+
+// witnessFamilyKnown reports whether name is one of the five registered
+// families.
+func witnessFamilyKnown(name string) bool {
+	for _, f := range witnessFamilyRegistry() {
+		if f.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// witnessAnchorDigestFunc builds one family's LocalDigest over one anchor
+// stream: the family's existing load (loadAnchorStatePath) produces the entry
+// set, and the digest of the seq's entry is DERIVED from it (anchorDigestOf) —
+// the same derivation the witness compared at dispatch time.
+func witnessAnchorDigestFunc(pathFn func(dir string) string) func(dir string, seq int64) (string, bool) {
+	return func(dir string, seq int64) (string, bool) {
+		st, err := loadAnchorStatePath(pathFn(dir), dir, nil)
+		if err != nil {
+			return "", false
+		}
+		e, ok := st.latest[seq]
+		if !ok {
+			return "", false
+		}
+		dg, derr := anchorDigestOf(&e)
+		if derr != nil {
+			return "", false
+		}
+		return dg, true
+	}
+}
+
+// witnessFilePresent is the ONE existence probe both faces share (I6/T273):
+// present means the file exists AND is non-empty (a zero-byte file has never
+// held evidence). Sharing one probe is what makes the GET and POST vocabularies
+// mechanically incapable of disagreeing about a file state.
+func witnessFilePresent(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.Mode().IsRegular() && info.Size() > 0
+}
+
+// witnessFamilyEnabled reports whether the family's producer gate is ON in the
+// CURRENT configuration. It feeds the GET probe's not_enabled flag ONLY — the
+// POST face has NO enablement gate (ADR-067 A6): files decide, not flags, and
+// a legally disabled family keeps its files (T269). The gates mirror the
+// status face's Enabled fields, so the GET probe and the status document can
+// never disagree about what is enabled.
+func witnessFamilyEnabled(s *HistoryExportScheduler, name string) bool {
+	if s == nil {
+		return false
+	}
+	switch name {
+	case witnessFamilyLedger:
+		// The publication anchor stream is fed only when anchoring is on AND a
+		// signing key is configured (the recordAnchorEntry gate).
+		return s.anchorEnabled() && s.signer != nil
+	case witnessFamilyKeyLifecycle:
+		return s.keyLifecycleConfig().enabled()
+	case witnessFamilyDestruction:
+		return s.destructionConfig().enabled()
+	case witnessFamilyVerification:
+		return s.verificationConfig().enabled()
+	case witnessFamilyAcceptance:
+		return s.cfg.AcceptanceLog
+	}
+	return false
+}

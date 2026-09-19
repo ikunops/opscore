@@ -1672,6 +1672,15 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// still the one the system originally accepted?). Read-only, admin-only,
 	// :8082 only, same namespace ruling as Phase 43.
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/input-integrity", s.handleHistoryExportInputIntegrity)
+	// Phase 46: witness reconciliation (WHETHER WITNESSED — the out-of-domain
+	// copy every anchored family kept is now assertable in-domain, ADR-067 §3).
+	// GET = the local five-family existence/window probe (deleted-free
+	// vocabulary, I6); POST = the reconciliation itself — zero side effects
+	// (I5), admin-only, :8082 only, CSRF fail-closed like every POST here.
+	// The Phase 40 publication reconcile face above stays byte-identical (I1):
+	// the two faces answer different questions on the same chain stream.
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/witness-reconcile", s.handleHistoryExportWitnessReconcileView)
+	mux.HandleFunc("POST /management/v1/protection/alerts/history/export/witness-reconcile", s.handleHistoryExportWitnessReconcile)
 	return mux
 }
 
