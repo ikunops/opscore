@@ -476,6 +476,12 @@ func cmdServe(args []string) {
 	exportAnchorTimeout := fs.Duration("export-anchor-timeout", 5*time.Second, "timeout of one anchor delivery attempt")
 	exportAnchorMaxAttempts := fs.Int("export-anchor-max-attempts", 8, "max delivery attempts per anchor_seq (exhausted = terminal unanchored; re-dispatch is out of scope)")
 	exportAnchorCapacity := fs.Int("export-anchor-capacity", 4096, "max anchor_seq groups to retain (a whole group is never partially dropped; an unconfirmed group is never evicted; 0 = keep all)")
+	// Phase 41 (signing key lifecycle): OPT-IN and OFF by default. Both the
+	// authority key and its trust anchor are required to write; a trust anchor
+	// alone gives a read-only deployment that can still evaluate a ledger.
+	exportKeyAuthority := fs.String("export-key-authority", "", "Ed25519 PRIVATE key of the key authority (KAK) that signs signing-key lifecycle events; must differ from --export-sign-key (empty = the lifecycle ledger cannot be written)")
+	exportKeyAuthorityTrust := fs.String("export-key-authority-trust", "", "comma-separated trusted Ed25519 PUBLIC keys of the key authority, used to verify the signing-key lifecycle ledger (empty = the ledger cannot be verified, so every key stays unbounded)")
+	exportKeyLifecycleCapacity := fs.Int("export-key-lifecycle-capacity", 4096, "max signing-key lifecycle event groups to retain (oldest whole groups first; a lost bound only ever removes an interval's evidence, 0 = keep all)")
 	fs.Parse(args)
 
 	logger := newLogger()
@@ -618,6 +624,10 @@ func cmdServe(args []string) {
 			AnchorTimeout:     *exportAnchorTimeout,
 			AnchorMaxAttempts: *exportAnchorMaxAttempts,
 			AnchorCapacity:    *exportAnchorCapacity,
+			// Phase 41: signing-key lifecycle (time-bounded trust).
+			KeyAuthorityPath:       *exportKeyAuthority,
+			KeyAuthorityTrustPaths: parseExportFormats(*exportKeyAuthorityTrust),
+			KeyLifecycleCapacity:   *exportKeyLifecycleCapacity,
 		})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)

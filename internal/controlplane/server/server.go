@@ -198,22 +198,22 @@ func New(cfg Config) (*Server, error) {
 	}
 	hub := NewWSHub(bus)
 	s := &Server{
-		stor:          cfg.Storage,
-		auth:          auth.NewAuthService(cfg.Storage, cfg.AccessSecret, cfg.RefreshSecret),
-		dispatcher:    cfg.Dispatcher,
-		runtime:       cfg.Runtime,
-		hosts:         cfg.HostStore,
-		logger:        logger,
-		defaultTarget: cfg.DefaultTarget,
-		demoMode:      cfg.DemoMode,
-		useSudo:       cfg.UseSudo,
-		allowRegister: cfg.AllowRegister,
-		bus:           bus,
-		wsHub:         hub,
-		gate:          cfg.Gate,
-		alertTracker:  cfg.AlertTracker,
-		alertPolicy:   cfg.AlertPolicy,
-		transitionStore: cfg.TransitionStore,
+		stor:             cfg.Storage,
+		auth:             auth.NewAuthService(cfg.Storage, cfg.AccessSecret, cfg.RefreshSecret),
+		dispatcher:       cfg.Dispatcher,
+		runtime:          cfg.Runtime,
+		hosts:            cfg.HostStore,
+		logger:           logger,
+		defaultTarget:    cfg.DefaultTarget,
+		demoMode:         cfg.DemoMode,
+		useSudo:          cfg.UseSudo,
+		allowRegister:    cfg.AllowRegister,
+		bus:              bus,
+		wsHub:            hub,
+		gate:             cfg.Gate,
+		alertTracker:     cfg.AlertTracker,
+		alertPolicy:      cfg.AlertPolicy,
+		transitionStore:  cfg.TransitionStore,
 		historyScheduler: cfg.HistoryScheduler,
 	}
 	if cfg.BootstrapAdmin != nil {
@@ -1547,8 +1547,8 @@ func (s *Server) handleProtectionKills(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"state":         s.gate.KillState().String(),
-		"kills":         out,
+		"state":          s.gate.KillState().String(),
+		"kills":          out,
 		"operator_kills": opOut,
 	})
 }
@@ -1570,16 +1570,16 @@ func (s *Server) handleProtectionMetrics(w http.ResponseWriter, r *http.Request)
 	}
 	m := s.gate.SnapshotMetrics()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"admitted":                m.Admitted,
-		"killed":                  m.Killed,
-		"principal_killed":        m.PrincipalKilled,
-		"circuit_open":            m.CircuitOpen,
-		"breaker_unknown":         m.BreakerUnknown,
-		"concurrency_exceeded":    m.ConcurrencyExceeded,
-		"quota_exceeded":          m.QuotaExceeded,
+		"admitted":                   m.Admitted,
+		"killed":                     m.Killed,
+		"principal_killed":           m.PrincipalKilled,
+		"circuit_open":               m.CircuitOpen,
+		"breaker_unknown":            m.BreakerUnknown,
+		"concurrency_exceeded":       m.ConcurrencyExceeded,
+		"quota_exceeded":             m.QuotaExceeded,
 		"quota_evidence_unavailable": m.QuotaEvidenceUnavailable,
-		"rate_limited":            m.RateLimited,
-		"audit_write_failed":      m.AuditWriteFailed,
+		"rate_limited":               m.RateLimited,
+		"audit_write_failed":         m.AuditWriteFailed,
 	})
 }
 
@@ -1653,6 +1653,10 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// Phase 40: anchoring surfaces. Both are admin-only and strictly read-only.
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/anchor", s.handleHistoryExportAnchor)
 	mux.HandleFunc("POST /management/v1/protection/alerts/history/export/anchor/reconcile", s.handleHistoryExportAnchorReconcile)
+	// Phase 41: signing-key lifecycle (time-bounded trust). GET = state,
+	// POST = append one lifecycle fact.
+	mux.HandleFunc("GET /management/v1/protection/export/key-lifecycle", s.handleHistoryExportKeyLifecycle)
+	mux.HandleFunc("POST /management/v1/protection/export/key-lifecycle", s.handleHistoryExportKeyLifecycle)
 	return mux
 }
 

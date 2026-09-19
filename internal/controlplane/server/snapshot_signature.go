@@ -63,6 +63,10 @@ type SignatureVerdict struct {
 	Verdict string `json:"verdict"`
 	KeyID   string `json:"key_id,omitempty"`
 	Detail  string `json:"detail,omitempty"`
+	// Validity (Phase 41) is the authorization interval the signature was
+	// checked against. It is nil whenever Phase 41 is not in play, so the
+	// verify surface stays byte-identical to Phase 40 (ADR-055 §10/§11).
+	Validity *signatureValidity `json:"validity,omitempty"`
 }
 
 // exportSigner holds the configured private key and its DERIVED identity. The
@@ -270,9 +274,18 @@ func verifyManifestSignature(m *snapshotManifest, trust *exportTrustStore) Signa
 //	key_unknown / signature_malformed  → at most unknown (unverifiable)
 //	signature_absent (v2)              → unchanged (read-only compatibility)
 //	signature_absent (v3, missing)     → at most unknown (should have been signed)
+//
+// Phase 41 adds ONE case (R41-1 / R41-7). The three lifecycle verdicts and the
+// unparseable-time verdict are all DECIDABLE problems — reporting them as
+// `unknown` would be pretending ignorance and would re-open exactly the "fuzzy
+// bucket" R40-2 had to close — so they sit in the `mismatch` tier alongside
+// `signature_invalid`. Loudness lives in the status; the category lives in the
+// verdict NAME, which stays independent. Every pre-existing branch is untouched.
 func applySignatureVerdict(status string, v SignatureVerdict, schemaVersion int) string {
 	switch v.Verdict {
 	case sigVerdictInvalid:
+		return verifyStatusMismatch
+	case sigVerdictAfterRevocation, sigVerdictAfterRotation, sigVerdictBeforeActivation, sigVerdictTimeUnparseable:
 		return verifyStatusMismatch
 	case sigVerdictKeyUnknown, sigVerdictMalformed:
 		if status == verifyStatusOK {

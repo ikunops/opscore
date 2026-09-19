@@ -38,6 +38,20 @@ import (
 
 const chainAnchorFile = "chain-anchor.jsonl"
 
+// keyLifecycleAnchorFile (Phase 41) is the SECOND anchor record stream.
+// Lifecycle events are deliberately kept out of `chain-anchor.jsonl`: their
+// sequence space is independent, and mixing the two families in one file would
+// make the shared group classifier treat a publication seq and a lifecycle seq
+// as the same group (ADR-055 §9).
+const keyLifecycleAnchorFile = "key-lifecycle-anchor.jsonl"
+
+// anchorKind values. The empty kind is the Phase 40 publication family, so
+// every byte ever written by Phase 40 stays identical.
+const (
+	anchorKindPublication  = ""
+	anchorKindKeyLifecycle = "key_lifecycle"
+)
+
 // Delivery states of one anchor_seq. Only `anchored` is a CONFIRMED state —
 // an HTTP 2xx alone is never a confirmation (ADR-053 §5.2).
 const (
@@ -68,6 +82,14 @@ type anchorEntry struct {
 	KeyID              string `json:"key_id"`    // derived (P37), never configured
 	StreamID           string `json:"stream_id"` // derived (R40-2), never configured
 
+	// Phase 41 (the second anchor family). All omitempty, so a Phase 40
+	// publication entry serializes byte-for-byte as it always has.
+	Kind        string `json:"kind,omitempty"`         // "key_lifecycle"
+	EventSeq    int64  `json:"event_seq,omitempty"`    // lifecycle event identity
+	EventDigest string `json:"event_digest,omitempty"` // sha256(canonical lifecycle payload)
+	EventType   string `json:"event_type,omitempty"`
+	NotAfter    string `json:"not_after,omitempty"`
+
 	// ---- delivery state: mutable, never signed ----
 	State      string `json:"state"`
 	Attempts   int    `json:"attempts"`
@@ -88,6 +110,12 @@ type anchorSigned struct {
 	RecordedAt         string `json:"recorded_at"`
 	KeyID              string `json:"key_id"`
 	StreamID           string `json:"stream_id"`
+	// Phase 41 — omitempty keeps the Phase 40 payload byte-identical.
+	Kind        string `json:"kind,omitempty"`
+	EventSeq    int64  `json:"event_seq,omitempty"`
+	EventDigest string `json:"event_digest,omitempty"`
+	EventType   string `json:"event_type,omitempty"`
+	NotAfter    string `json:"not_after,omitempty"`
 }
 
 func anchorSignedFields(e *anchorEntry) anchorSigned {
@@ -100,7 +128,21 @@ func anchorSignedFields(e *anchorEntry) anchorSigned {
 		RecordedAt:         e.RecordedAt,
 		KeyID:              e.KeyID,
 		StreamID:           e.StreamID,
+		Kind:               e.Kind,
+		EventSeq:           e.EventSeq,
+		EventDigest:        e.EventDigest,
+		EventType:          e.EventType,
+		NotAfter:           e.NotAfter,
 	}
+}
+
+// identityID is the id an anchor entry is addressed by: the publication id for
+// the Phase 40 family, the lifecycle event_seq for the Phase 41 family.
+func (e *anchorEntry) identityID() int64 {
+	if e.Kind == anchorKindKeyLifecycle {
+		return e.EventSeq
+	}
+	return e.PublicationID
 }
 
 func serializeAnchorEntryBytes(e *anchorEntry) ([]byte, error) {
@@ -316,10 +358,10 @@ func anchorGroupOf(raw []byte) (int64, bool) {
 
 // anchorProblem is one anchor record that exists but cannot be trusted.
 type anchorProblem struct {
-	AnchorSeq      int64  `json:"anchor_seq"`
-	PublicationID  int64  `json:"publication_id,omitempty"`
-	Verdict        string `json:"verdict"`
-	Detail         string `json:"detail,omitempty"`
+	AnchorSeq     int64  `json:"anchor_seq"`
+	PublicationID int64  `json:"publication_id,omitempty"`
+	Verdict       string `json:"verdict"`
+	Detail        string `json:"detail,omitempty"`
 }
 
 // anchorWindow is the local evidence window of R40-1: the contiguous run of
@@ -357,8 +399,14 @@ func (a *anchorState) seqs() []int64 {
 // unclassifiable line makes the whole load fail (ADR-053 §6) — there is no
 // skip-and-continue, because skipping is how a tampered prefix disappears.
 func loadAnchorState(dir string, trust *exportTrustStore) (*anchorState, error) {
+	return loadAnchorStatePath(anchorLogPath(dir), dir, trust)
+}
+
+// loadAnchorStatePath is the path-parameterised form introduced by Phase 41 so
+// the second (lifecycle) anchor stream can reuse one implementation instead of
+// growing a second copy of the discipline.
+func loadAnchorStatePath(path, dir string, trust *exportTrustStore) (*anchorState, error) {
 	st := &anchorState{latest: map[int64]anchorEntry{}, byID: map[int64]anchorEntry{}}
-	path := filepath.Join(dir, chainAnchorFile)
 	lines, ok, err := readLogLines(path, anchorGroupOf)
 	if err != nil {
 		return nil, err
@@ -406,10 +454,10 @@ func loadAnchorState(dir string, trust *exportTrustStore) (*anchorState, error) 
 		e := st.latest[seq]
 		v := verifyAnchorEntrySignature(&e, trust, dir)
 		if v.Verdict != sigVerdictOK {
-			st.unusable = append(st.unusable, anchorProblem{AnchorSeq: seq, PublicationID: e.PublicationID, Verdict: v.Verdict, Detail: v.Detail})
+			st.unusable = append(st.unusable, anchorProblem{AnchorSeq: seq, PublicationID: e.identityID(), Verdict: v.Verdict, Detail: v.Detail})
 			continue
 		}
-		st.byID[e.PublicationID] = e
+		st.byID[e.identityID()] = e
 	}
 	return st, nil
 }
@@ -418,8 +466,10 @@ func loadAnchorState(dir string, trust *exportTrustStore) (*anchorState, error) 
 // log. It is only ever consumed by a SUCCESSFUL append (ADR-053 §4.2), which is
 // what makes the surviving seqs contiguous (I4). An unclassifiable line makes
 // allocation fail-closed too — we cannot know which seqs are taken.
-func nextAnchorSeq(dir string) (int64, error) {
-	st, err := loadAnchorState(dir, nil)
+func nextAnchorSeq(dir string) (int64, error) { return nextAnchorSeqPath(anchorLogPath(dir)) }
+
+func nextAnchorSeqPath(path string) (int64, error) {
+	st, err := loadAnchorStatePath(path, filepath.Dir(path), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -437,7 +487,10 @@ func nextAnchorSeq(dir string) (int64, error) {
 // An unclassifiable line makes the append FAIL-CLOSED and leaves the file
 // byte-identical (ADR-053 I2).
 func appendAnchorEntry(dir string, capacity int, e anchorEntry) error {
-	path := filepath.Join(dir, chainAnchorFile)
+	return appendAnchorEntryPath(anchorLogPath(dir), capacity, e)
+}
+
+func appendAnchorEntryPath(path string, capacity int, e anchorEntry) error {
 	lines, _, err := readLogLines(path, anchorGroupOf)
 	if err != nil {
 		return err
@@ -474,19 +527,23 @@ func appendAnchorEntry(dir string, capacity int, e anchorEntry) error {
 		return aerr
 	}
 	if capacity > 0 {
-		return compactAnchorPrefix(dir, capacity)
+		return compactAnchorPrefixPath(path, capacity)
 	}
 	return nil
 }
 
-// compactAnchorPrefix bounds the log by whole seq groups — with one hard rule:
+func compactAnchorPrefix(dir string, capacity int) error {
+	return compactAnchorPrefixPath(anchorLogPath(dir), capacity)
+}
+
+// compactAnchorPrefixPath bounds the log by whole seq groups — with one hard rule:
 // it NEVER drops an UNCONFIRMED group. A `pending` group carries a delivery
 // obligation that A5 forbids re-creating (no re-dispatch), so evicting it would
 // silently erase the only thing that still remembers the delivery is owed
 // (ADR-053 §4.4 / T128). When the oldest group is unconfirmed the log is
 // deliberately left over capacity and the caller is told.
-func compactAnchorPrefix(dir string, capacity int) error {
-	st, err := loadAnchorState(dir, nil)
+func compactAnchorPrefixPath(path string, capacity int) error {
+	st, err := loadAnchorStatePath(path, filepath.Dir(path), nil)
 	if err != nil {
 		return err
 	}
@@ -497,7 +554,7 @@ func compactAnchorPrefix(dir string, capacity int) error {
 		return fmt.Errorf("anchor capacity %d exceeded (%d groups) but seq %d is still %s — refusing to evict an unconfirmed group",
 			capacity, st.window.Entries, st.window.MinSeq, oldest.State)
 	}
-	return compactLogPrefixGroups(filepath.Join(dir, chainAnchorFile), capacity, anchorGroupOf)
+	return compactLogPrefixGroups(path, capacity, anchorGroupOf)
 }
 
 // ---------------------------------------------------------------------------
@@ -798,6 +855,10 @@ func anchorBacklogBlocks(st *anchorState, capacity int) bool {
 // state line for the same seq (a state ADVANCE, never a rewrite — ADR-053 §1.2).
 // It never rolls back anything that already happened.
 func (s *HistoryExportScheduler) dispatchAnchor(ctx context.Context, e anchorEntry) error {
+	return s.dispatchAnchorPath(ctx, anchorLogPath(s.cfg.Dir), e)
+}
+
+func (s *HistoryExportScheduler) dispatchAnchorPath(ctx context.Context, path string, e anchorEntry) error {
 	dg, derr := anchorDigestOf(&e)
 	if derr != nil {
 		return derr
@@ -849,13 +910,59 @@ func (s *HistoryExportScheduler) dispatchAnchor(ctx context.Context, e anchorEnt
 	}
 	// The payload is unchanged, so the original signature still covers it: a
 	// state advance needs no re-signing (ADR-053 §1.3).
-	if aerr := appendAnchorEntry(s.cfg.Dir, s.cfg.AnchorCapacity, next); aerr != nil {
+	if aerr := appendAnchorEntryPath(path, s.cfg.AnchorCapacity, next); aerr != nil {
 		return aerr
 	}
 	if next.State != anchorStateAnchored {
 		return fmt.Errorf("anchor: seq %d is %s (attempt %d): %s", next.AnchorSeq, next.State, next.Attempts, next.LastError)
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Phase 41 — the second anchor family (ADR-055 §9)
+//
+// A lifecycle event is anchored through the SAME dispatch and the SAME ack
+// semantics as a publication (2xx + non-empty ack_id = anchored, 8 attempts ⇒
+// terminal `unanchored`), but into its OWN file and its own sequence space: the
+// two families must never share a group key, or the shared classifier would
+// read a publication seq and a lifecycle seq as one group.
+//
+// Two prohibitions are inherited verbatim: the anchor result is never used to
+// decide whether a key is valid, and the lifecycle ledger is never used to fill
+// an anchor hole.
+// ---------------------------------------------------------------------------
+
+func keyLifecycleAnchorPath(dir string) string { return filepath.Join(dir, keyLifecycleAnchorFile) }
+
+// anchorKeyLifecycleEvent records and dispatches the anchor of one lifecycle
+// event. The pending line is durable BEFORE the witness is contacted (R40-6).
+func (s *HistoryExportScheduler) anchorKeyLifecycleEvent(e keyLifecycleEntry) error {
+	if !s.anchorEnabled() || s.signer == nil {
+		return nil
+	}
+	path := keyLifecycleAnchorPath(s.cfg.Dir)
+	seq, err := nextAnchorSeqPath(path)
+	if err != nil {
+		return err
+	}
+	ae := anchorEntry{
+		AnchorSeq:   seq,
+		Kind:        anchorKindKeyLifecycle,
+		EventSeq:    e.EventSeq,
+		EventDigest: e.EventDigest,
+		EventType:   e.EventType,
+		NotAfter:    e.NotAfter,
+		RecordedAt:  s.clock().UTC().Format(time.RFC3339Nano),
+		State:       anchorStatePending,
+	}
+	if serr := s.signer.signAnchorEntry(&ae, s.cfg.Dir, s.clock()); serr != nil {
+		return serr
+	}
+	if aerr := appendAnchorEntryPath(path, s.cfg.AnchorCapacity, ae); aerr != nil {
+		return aerr
+	}
+	return s.dispatchAnchorPath(context.Background(), path, ae)
 }
 
 // anchorHousekeeping re-delivers entries that are still `pending` and have
@@ -940,11 +1047,11 @@ const (
 	anchorTrustDivergent   = "divergent"
 	anchorTrustAligned     = "aligned"
 
-	trustReasonForeignKey   = "foreign_key_id"
-	trustReasonForeignStrm  = "foreign_stream"
-	trustReasonNoOverlap    = "no_overlap"
-	trustReasonMalformed    = "malformed_sequence"
-	trustReasonNoWindow     = "no_local_window"
+	trustReasonForeignKey  = "foreign_key_id"
+	trustReasonForeignStrm = "foreign_stream"
+	trustReasonNoOverlap   = "no_overlap"
+	trustReasonMalformed   = "malformed_sequence"
+	trustReasonNoWindow    = "no_local_window"
 )
 
 // anchorItemResult is the per-publication row of the reconcile output.
@@ -957,14 +1064,14 @@ type anchorItemResult struct {
 }
 
 const (
-	witnessStateWitnessed          = "witnessed"
-	witnessStateDigestMismatch     = "digest_mismatch"
-	witnessStateMissing            = "missing_witness"
-	witnessStateOrphan             = "orphan_witness"
-	witnessStateOutsideWindow      = "witness_outside_window"
-	witnessStateAheadOfWindow      = "witness_ahead_of_window"
-	witnessStateUnconfirmed        = "witnessed_unconfirmed"
-	witnessStateNotEvaluated       = "not_evaluated"
+	witnessStateWitnessed      = "witnessed"
+	witnessStateDigestMismatch = "digest_mismatch"
+	witnessStateMissing        = "missing_witness"
+	witnessStateOrphan         = "orphan_witness"
+	witnessStateOutsideWindow  = "witness_outside_window"
+	witnessStateAheadOfWindow  = "witness_ahead_of_window"
+	witnessStateUnconfirmed    = "witnessed_unconfirmed"
+	witnessStateNotEvaluated   = "not_evaluated"
 )
 
 // anchorReconcileResult is the aggregate row (ADR-052 §5).

@@ -1017,3 +1017,74 @@ func (s *Server) handleHistoryExportAnchorReconcile(w http.ResponseWriter, r *ht
 	}
 	writeJSON(w, http.StatusOK, res)
 }
+
+// handleHistoryExportKeyLifecycle (Phase 41) is the signing-key lifecycle face.
+//
+//	GET  — the ledger's read-only roll-up (never creates or repairs the file)
+//	POST — append one lifecycle fact (activated / rotated_out / revoked)
+//
+// Both are admin-only; the POST additionally requires the same-origin check
+// (P22-9). Every refusal leaves the file byte-identical: a lifecycle fact that
+// cannot be recorded honestly is never recorded at all.
+func (s *Server) handleHistoryExportKeyLifecycle(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if !s.isAdmin(username) {
+		writeError(w, http.StatusForbidden, "admin role required")
+		return
+	}
+	if s.historyScheduler == nil {
+		writeError(w, http.StatusServiceUnavailable, "scheduled history export is disabled (configure --export-interval and --export-dir to enable)")
+		return
+	}
+	if r.Method == http.MethodGet {
+		res, rerr := s.historyScheduler.KeyLifecycleStatus()
+		if rerr != nil {
+			writeError(w, http.StatusInternalServerError, rerr.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
+	if !sameOriginOrFail(w, r) {
+		return
+	}
+	if r.Body != nil {
+		defer r.Body.Close()
+	}
+	var req keyLifecycleRequest
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<20))
+	if derr := dec.Decode(&req); derr != nil {
+		writeError(w, http.StatusBadRequest, "malformed request body")
+		return
+	}
+	e, aerr := s.historyScheduler.AppendKeyLifecycleEvent(req)
+	if aerr != nil {
+		msg := aerr.Error()
+		switch {
+		case strings.HasPrefix(msg, "key lifecycle: no key-authority"):
+			// Not an error: the Phase is simply not enabled on this deployment.
+			writeError(w, http.StatusServiceUnavailable, msg)
+			return
+		case strings.HasPrefix(msg, "key lifecycle: duplicate submission"),
+			strings.HasPrefix(msg, "key lifecycle: key "),
+			strings.HasPrefix(msg, "key lifecycle: refusing to append"):
+			// A conflict or an illegal transition: nothing was written.
+			writeError(w, http.StatusConflict, msg)
+			return
+		default:
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"event_seq":    e.EventSeq,
+		"event_type":   e.EventType,
+		"key_id":       e.KeyID,
+		"event_digest": e.EventDigest,
+		"recorded_at":  e.RecordedAt,
+	})
+}

@@ -88,6 +88,18 @@ type HistoryExportConfig struct {
 	// AnchorCapacity bounds `chain-anchor.jsonl` by whole `anchor_seq` groups.
 	// 0 disables the cap. An UNCONFIRMED group is never evicted to make room.
 	AnchorCapacity int
+	// KeyAuthorityPath (Phase 41) is the key-authority key (KAK): an Ed25519
+	// private key that signs lifecycle events and NOTHING else. EMPTY = the
+	// lifecycle ledger cannot be written.
+	KeyAuthorityPath string
+	// KeyAuthorityTrustPaths are the trusted KAK public keys used to verify the
+	// lifecycle ledger. EMPTY = the ledger cannot be verified, so every key
+	// stays unbounded (and construction refuses a write key without them).
+	KeyAuthorityTrustPaths []string
+	// KeyLifecycleCapacity bounds `signing-key-log.jsonl` by whole `event_seq`
+	// groups. 0 disables the cap. Bounds are lost from the OLDEST side, which
+	// can only remove an interval's evidence — never invent one.
+	KeyLifecycleCapacity int
 }
 
 // HistoryExportStatus is the read-only scheduler state surfaced via
@@ -106,22 +118,25 @@ type HistoryExportStatus struct {
 	LedgerError           string     `json:"ledger_error,omitempty"`            // Phase 39: ledger append/backfill problem (manifest stays published)
 	// Phase 40: anchor_enabled / counts / error / window. All omitempty, so a
 	// disabled anchor leaves the read surface byte-identical to Phase 39.
-	AnchorEnabled    bool          `json:"anchor_enabled,omitempty"`
-	AnchoredCount    int           `json:"anchored_count,omitempty"`
-	PendingCount     int           `json:"pending_count,omitempty"`
-	UnanchoredCount  int           `json:"unanchored_count,omitempty"`
-	AnchorError      string        `json:"anchor_error,omitempty"`
-	AnchorWindow     *anchorWindow `json:"anchor_window,omitempty"`
-	SigningEnabled   bool          `json:"signing_enabled"`         // Phase 37: a signing key is configured
-	SignerKeyID      string        `json:"signer_key_id,omitempty"` // Phase 37: derived (never configured) key id
-	TrustedKeys      int           `json:"trusted_keys"`            // Phase 37: size of the independent trust anchor
-	SkipCount        int64         `json:"skip_count"`
-	Published        int64         `json:"published"`
-	Failed           int64         `json:"failed"`
-	Dir                   string     `json:"dir,omitempty"`
-	Interval              string     `json:"interval,omitempty"`
-	Formats               []string   `json:"formats,omitempty"`
-	Retain                int        `json:"retain"`
+	AnchorEnabled   bool          `json:"anchor_enabled,omitempty"`
+	AnchoredCount   int           `json:"anchored_count,omitempty"`
+	PendingCount    int           `json:"pending_count,omitempty"`
+	UnanchoredCount int           `json:"unanchored_count,omitempty"`
+	AnchorError     string        `json:"anchor_error,omitempty"`
+	AnchorWindow    *anchorWindow `json:"anchor_window,omitempty"`
+	// Phase 41: key lifecycle roll-up. nil (and therefore absent) unless a key
+	// authority trust anchor is configured.
+	KeyLifecycle   *keyLifecycleStatusSummary `json:"key_lifecycle,omitempty"`
+	SigningEnabled bool                       `json:"signing_enabled"`         // Phase 37: a signing key is configured
+	SignerKeyID    string                     `json:"signer_key_id,omitempty"` // Phase 37: derived (never configured) key id
+	TrustedKeys    int                        `json:"trusted_keys"`            // Phase 37: size of the independent trust anchor
+	SkipCount      int64                      `json:"skip_count"`
+	Published      int64                      `json:"published"`
+	Failed         int64                      `json:"failed"`
+	Dir            string                     `json:"dir,omitempty"`
+	Interval       string                     `json:"interval,omitempty"`
+	Formats        []string                   `json:"formats,omitempty"`
+	Retain         int                        `json:"retain"`
 }
 
 // HistoryExportScheduler materializes the durable alert-transition history to
@@ -142,12 +157,18 @@ type HistoryExportScheduler struct {
 	trust  *exportTrustStore
 
 	// Phase 40: the witness transport (nil ⇒ anchoring disabled) and its limits.
-	anchorTransport   anchorTransport
-	anchorError       string
-	anchoredCount     int
-	pendingCount      int
-	unanchoredCount   int
-	anchorWindow      *anchorWindow
+	anchorTransport anchorTransport
+	anchorError     string
+	anchoredCount   int
+	pendingCount    int
+	unanchoredCount int
+	anchorWindow    *anchorWindow
+
+	// Phase 41: the key authority (KAK) and the last lifecycle error. The
+	// ledger itself is never cached — it is re-read on every evaluation, so a
+	// revocation recorded by another process is honoured immediately.
+	keyAuthority      *keyAuthority
+	keyLifecycleError string
 
 	mu             sync.Mutex
 	started        bool
@@ -264,6 +285,38 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		}
 	}
 
+	// Phase 41: the key authority. Two fail-fast rules, both the direct
+	// analogue of the Phase 37 rule that refuses a signer the verifier cannot
+	// resolve:
+	//   - a KAK write key with no KAK trust anchor would let us build a ledger
+	//     nobody can ever verify — a fake sense of time-bounded trust;
+	//   - a KAK whose key id equals the SIGNING key's collapses the
+	//     authorization chain into self-assertion (ADR-055 §7.1).
+	// A trust anchor without a write key is legal: that is the read-only
+	// deployment, which can still evaluate a ledger written elsewhere.
+	kakSigner, kerr := newExportSigner(cfg.KeyAuthorityPath, "")
+	if kerr != nil {
+		return nil, fmt.Errorf("history export: key authority: %w", kerr)
+	}
+	kakTrust, kerr2 := newExportTrustStore(cfg.KeyAuthorityTrustPaths)
+	if kerr2 != nil {
+		return nil, fmt.Errorf("history export: key authority trust: %w", kerr2)
+	}
+	if kakSigner != nil {
+		if kakTrust == nil || len(kakTrust.keys) == 0 {
+			return nil, errors.New("history export: --export-key-authority is set but no --export-key-authority-trust is configured — the lifecycle ledger could never be verified")
+		}
+		if _, ok := kakTrust.keys[kakSigner.keyID]; !ok {
+			return nil, fmt.Errorf("history export: key authority %s is absent from the configured KAK trust keys — its events would verify as key_unknown", kakSigner.keyID)
+		}
+		if signer != nil && kakSigner.keyID == signer.keyID {
+			return nil, fmt.Errorf("history export: key authority %s is the SAME key as the signing key — the authorization chain would be self-asserted", kakSigner.keyID)
+		}
+	}
+	if cfg.KeyLifecycleCapacity < 0 {
+		return nil, fmt.Errorf("history export: key lifecycle capacity %d is negative", cfg.KeyLifecycleCapacity)
+	}
+
 	return &HistoryExportScheduler{
 		cfg:             cfg,
 		clock:           clock,
@@ -271,7 +324,90 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		signer:          signer,
 		trust:           trust,
 		anchorTransport: transport,
+		keyAuthority:    &keyAuthority{signer: kakSigner, trust: kakTrust},
 	}, nil
+}
+
+// keyLifecycleConfig assembles the Phase 41 bundle. It is rebuilt on every use:
+// the ledger is the single source of truth and must never be shadowed by a
+// cached view (R41-6 — the ledger, not memory, decides the next seq and what is
+// a duplicate).
+func (s *HistoryExportScheduler) keyLifecycleConfig() keyLifecycleConfig {
+	if s == nil {
+		return keyLifecycleConfig{}
+	}
+	return keyLifecycleConfig{
+		dir:          s.cfg.Dir,
+		capacity:     s.cfg.KeyLifecycleCapacity,
+		ka:           s.keyAuthority,
+		signingTrust: s.trust,
+		streamID:     s.lifecycleStreamID(),
+	}
+}
+
+// lifecycleStreamID is the P40-derived identity of this export directory. It is
+// what makes a same-key/multi-directory omission visible instead of silently
+// importing a foreign revocation (R41-3 / R40-2).
+func (s *HistoryExportScheduler) lifecycleStreamID() string {
+	if s == nil {
+		return ""
+	}
+	id, err := deriveAnchorIdentity(s.signer, s.trust, s.cfg.Dir)
+	if err != nil || id == nil {
+		return ""
+	}
+	return id.StreamID
+}
+
+func (s *HistoryExportScheduler) setKeyLifecycleError(msg string) {
+	s.mu.Lock()
+	s.keyLifecycleError = msg
+	s.mu.Unlock()
+}
+
+func (s *HistoryExportScheduler) currentKeyLifecycleError() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keyLifecycleError
+}
+
+// AppendKeyLifecycleEvent records one lifecycle fact and, when anchoring is
+// enabled, hands it to the witness afterwards (ADR-055 §8 step 6 / §9).
+func (s *HistoryExportScheduler) AppendKeyLifecycleEvent(req keyLifecycleRequest) (keyLifecycleEntry, error) {
+	c := s.keyLifecycleConfig()
+	e, err := appendKeyLifecycleEvent(c, req, s.clock())
+	if err != nil {
+		s.setKeyLifecycleError(err.Error())
+		return e, err
+	}
+	s.setKeyLifecycleError("")
+	if s.anchorEnabled() {
+		if aerr := s.anchorKeyLifecycleEvent(e); aerr != nil {
+			// An anchor failure NEVER rolls back the recorded fact: the ledger
+			// is the evidence, the anchor is only the out-of-domain copy
+			// (ADR-053 I6, carried into Phase 41).
+			s.setAnchorError(aerr.Error())
+		}
+	}
+	return e, nil
+}
+
+// KeyLifecycleStatus returns the read-only roll-up. It never creates the file.
+func (s *HistoryExportScheduler) KeyLifecycleStatus() (keyLifecycleStatusSummary, error) {
+	c := s.keyLifecycleConfig()
+	if !c.enabled() {
+		return keyLifecycleStatusSummary{}, nil
+	}
+	out := keyLifecycleSummary(c)
+	if out.Error == "" {
+		if err := s.currentKeyLifecycleError(); err != "" {
+			out.Error = err
+		}
+	}
+	return out, nil
 }
 
 // Start launches the ticker loop bound to parent's lifecycle. It is
@@ -988,13 +1124,18 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 		Interval:              s.cfg.Interval.String(),
 		Formats:               s.cfg.Formats,
 		Retain:                s.cfg.Retain,
-		SigningEnabled:   s.signer != nil,
-		AnchorEnabled:    s.anchorEnabled(),
-		AnchoredCount:    s.anchoredCount,
-		PendingCount:     s.pendingCount,
-		UnanchoredCount:  s.unanchoredCount,
-		AnchorError:      s.anchorError,
-		AnchorWindow:     s.anchorWindow,
+		SigningEnabled:        s.signer != nil,
+		AnchorEnabled:         s.anchorEnabled(),
+		AnchoredCount:         s.anchoredCount,
+		PendingCount:          s.pendingCount,
+		UnanchoredCount:       s.unanchoredCount,
+		AnchorError:           s.anchorError,
+		AnchorWindow:          s.anchorWindow,
+	}
+	// Phase 41: omitted entirely when the key authority is not configured, so
+	// the status document stays byte-identical to Phase 40 (ADR-055 §10).
+	if kl := keyLifecycleSummary(s.keyLifecycleConfig()); kl.Enabled {
+		st.KeyLifecycle = &kl
 	}
 	if s.trust != nil {
 		st.TrustedKeys = len(s.trust.keys)

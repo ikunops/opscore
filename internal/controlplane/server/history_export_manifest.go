@@ -382,12 +382,12 @@ func ensurePublicationState(dir string) {
 // ManifestListEntry is one manifest-bearing snapshot as surfaced by
 // GET /management/v1/protection/alerts/history/export/manifest.
 type ManifestListEntry struct {
-	Snapshot      string `json:"snapshot"`
-	PublicationID int64  `json:"publication_id"`
-	ExportedAt    string `json:"exported_at"`
-	GeneratedAt   string `json:"generated_at"`
+	Snapshot      string   `json:"snapshot"`
+	PublicationID int64    `json:"publication_id"`
+	ExportedAt    string   `json:"exported_at"`
+	GeneratedAt   string   `json:"generated_at"`
 	Formats       []string `json:"formats"`
-	ManifestFile  string `json:"manifest_file"`
+	ManifestFile  string   `json:"manifest_file"`
 }
 
 // ErrCursorInvalid / ErrCursorExpired / ErrCursorAmbiguous map 1:1 onto the
@@ -505,15 +505,15 @@ type VerifyFormatResult struct {
 
 // VerifyResult is the per-snapshot verification verdict (A6 result model).
 type VerifyResult struct {
-	Snapshot      string              `json:"snapshot"`
-	Status        string              `json:"status"`
-	ExportedAt    string              `json:"exported_at,omitempty"`
-	MinSeq        int64               `json:"min_seq,omitempty"`
-	MaxSeq        int64               `json:"max_seq,omitempty"`
-	Records       int64               `json:"records,omitempty"`
-	SeqContinuity string              `json:"seq_continuity"`
+	Snapshot      string               `json:"snapshot"`
+	Status        string               `json:"status"`
+	ExportedAt    string               `json:"exported_at,omitempty"`
+	MinSeq        int64                `json:"min_seq,omitempty"`
+	MaxSeq        int64                `json:"max_seq,omitempty"`
+	Records       int64                `json:"records,omitempty"`
+	SeqContinuity string               `json:"seq_continuity"`
 	Formats       []VerifyFormatResult `json:"formats,omitempty"`
-	ExtraFiles    []string            `json:"extra_files,omitempty"`
+	ExtraFiles    []string             `json:"extra_files,omitempty"`
 	// Signature is the orthogonal Phase 37 dimension. It is absent when the
 	// manifest itself could not be parsed (P35 `unknown` semantics apply, and
 	// no signature verdict is ever fabricated).
@@ -552,6 +552,19 @@ func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyRes
 	if err != nil {
 		return nil, ChainVerdict{}, err
 	}
+	// Phase 41: the lifecycle ledger is read ONCE per evaluation and is the
+	// single source of truth for the interval check. When the key authority is
+	// not configured this stays nil and the surface is byte-identical to
+	// Phase 40 (ADR-055 §11).
+	var lifecycleState *keyLifecycleState
+	if klc := s.keyLifecycleConfig(); klc.enabled() {
+		lifecycleState, err = loadKeyLifecycleState(klc)
+		if err != nil {
+			s.setKeyLifecycleError(err.Error())
+		} else {
+			s.setKeyLifecycleError("")
+		}
+	}
 	// Publication-id uniqueness is a NAMESPACE property: it is checked over the
 	// FULL manifest set BEFORE the limit window is applied (R177/B — a
 	// duplicate outside the requested page must still poison the namespace).
@@ -576,6 +589,13 @@ func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyRes
 		idCount[m.PublicationID]++
 		// Phase 37/38 dimensions, computed over the full retained set.
 		v := verifyManifestSignature(m, s.trust)
+		// Phase 41 (WHEN) — the ONE call site, strictly after P37 decided WHO
+		// and strictly before the status is lowered. `verifyManifestSignature`
+		// itself is untouched.
+		if lifecycleState != nil {
+			a := lifecycleState.authorizationFor(v.KeyID)
+			v = authorizeByLifecycle(v, signedAtOfManifest(m), a)
+		}
 		sigByGroup[g.identity] = v
 		if m.SchemaVersion >= manifestSchemaVersionV4 && m.Chain != nil {
 			chainBearing++
@@ -802,6 +822,16 @@ func (s *HistoryExportScheduler) VerifySnapshotsDetailed(limit int) ([]VerifyRes
 		out = append(out, res)
 	}
 	return out, chainVerdict, nil
+}
+
+// signedAtOfManifest reads the manifest's own time declaration. It is
+// self-asserted (P41 is not a timestamp authority) but it is the only input the
+// interval check has, and an unparseable one is itself assertable (R41-7).
+func signedAtOfManifest(m *snapshotManifest) string {
+	if m == nil || m.Signature == nil {
+		return ""
+	}
+	return m.Signature.SignedAt
 }
 
 func sortFormats(fs []VerifyFormatResult) {
