@@ -512,10 +512,41 @@ type verificationConfig struct {
 	// observe (Phase 43) is the destruction hook this log's prefix compaction
 	// installs. nil ⇒ the log compacts exactly as it did in Phase 42.
 	observe compactionObserver
+	// Phase 44 (ADR-064 §1): the verifier's OWN signing identity (VAK) and its
+	// OWN trust anchor, both nil unless --export-verifier-key is configured.
+	// There is deliberately no second on switch: a VAK configuration IS
+	// independent mode, and its consistency with --export-verify-attest is
+	// enforced by the V4 construction guard (history_export_scheduler.go).
+	// Schema note: the log entry shape is UNCHANGED — `key_id` only changes its
+	// VALUE (the VAK key id), never the field set (ADR-064 §1).
+	verifierSigner *exportSigner
+	verifierTrust  *exportTrustStore
+	// foreignKeys is the set of key_ids this deployment knows from its OTHER
+	// trust anchors (manifest trust ∪ KAK trust). It is used ONLY to separate
+	// "known key of another family" (`verification_unauthorized`) from "key we
+	// do not know at all" (`key_unknown`) — I3's two tracks. It never stores
+	// public keys and is never a trust input.
+	foreignKeys map[string]bool
 }
 
 func (c verificationConfig) enabled() bool {
 	return c.on && c.signer != nil && c.trust != nil && len(c.trust.keys) > 0
+}
+
+// independent reports whether the verifier identity is SEPARATE from the
+// evidence identity (ADR-064 §1). Closed mode (no VAK) is never independent,
+// which is what makes every P44 addition an omitempty dead path there (I6).
+func (c verificationConfig) independent() bool {
+	return c.verifierSigner != nil && c.verifierTrust != nil && len(c.verifierTrust.keys) > 0
+}
+
+// verifySigner returns the identity that SIGNS verification entries: the VAK
+// in independent mode, the evidence (export) key otherwise (ADR-064 §2).
+func (c verificationConfig) verifySigner() *exportSigner {
+	if c.independent() {
+		return c.verifierSigner
+	}
+	return c.signer
 }
 
 // ---------------------------------------------------------------------------
@@ -532,12 +563,45 @@ type verificationWindow struct {
 	Continuous bool  `json:"continuous"`
 }
 
+// verificationProblem (Phase 44, ADR-064 §1) is one entry-level signature
+// failure, same shape as the Phase 43 destructionProblem
+// (snapshot_destruction.go). It is filled ONLY in independent mode — closed
+// mode keeps it nil so every response stays byte-identical to Phase 42 (I6).
+// The verdicts are the sigVerdict family plus `verification_unauthorized`
+// (I3): a problem states WHY one entry is not verifiable; it never merges
+// into any overall verdict (I5 — the exit is never an input).
+type verificationProblem struct {
+	ReportSeq int64  `json:"report_seq"`
+	Verdict   string `json:"verdict"`
+	Detail    string `json:"detail,omitempty"`
+}
+
+// verificationVerdictUnauthorized (Phase 44, I3) — the entry was signed by a
+// key this deployment KNOWS (it sits in the manifest or KAK trust anchor) but
+// which is not authorized to sign verification reports. Stronger than
+// `key_unknown`: it asserts a FAMILY violation, not an unknown identity.
+const verificationVerdictUnauthorized = "verification_unauthorized"
+
 type verificationState struct {
 	entries    []verificationLogEntry
 	window     verificationWindow
 	verifiable bool
 	errs       []string
 	total      int
+	// problems (Phase 44) mirrors the per-entry signature failures in
+	// independent mode. Closed mode never fills it (I6).
+	problems []verificationProblem
+}
+
+// verifyTrackFor (ADR-064 §2) selects the trust anchor — and the foreign-key
+// set — that signature checks run against: the verifier's OWN anchor plus the
+// deployment's other known keys in independent mode; the manifest anchor with
+// a nil foreign set otherwise (the Phase 42 behaviour, byte-for-byte).
+func (c verificationConfig) verifyTrackFor() (*exportTrustStore, map[string]bool) {
+	if c.independent() {
+		return c.verifierTrust, c.foreignKeys
+	}
+	return c.trust, nil
 }
 
 // loadVerificationState reads and validates the log. It is strictly fail-closed
@@ -567,6 +631,9 @@ func loadVerificationState(c verificationConfig) (*verificationState, error) {
 	prevDigest := ""
 	seqs := make([]int64, 0, len(lines))
 	seenSeq := map[int64]bool{}
+	// Phase 44: the signature check runs against the verifier's own trust
+	// anchor in independent mode, against the manifest anchor otherwise.
+	sigTrust, sigForeign := c.verifyTrackFor()
 	for i := range lines {
 		var e verificationLogEntry
 		if jerr := json.Unmarshal(lines[i].raw, &e); jerr != nil {
@@ -586,9 +653,18 @@ func loadVerificationState(c verificationConfig) (*verificationState, error) {
 		}
 		seenSeq[e.ReportSeq] = true
 
-		if v := verifyVerificationEntrySignature(&e, c.trust); v.Verdict != sigVerdictOK {
+		if v := verifyVerificationEntrySignatureIn(&e, sigTrust, sigForeign); v.Verdict != sigVerdictOK {
 			st.verifiable = false
 			st.errs = append(st.errs, fmt.Sprintf("report_seq %d: %s (%s)", e.ReportSeq, v.Verdict, v.Detail))
+			// Phase 44 (ADR-064 §1): the structured per-entry problem is filled
+			// ONLY in independent mode; closed mode keeps problems nil so every
+			// response stays byte-identical to Phase 42 (I6). The problem is an
+			// ADDITIONAL channel — it never replaces or masks the errs channel
+			// above, and the window check below stays independent of it (I4/P43
+			// I4 discipline: parallel channels, never a masking merge).
+			if c.independent() {
+				st.problems = append(st.problems, verificationProblem{ReportSeq: e.ReportSeq, Verdict: v.Verdict, Detail: v.Detail})
+			}
 			prevDigest = ""
 			continue
 		}
@@ -660,7 +736,24 @@ func (s *exportSigner) signVerificationEntry(e *verificationLogEntry, at time.Ti
 	return nil
 }
 
+// verifyVerificationEntrySignature is the Phase 42 entry signature check. It
+// is kept VERBATIM as a thin wrapper (the P41 loadAnchorStatePath /
+// dispatchAnchorPath discipline): closed mode delegates to the In-variant with
+// a nil foreign set, whose behaviour is byte-identical to Phase 42 on every
+// branch (ADR-064 §2 / §11).
 func verifyVerificationEntrySignature(e *verificationLogEntry, trust *exportTrustStore) SignatureVerdict {
+	return verifyVerificationEntrySignatureIn(e, trust, nil)
+}
+
+// verifyVerificationEntrySignatureIn (Phase 44, ADR-064 §2) adds exactly ONE
+// branch to the frozen Phase 42 decision order: when the signing key_id is NOT
+// in the supplied trust anchor but IS known to this deployment from another
+// trust anchor (foreign), the verdict is `verification_unauthorized` (I3) — a
+// family violation — instead of `key_unknown` (an unknown identity). Every
+// other branch (absent / malformed / invalid / ok) is the Phase 42 logic
+// byte-for-byte, and foreign == nil degrades to the Phase 42 behaviour
+// constructively (I6).
+func verifyVerificationEntrySignatureIn(e *verificationLogEntry, trust *exportTrustStore, foreign map[string]bool) SignatureVerdict {
 	if e == nil || e.Signature == nil {
 		return SignatureVerdict{Verdict: sigVerdictAbsent, KeyID: e.KeyID, Detail: "verification report carries no signature"}
 	}
@@ -673,10 +766,16 @@ func verifyVerificationEntrySignature(e *verificationLogEntry, trust *exportTrus
 		return SignatureVerdict{Verdict: sigVerdictMalformed, KeyID: sb.KeyID, Detail: "verification signature is not valid base64"}
 	}
 	if trust == nil || len(trust.keys) == 0 {
+		if foreign[sb.KeyID] {
+			return SignatureVerdict{Verdict: verificationVerdictUnauthorized, KeyID: sb.KeyID, Detail: "verification key_id belongs to another trust anchor of this deployment and is not authorized to sign verification reports"}
+		}
 		return SignatureVerdict{Verdict: sigVerdictKeyUnknown, KeyID: sb.KeyID, Detail: "no trusted export keys are configured"}
 	}
 	pub, known := trust.keys[sb.KeyID]
 	if !known {
+		if foreign[sb.KeyID] {
+			return SignatureVerdict{Verdict: verificationVerdictUnauthorized, KeyID: sb.KeyID, Detail: "verification key_id belongs to another trust anchor of this deployment and is not authorized to sign verification reports"}
+		}
 		return SignatureVerdict{Verdict: sigVerdictKeyUnknown, KeyID: sb.KeyID, Detail: "verification key_id is not in the trusted set"}
 	}
 	payload, perr := canonicalVerificationEntryPayload(e)
@@ -913,6 +1012,12 @@ func appendVerificationReport(c verificationConfig, r *VerificationReport, at ti
 	maxSeq := int64(0)
 	prevDigest := ""
 	seenSeq := map[int64]bool{}
+	// Phase 44: appending self-verifies the log against the SAME track the
+	// loader uses (the verifier's own anchor in independent mode). Building on
+	// an entry the verifier cannot vouch for — including one signed by a KNOWN
+	// foreign key (`verification_unauthorized`) — would launder the forgery
+	// into the operator's history: refused (I2, fail-closed).
+	sigTrust, sigForeign := c.verifyTrackFor()
 	for i := range lines {
 		var e verificationLogEntry
 		if jerr := json.Unmarshal(lines[i].raw, &e); jerr != nil {
@@ -924,7 +1029,7 @@ func appendVerificationReport(c verificationConfig, r *VerificationReport, at ti
 		seenSeq[e.ReportSeq] = true
 		// Appending to a log we cannot evaluate would launder the corruption
 		// (P41 I2, generalised to this log).
-		if v := verifyVerificationEntrySignature(&e, c.trust); v.Verdict != sigVerdictOK {
+		if v := verifyVerificationEntrySignatureIn(&e, sigTrust, sigForeign); v.Verdict != sigVerdictOK {
 			return fmt.Errorf("verification: refusing to append — report_seq %d is %s (%s)", e.ReportSeq, v.Verdict, v.Detail)
 		}
 		if c.streamID != "" && e.StreamID != "" && e.StreamID != c.streamID {
@@ -937,6 +1042,11 @@ func appendVerificationReport(c verificationConfig, r *VerificationReport, at ti
 	}
 
 	r.ReportSeq = maxSeq + 1
+	// Phase 44 (ADR-064 §2): the entry is signed by the VERIFIER's identity —
+	// the VAK in independent mode, the evidence key otherwise. One source swap,
+	// one place; the signature block, the canonical payload and the schema are
+	// untouched (`key_id` only changes its value).
+	signingKey := c.verifySigner()
 	e := verificationLogEntry{
 		V:          1,
 		ReportSeq:  r.ReportSeq,
@@ -947,7 +1057,7 @@ func appendVerificationReport(c verificationConfig, r *VerificationReport, at ti
 		Reasons:    r.Reasons,
 		VerifiedAt: r.VerifiedAt,
 		StreamID:   c.streamID,
-		KeyID:      c.signer.keyID,
+		KeyID:      signingKey.keyID,
 		PrevDigest: prevDigest,
 	}
 	edg, ederr := verificationEntryDigest(&e)
@@ -955,7 +1065,7 @@ func appendVerificationReport(c verificationConfig, r *VerificationReport, at ti
 		return ederr
 	}
 	e.Digest = edg
-	if serr := c.signer.signVerificationEntry(&e, at); serr != nil {
+	if serr := signingKey.signVerificationEntry(&e, at); serr != nil {
 		return serr
 	}
 	// A second entry digest over the SAME report bytes ties the log line to the
@@ -1002,7 +1112,36 @@ func (s *HistoryExportScheduler) verificationConfig() verificationConfig {
 		streamID: s.lifecycleStreamID(),
 		on:       s.cfg.VerifyAttest,
 		observe:  s.destructionObserver(destructionKindVerificationCompaction),
+		// Phase 44 (ADR-064 §1): the verifier's own identity. Both stay nil
+		// unless the deployment configured a VAK, which keeps closed mode
+		// byte-identical to Phase 42 (I6).
+		verifierSigner: s.verifierSigner,
+		verifierTrust:  s.verifierTrust,
+		foreignKeys:    s.verifierForeignKeys(),
 	}
+}
+
+// verifierForeignKeys (Phase 44, ADR-064 §1) derives the "known foreign" set
+// for I3: the key_ids this deployment trusts in its OTHER anchors (manifest ∪
+// KAK). It stores ids only, never public keys, and is only ever consulted to
+// distinguish `verification_unauthorized` from `key_unknown` — never as a
+// trust input. nil unless independent mode is on.
+func (s *HistoryExportScheduler) verifierForeignKeys() map[string]bool {
+	if s == nil || s.verifierTrust == nil || len(s.verifierTrust.keys) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	if s.trust != nil {
+		for id := range s.trust.keys {
+			out[id] = true
+		}
+	}
+	if s.keyAuthority != nil && s.keyAuthority.trust != nil {
+		for id := range s.keyAuthority.trust.keys {
+			out[id] = true
+		}
+	}
+	return out
 }
 
 func (s *HistoryExportScheduler) setVerificationError(msg string) {
@@ -1225,6 +1364,14 @@ type VerificationView struct {
 	ScopeChanged        []VerificationChange `json:"scope_changed,omitempty"`
 	WindowDiscontinuous bool                 `json:"window_discontinuous,omitempty"`
 	Error               string               `json:"error,omitempty"`
+	// Phase 44 (ADR-064 §1/§6): DERIVED display fields, never persisted — the
+	// on-disk identity is the entry's own `key_id`. All omitempty: closed mode
+	// never emits them, so the Phase 42 response bytes are unchanged (I6/T222b).
+	// Per I5 they are projections of the construction-time guards; they never
+	// merge into any verdict.
+	VerifierKeyID       string                `json:"verifier_key_id,omitempty"`
+	VerifierIndependent bool                  `json:"verifier_independent,omitempty"`
+	Problems            []verificationProblem `json:"problems,omitempty"`
 }
 
 // verificationStatusSummary is the roll-up on the scheduler status face.
@@ -1234,6 +1381,10 @@ type verificationStatusSummary struct {
 	Window      *verificationWindow `json:"window,omitempty"`
 	LastOverall string              `json:"last_overall,omitempty"`
 	Error       string              `json:"error,omitempty"`
+	// Phase 44 (ADR-064 §1/§6): omitempty projections of independent mode —
+	// closed mode stays byte-identical to Phase 42 (T233/M5).
+	VerifierKeyID       string `json:"verifier_key_id,omitempty"`
+	VerifierIndependent bool   `json:"verifier_independent,omitempty"`
 }
 
 // verificationSummary builds the roll-up. Read-only: it never creates,
@@ -1244,6 +1395,11 @@ func verificationSummary(c verificationConfig) verificationStatusSummary {
 		return out
 	}
 	out.Enabled = true
+	// Phase 44: identity projections only — never a verdict input (I5).
+	if c.independent() {
+		out.VerifierKeyID = c.verifierSigner.keyID
+		out.VerifierIndependent = true
+	}
 	st, err := loadVerificationState(c)
 	if err != nil {
 		out.Error = err.Error()
@@ -1271,11 +1427,18 @@ func (s *HistoryExportScheduler) VerificationView() (VerificationView, error) {
 	}
 	out.Enabled = true
 	c := s.verificationConfig()
+	// Phase 44: identity projections (derived, never persisted, never a
+	// verdict input — I5). Closed mode leaves all three fields zero (I6).
+	if c.independent() {
+		out.VerifierKeyID = c.verifierSigner.keyID
+		out.VerifierIndependent = true
+	}
 	st, err := loadVerificationState(c)
 	if err != nil {
 		out.Error = err.Error()
 		return out, nil
 	}
+	out.Problems = st.problems // nil in closed mode (I6)
 	w := st.window
 	out.Window = &w
 	out.Absent = st.total == 0

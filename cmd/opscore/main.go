@@ -488,6 +488,13 @@ func cmdServe(args []string) {
 	exportVerifyAttest := fs.Bool("export-verify-attest", false, "record signed verification reports (verification-log.jsonl) so 'never verified' becomes assertable instead of silent (requires --export-sign-key and --export-trust-keys)")
 	exportVerifyInterval := fs.Duration("export-verify-interval", 0, "interval of the periodic verification attestation (0 = only on demand; requires --export-verify-attest)")
 	exportVerifyCapacity := fs.Int("export-verify-capacity", 4096, "max verification report groups to retain (oldest whole groups first; compaction only ever lifts the assertion boundary, it never invents one, 0 = keep all)")
+	// Phase 44 (verifier independence): OPT-IN and OFF by default (both empty).
+	// The verification report is a JUDGEMENT about the evidence, so it is signed
+	// by the verifier's OWN key (VAK), never by the evidence signer; its trust
+	// anchor must not overlap the manifest/KAK anchors (construction guards).
+	// Empty flags = Phase 42 behaviour byte-for-byte.
+	exportVerifierKey := fs.String("export-verifier-key", "", "Ed25519 PRIVATE key of the verifier (VAK) that signs verification reports; must differ from --export-sign-key and --export-key-authority (empty = independent verification identity disabled)")
+	exportVerifierTrust := fs.String("export-verifier-trust", "", "comma-separated trusted Ed25519 PUBLIC keys of the verifier, used to verify the verification log; must not overlap --export-trust-keys or --export-key-authority-trust (required when --export-verifier-key is set)")
 	// Phase 43 (destruction accountability): OPT-IN and OFF by default. It makes
 	// "did that evidence leave on the record, or did it just disappear?"
 	// assertable. The signing authority is the Phase 41 KAK, so no new key flag
@@ -644,6 +651,9 @@ func cmdServe(args []string) {
 			VerifyAttest:   *exportVerifyAttest,
 			VerifyInterval: *exportVerifyInterval,
 			VerifyCapacity: *exportVerifyCapacity,
+			// Phase 44: verifier identity & trust-anchor independence.
+			VerifierKeyPath:   *exportVerifierKey,
+			VerifierTrustPaths: parseExportFormats(*exportVerifierTrust),
 			// Phase 43: destruction accountability (KAK and anchor flags
 			// are deliberately reused — no new trust anchor is introduced).
 			DestructionLog:      *exportDestructionLog,

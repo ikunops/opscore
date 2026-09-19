@@ -112,6 +112,18 @@ type HistoryExportConfig struct {
 	// VerifyCapacity bounds `verification-log.jsonl` by whole `report_seq`
 	// groups. 0 disables the cap.
 	VerifyCapacity int
+	// VerifierKeyPath (Phase 44) is the VERIFIER's own Ed25519 private key
+	// (VAK): the identity that signs verification reports, deliberately a
+	// DIFFERENT key from the evidence signer and from the KAK (I1). EMPTY =
+	// independent mode is OFF and every Phase 44 surface stays byte-identical
+	// to Phase 42 (ADR-064 §1 — the VAK configuration IS the switch).
+	VerifierKeyPath string
+	// VerifierTrustPaths (Phase 44) are the trusted VAK public keys used to
+	// verify the verification log. They form the verifier's OWN trust anchor,
+	// loaded from an independent configuration source; V2 refuses any overlap
+	// with the manifest or KAK anchors at construction (one key must never sit
+	// in two trust anchors).
+	VerifierTrustPaths []string
 	// DestructionLog (Phase 43) turns destruction accountability on. FALSE by
 	// default: no file, no hook, no behaviour change anywhere (ADR-061 §1.5).
 	DestructionLog bool
@@ -199,6 +211,13 @@ type HistoryExportScheduler struct {
 	// re-read on every evaluation, so a report recorded by another process is
 	// honoured immediately (the R41-6 discipline, inherited).
 	verificationError string
+
+	// Phase 44 (ADR-064 §1): the verifier's own signing identity (VAK) and its
+	// own trust anchor. Both nil unless --export-verifier-key is configured;
+	// the disjointness from the other two anchors is a CONSTRUCTION-TIME
+	// invariant (V2/V3), not a runtime check.
+	verifierSigner *exportSigner
+	verifierTrust  *exportTrustStore
 
 	// Phase 43: destruction accountability. The log is never cached either.
 	destructionError string
@@ -403,6 +422,95 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		return nil, fmt.Errorf("history export: destruction capacity %d is negative", cfg.DestructionCapacity)
 	}
 
+	// Phase 44 (ADR-064 §5): the verifier's own identity (VAK). Loaded exactly
+	// like the KAK (history_export_scheduler.go Phase 41 block) — an empty path
+	// yields (nil, nil), so closed mode stays byte-identical to Phase 42 (I6).
+	// The V1~V4 fail-fast guards follow the destruction block below.
+	vakSigner, verr := newExportSigner(cfg.VerifierKeyPath, "")
+	if verr != nil {
+		return nil, fmt.Errorf("history export: verifier key: %w", verr)
+	}
+	verifierTrust, verr2 := newExportTrustStore(cfg.VerifierTrustPaths)
+	if verr2 != nil {
+		return nil, fmt.Errorf("history export: verifier trust: %w", verr2)
+	}
+
+	// V1 — a VAK the verifier cannot resolve is not a verifier: no own trust
+	// anchor, or absent from it, would produce reports nobody can verify
+	// (T79b / P41 I1 lineage, same shape as the Phase 41 KAK block above).
+	// Construction-time fail-fast, never a "enable first, add keys later"
+	// window.
+	if vakSigner != nil {
+		if verifierTrust == nil || len(verifierTrust.keys) == 0 {
+			return nil, errors.New("history export: --export-verifier-key is set but no --export-verifier-trust is configured — verification reports could never be verified against the verifier's own anchor")
+		}
+		if _, ok := verifierTrust.keys[vakSigner.keyID]; !ok {
+			return nil, fmt.Errorf("history export: verifier key %s is absent from the configured verifier trust keys — its reports would verify as key_unknown", vakSigner.keyID)
+		}
+		// V3 — the VAK must be a DIFFERENT KEY from the evidence signer and
+		// from the KAK. Checked before V2's anchor membership because identity
+		// equality always implies anchor overlap (the signer's id is already in
+		// the manifest anchor by the Phase 37 guard): without this earlier
+		// check V3 could never produce its own, more precise diagnosis.
+		if signer != nil && vakSigner.keyID == signer.keyID {
+			return nil, fmt.Errorf("history export: verifier key %s is the SAME key as the signing key — the verification judgement would be self-asserted", vakSigner.keyID)
+		}
+		if kakSigner != nil && vakSigner.keyID == kakSigner.keyID {
+			return nil, fmt.Errorf("history export: verifier key %s is the SAME key as the key authority — the observation identity would collapse into the authorization identity", vakSigner.keyID)
+		}
+		// V2 — mutual reachability (I1: the three anchors are PAIRWISE
+		// DISJOINT, the three private keys pairwise different). One key must
+		// never sit in two trust anchors, so ANY intersection is refused. The
+		// four explicit membership checks carry the precise diagnosis:
+		//   ② signing key ∈ verifier trust
+		//   ③ KAK ∈ verifier trust
+		//   ④ VAK ∈ manifest trust
+		//   ⑤ VAK ∈ KAK trust
+		// and the sweep then refuses ANY remaining intersection — ① (a shared
+		// non-VAK manifest key) and the residual case ①~⑤ alone would miss (a
+		// non-VAK, non-KAK verifier key also trusted by the KAK anchor).
+		// key_id is derived from the public key and never configurable
+		// (snapshot_signature.go), so id-level comparison is public-key-level.
+		if signer != nil {
+			if _, ok := verifierTrust.keys[signer.keyID]; ok {
+				return nil, fmt.Errorf("history export: signing key %s must not appear in the verifier trust anchor — the evidence signer would authorize its own verification", signer.keyID)
+			}
+		}
+		if kakSigner != nil {
+			if _, ok := verifierTrust.keys[kakSigner.keyID]; ok {
+				return nil, fmt.Errorf("history export: key authority %s must not appear in the verifier trust anchor — the authorization identity would judge observations", kakSigner.keyID)
+			}
+		}
+		if trust != nil {
+			if _, ok := trust.keys[vakSigner.keyID]; ok {
+				return nil, fmt.Errorf("history export: verifier key %s must not appear in the manifest trust anchor — the verifier would be able to sign evidence", vakSigner.keyID)
+			}
+		}
+		if kakTrust != nil {
+			if _, ok := kakTrust.keys[vakSigner.keyID]; ok {
+				return nil, fmt.Errorf("history export: verifier key %s must not appear in the KAK trust anchor — the observer would hold authorization power", vakSigner.keyID)
+			}
+		}
+		for id := range verifierTrust.keys {
+			if trust != nil {
+				if _, ok := trust.keys[id]; ok {
+					return nil, fmt.Errorf("history export: verifier trust key %s is also a manifest trust key — one key must never sit in two trust anchors (I1)", id)
+				}
+			}
+			if kakTrust != nil {
+				if _, ok := kakTrust.keys[id]; ok {
+					return nil, fmt.Errorf("history export: verifier trust key %s is also a KAK trust key — one key must never sit in two trust anchors (I1)", id)
+				}
+			}
+		}
+		// V4 — a VAK without attestation switched on is a self-contradiction:
+		// the verifier identity only matters for RECORDED reports (symmetric to
+		// the Phase 42 interval guard).
+		if !cfg.VerifyAttest {
+			return nil, errors.New("history export: --export-verifier-key is set but --export-verify-attest is not — the verifier identity only matters for recorded verification reports")
+		}
+	}
+
 	return &HistoryExportScheduler{
 		cfg:             cfg,
 		clock:           clock,
@@ -411,6 +519,8 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		trust:           trust,
 		anchorTransport: transport,
 		keyAuthority:    &keyAuthority{signer: kakSigner, trust: kakTrust},
+		verifierSigner:  vakSigner,
+		verifierTrust:   verifierTrust,
 	}, nil
 }
 
