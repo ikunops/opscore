@@ -110,7 +110,7 @@ durable 行 Sync 成功（既有代码）→ 接受条目追加（同 s.mu 临�
 5. **KAK 门控**：G1 同 P43 ⇒ 启用输入完整性强制要求 KAK 部署（构造期失败，无「先启用后补钥」窗口）。
 6. 记账有界 ⇒ 早期接受条目被合法 compaction 裁掉 ⇒ 对应记录的 intact 断言不可用（账本窗口纪律：结果强制携带 `acceptance_window{min_entry, max_entry, entries, continuous}` + `coverage_floor`；段不连续 ⇒ `window_discontinuous` 可断言）。
 7. **启用但账本缺失/空** ⇒ `input_absent`（与「从未接受任何记录」本地同形，诚实）。
-8. **记账失败不补记**（补记弱化「接受时事实」语义）：`acceptanceErr` 粘滞至下一次成功追加；Append 热路径 double-Sync（store + 账本）时延为已知运维代价。
+8. **记账失败不补记**（补记弱化「接受时事实」语义）：`acceptanceErr` 粘滞至下一次成功追加；Append 热路径 double-Sync（store + 账本）+ KAK 签名（CPU，Ed25519 微秒级）为已知运维代价。
 
 ## 5. 测试契约（T237~T257；T236 已被 P44 占用，全表右移一号）
 
@@ -135,7 +135,7 @@ durable 行 Sync 成功（既有代码）→ 接受条目追加（同 s.mu 临�
 | T253 | 变异 M1~M5（摘 modified 判定 / 摘 span 边界含上界 / 放行同 entry_seq 第二行 / 摘 missing 循环 / 摘 unaccepted ⇒ T239/T241·T254/T244/T240/T242 必红，sha256 还原） |
 | T254 | 删最新记录 / 回滚 store 文件 ⇒ 账本高 seq 条目 `record_missing_in_span`（上界缝隙闭合，评审 F2） |
 | T255 | store `Corrupt`/`LoadErr` ⇒ `input_unverifiable` + `input_error`，绝不 input_ok 假绿（评审 F3） |
-| T256 | capacity 满 ⇒ 新条目被拒（记录照常持久 + unaccepted 响亮）且**最旧组不被裁**（I7） |
+| T256 | compaction 被拒（记账不可用）⇒ 新条目被拒（记录照常持久 + unaccepted 响亮）且**不发生无记账裁组**（I7；常态有界化 = 带记账 compaction，A8-6） |
 | T257 | 合法 compaction 后链首豁免（I4）；未篡改记录重导出 ⇒ intact（I2 反向守卫：re-marshal 漂移先于此红） |
 
 ## 6. 与既有 Phase 的关系

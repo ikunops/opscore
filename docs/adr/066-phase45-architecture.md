@@ -62,12 +62,16 @@ if s.acceptance != nil {
 ```
 
 - **record-first**（ADR-065 A3）：崩溃窗 ⇒ record_unaccepted 响亮。
-- `record(seq, line, clock)` 内部：`entry_seq` 由账本自身 max+1 导出（**无水位文件**，R41-6 纪律）、KAK 签名、`appendLogLine`。自有互斥 `acceptanceMu`（并发域 = store.Append 持 s.mu 单写者 + compaction；锁序 **s.mu → acceptanceMu → destructionWriteMu → destructionDispatchMu**，与 P43/P44 既有锁序图合并后必须无环）。
-- **锁内无 witness I/O**（P43 N1/N2）：锚定派发收集后置——`record()` 只收集 pending，由 scheduler tick 尾部 `dispatchAcceptancePending()` 统一派发（dispatchMu 内）。
+- `record(seq, line, clock)` 内部：`entry_seq` 由账本自身 max+1 导出（**无水位文件**，R41-6 纪律）、KAK 签名、`appendLogLine`。自有互斥 `acceptanceMu`（并发域 = store.Append 持 s.mu 单写者 + compaction）。
+- **锁内零网络 I/O（I6，架构级强制）**——本流有**两个**派生源，都必须收集后置（P43 N1/N2 纪律）：
+  1. acceptance-anchor 派发：`record()` 只收集 pending，scheduler tick 尾部 `dispatchAcceptancePending()` 统一派发；
+  2. **acceptance compaction 的销毁观察点（评审 B1）**：该观察点在 s.mu+acceptanceMu 内触发 `destructionObserver`，其 complete 闭包若按 P43 默认配置会同步 witness 派发 ⇒ **此调用点的销毁配置必须为 collect-only 变体**——`anchorDispatch` 换成**入队器**（terminal 条目进 scheduler 级 `destructionAnchorQueue`，由 `destructionDispatchMu` 守卫；入队零 I/O，且在 destructionWriteMu 释放**之后**进行，两锁不嵌套）；scheduler tick 尾部 drain 该队列做真实派发。⇒ witness 网络 I/O 永不持有 s.mu / acceptanceMu / destructionWriteMu 中的任何一个。
+- **真实获取图（I6 定稿，取代任何「线性锁序」表述）**：tracker `t.mu` → store `s.mu` → `acceptanceMu` → `destructionWriteMu`（观察者记账，无派发）；`destructionDispatchMu`、`verificationWriteMu` 各自独立持有（P43 已冻结「dispatchMu → writeMu 永不反向」——本流绝不引入 writeMu→dispatchMu 嵌套）；`scheduler.mu` 为叶。图无环，且**任何 witness I/O 都不在上列写锁内**。
 - `acceptanceErr` 暴露于状态面（`input_error`）；**失败不补记**（补记弱化接受时语义），粘滞至下一次成功追加。
 - 账本路径 = export dir 同域（与 chain-ledger/chain-anchor/verification-log 一致）。
 - **compaction**：账本按 `entry_seq` 组级 prefix compaction，观察者 = `destructionObserver(kind=acceptance_compaction)`（销毁账本记账——它是证据销毁）；**acceptance-anchor 流自身 compaction 不被观察**（I5，nil observer，P43 既有无环结构）。
-- 容量满 ⇒ 拒绝新条目入账（Append 仍成功——记录已持久；该记录将 `record_unaccepted` + `input_error` 响亮）——**绝不**裁最旧组腾位（A5/家族纪律：丢最旧 = 洗掉接受证据）。
+- **有界化的常态路径 = 带记账的 compaction**（A8-6：早期条目被合法裁掉）：组数超 capacity ⇒ 触发组级 compaction（观察者记账）——账本由此有界，不存在「满」。（评审 M2：I7 与 compaction 常态路径不再互斥）
+- **仅当 compaction 被拒**（记账不可用：销毁账本 fail-closed / KAK 异常——R43-4 纪律：绝不借 compaction 绕过记账裁组）⇒ 拒绝新条目入账（Append 仍成功——记录已持久；该记录 `record_unaccepted` + `input_error` 响亮）。I7/T256 按此触发条件验收。
 
 ## 4. 逐记录 seq 暴露（protection additive）
 
@@ -112,7 +116,7 @@ input_integrity(c):
             否则                 ⇒ input_ok
 ```
 
-- **字节重建（§6 关键）**：对账需要「记录当次的 durable 行字节」，而 ReadAll 返回的是解析后的 struct。机制：`persistedTransition` 重序列化 = `json.Marshal(newPersisted(seq, t))` 与写入路径**同一构造函数同一字段序** ⇒ 字节确定。**风险**：Go struct 字段序变化/新字段会改变重序列化字节 ⇒ 假 modified。缓解钉死：`newPersisted` 为唯一构造点（已成立，:74）+ **T238 反向守卫**（未篡改的记录重导出必须 intact——若重序列化漂移，此测试先红）。`recorded_at` 用 store 时钟（P34-CLOCK-1：store 的时间，不取 scheduler clock）。
+- **字节重建（§6 关键）**：对账需要「记录当次的 durable 行字节」，而 ReadAll 返回的是解析后的 struct。机制：`persistedTransition` 重序列化 = `json.Marshal(newPersisted(seq, t))` 与写入路径**同一构造函数同一字段序** ⇒ 字节确定。**风险**：Go struct 字段序变化/新字段会改变重序列化字节 ⇒ 假 modified。缓解钉死：`newPersisted` 为唯一构造点（已成立，:74）+ **T257 反向守卫**（未篡改的记录重导出必须 intact——若重序列化漂移，此测试先红；另配黄金 digest 夹具：固定 seq+记录的期望 sha256 冻结值，防跨版本 struct 漂移——评审 m3）。`recorded_at` 用 store 时钟（P34-CLOCK-1：store 的时间，不取 scheduler clock）。
 - 读面：`GET /management/v1/protection/alerts/history/export/input-integrity`（:8082 admin-only，未启用 503，禁用面不出现新字段）。
 - flags：`--export-acceptance-log`（false）、`--export-acceptance-capacity`（4096）。KAK 零新增 flag。
 
@@ -121,25 +125,26 @@ input_integrity(c):
 | # | 不变量 |
 |---|---|
 | I1 | record-first：durable Sync 成功后才记账；崩溃窗 = unaccepted（响亮），绝不 phantom |
-| I2 | record_digest = sha256(durable 行字节)；重序列化唯一构造点 newPersisted；T238 反向守卫防漂移假阳性 |
+| I2 | record_digest = sha256(durable 行字节)；重序列化唯一构造点 newPersisted；T257 反向守卫防漂移假阳性 |
 | I3 | 接受条目事实非状态：同 entry_seq 任何第二行 ⇒ conflict fail-closed |
 | I4 | 链首豁免（合法 compaction 后首行 prev 指向被裁条目不算篡改） |
 | I5 | 接受账本自身 compaction 记入销毁账本；acceptance-anchor 流自身 compaction 不被观察（无环终止） |
-| I6 | 锁序 s.mu → acceptanceMu → destructionWriteMu → destructionDispatchMu，无环；锁内零网络 I/O |
-| I7 | capacity 满 ⇒ 拒绝新条目（记录照常持久 + unaccepted 响亮），绝不裁最旧组 |
+| I6 | 获取图 t.mu→s.mu→acceptanceMu→destructionWriteMu 无环；destructionDispatchMu/verificationWriteMu 独立持有（绝不 writeMu→dispatchMu 嵌套——P43 N1 冻结）；**两个派生源都收集后置**（acceptance-anchor pending + acceptance 位点销毁入队器），witness I/O 不持任何写锁 |
+| I7 | 有界化 = 带记账 compaction（常态）；仅 compaction 被拒（记账不可用）⇒ 拒新条目（记录照常持久 + unaccepted 响亮）；绝不无记账裁组 |
 | I8 | span 边界纪律：seq < MinSeq ⇒ outside_span 不断言；coverage_floor 之前 ⇒ outside_coverage；窗口强制输出 |
 | I9 | 未启用零回归：不建文件、Append 零开销、输出逐字节一致；P35~P44 全部取值零变化 |
+| I10 | 对账顺序承重墙：先 load 接受账本、后 store.ReadAll——并发 Append 只可能产生 unaccepted（诚实正常态），不可能假 missing_in_span（评审 n2 升格） |
 
 ## 7. 实现步骤（每步跑门禁）
 
-1. `TransitionLoadResult/ReadResult.Seqs` additive + 四投影填充 → 包测试绿
+1. `TransitionLoadResult/ReadResult.Seqs` additive + ReadAll 投影填充 → 包测试绿
 2. `snapshot_acceptance.go`：条目/canonical/KAK/持久化/窗口
 3. store 钩子接入（I1/I6/I7）+ T237/T241/T247
 4. 对账算法 + T238/T239/T240/T249/T250/T251
 5. 锚定第五流 + 销毁记账 + T244
 6. 读面 + flags + T236
-7. 变异 M1~M3（红→绿）+ 三道门禁 + 冻结面自证 → mktree 提交
+7. 变异 M1~M5（红→绿，sha256 还原）+ 三道门禁 + 冻结面自证 → mktree 提交
 
 ## 8. 测试映射
 
-ADR-065 §5 T237~T257 ↔ 本 ADR：T238→§3 钩子；T239→§5 字节重建+I2 反向守卫；T240/T241/T250/T254→§5 span 纪律（含上界）+I8；T242→I1；T243/T244→I2/I3；T245→I5；T248→I6；T249→I6；T255→§5 corrupt 分支；T256→I7；T257→I4+I2；T251→I8。
+ADR-065 §5 T237~T257 ↔ 本 ADR：T237→I9；T238→§3 钩子；T239→§5 字节重建+T257 反向守卫；T240/T241/T250/T254→§5 span 纪律（含上界）+I8；T242→I1；T243/T244→I2/I3；T245→I5+I6；T246→I9；T247→§1 冻结面；T248→I6；T249→I6（**须 anchor+destruction+acceptance 全开 fixture 才非空洞**——B1 修复后 T249 才可能真红）；T252→I8；T255→§5 corrupt 分支；T256→I7；T257→I4+I2；T251→I8。变异 = 065 T253 的 M1~M5。
