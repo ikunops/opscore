@@ -1,9 +1,9 @@
 # ADR-063 · Phase 44 — Verifier Independence（验证者身份与信任锚独立）· Scope
 
-- **Status**: PROPOSED（R219 投递；Phase 44, Scope stage）
+- **Status**: PROPOSED（R220 投递；Phase 44, Scope stage；R219 评审 approved=false，R44-1~R44-4 已闭合，见 §12 必修闭合表）
 - **Parent**: ADR-062（P43 Implementation, commit `ff9c4fc7`）
-- **裁决前提**: R217 = A（ADR-061）；R218 = P43 实现交付并核验（`ff9c4fc`），P43 CLOSED。R218「下一步」指定 C1 为 Phase 44 第一候选——本条引自轮次简报（**未直读 r218 原文**），与 ADR-060 §3 的登记相互印证。
-- **覆盖关系**: 本文为 Scope；后续 Architecture ADR（064，若开题）与之冲突处以 Architecture 为准（060/061 先例）
+- **裁决前提**: R217 = A（ADR-061）；R218 = P43 实现交付并核验（`ff9c4fc`），P43 CLOSED。R218「下一步」指定 C1 为 Phase 44 第一候选——本条引自轮次简报（**未直读 r218 原文**），与 ADR-060 §3 的登记相互印证。R219 = Scope 评审（approved=false：major×1 / minor×2 / note×6）。
+- **覆盖关系**: 与 **ADR-064（Architecture）** 冲突处以 ADR-064 为准（060/061 先例）
 - **Author**: executor（方向自拍板，依据用户 2026-08-27 授权）
 
 ---
@@ -29,7 +29,7 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 
 | # | 事实 | 位置 |
 |---|---|---|
-| 1 | 验证配置的 signer/trust 就是 manifest 平面的 `*exportSigner` / `*exportTrustStore` | `snapshot_verification.go:505-506`；接线 `history_export_scheduler.go:1000-1001`（`signer: s.signer` / `trust: s.trust`） |
+| 1 | 验证配置的 signer/trust 就是 manifest 平面的 `*exportSigner` / `*exportTrustStore` | `snapshot_verification.go:505-506`；接线 `snapshot_verification.go:1000-1001`（`verificationConfig()`：`signer: s.signer` / `trust: s.trust`） |
 | 2 | 验证条目由导出签名密钥签署 | `snapshot_verification.go:641-661`（`func (s *exportSigner) signVerificationEntry`）、`:950`（`KeyID: c.signer.keyID`） |
 | 3 | 验签走 manifest 同一信任锚 | `snapshot_verification.go:663-690`（对 `*exportTrustStore`）；该 store 同时验 manifest（`snapshot_signature.go:232`；`history_export_scheduler.go:284-303`） |
 | 4 | P42 构造守卫**强制**同源：`--export-verify-attest` 必须配 `--export-sign-key` + `--export-trust-keys` | `history_export_scheduler.go:367-374`；`main.go:488` |
@@ -64,7 +64,7 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 2. **「独立主机是拓扑」**——接受。**拓扑半边从头就不进判据**：P44 断言的只是信任锚互斥（构造期不变量 I1）；「验证进程与发布进程不同主机」进已知代价 1/2，与 P41 T177、P42 `verification_absent` 同域。
 3. **「工程量不足以撑 Phase」**——判据量小是真，但单元完整：独立密钥面 + 四条守卫 + 一个新判据 + 两个红例 + 字节等价自证，恰好一个 Phase。再小就没有独立判据（R210 击倒）；并入 C2 则把密钥面改动与 storage 基础设施耦合，两边的冻结面互相拖累。R218 已裁定其为第一候选。
 
-**与 P43 的对称性（为何不是「给验证报告换 KAK 签」）**：KAK 是**授权**密钥（什么可以存在/被信任，ADR-061 §1.4「生命周期 ∪ 销毁」），验证报告是**观测**结论；且验证周期自动运行（`verifyTick`，`snapshot_verification.go:1112`），让权限最高的离线密钥为每份报告在线签名 = 扩大 KAK 暴露面、制造「最高权限钥匙常在线」的新残差。观测身份单独成钥（VAK），三锚互斥（I1）。ADR-061 §1.3 否决 DAK 的逻辑在此**不**适用：VAK 不是「为同一判据再加一把钥匙」，它本身就是新判据的机制。
+**与 P43 的对称性（为何不是「给验证报告换 KAK 签」）**：KAK 的授权域是「授权事件类」（什么可以存在/被信任，ADR-061 §1.4「生命周期 ∪ 销毁」），验证报告是**观测**结论——把观测并进授权域，等于让一把密钥同时覆盖「授权什么存在」与「声称观测到什么」，§2.2 的自证结构以更大范围重现。且**「KAK 离线」只是语料的运维建模（ADR-061 §3/§5），不是代码事实**：KAK 私钥构造期即读入进程（`history_export_scheduler.go:337`），验证 compaction 亦已按周期产生 KAK 签名的销毁记录（`snapshot_verification.go:1004`）——本 Phase 的论证**不依赖离线假设**：无论 KAK 在线与否，观测身份单独成钥（VAK）+ 三锚互斥（I1）都是唯一能把「观测者」从「授权者/发布者」中分出的结构；把验证报告并给 KAK 只会造出唯一的全能密钥，零分离收益。ADR-061 §1.3 否决 DAK 的逻辑在此**不**适用：VAK 不是「为同一判据再加一把钥匙」，它本身就是新判据的机制。
 
 ---
 
@@ -103,6 +103,8 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 
 既有 P42 词汇（ok / contradicted / unattested / unavailable；signature_ok / key_unknown / …）零改动。
 
+**POST /verification 响应零改动**（R44-4 钉死）：该响应是手工 map（`snapshot_verification.go:1599-1605`），P44 **不加任何字段**——验证者身份只经 GET 视图（`verifier_key_id` / `verifier_independent`）与条目 `key_id`（`:299`，落盘）暴露（T236）。
+
 ---
 
 ## 5. 正交性
@@ -118,7 +120,7 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 1. 不做部署拓扑断言（「验证者跑在独立主机」代码断言不了，ADR-057 §8.1 原话）；
 2. 不改 P42 判定逻辑与尺子（I4：只换签名身份）；
 3. 不改 P37 manifest / ledger 签名面（发布者自签发布事实是其语义）；
-4. 不改 P40 锚定机制与既有 anchor 条目家族（验证锚定条目照旧由导出钥签——锚定是**存在见证**，不是作者见证）；
+4. 不改 P40 锚定机制与既有 anchor 条目家族（验证锚定条目照旧由导出钥签——锚定是**存在见证**，不是作者见证；其伪造残差如实保留于 §7 / §8-7）；
 5. 不改 P41 KAK 面与生命周期账本（VAK 不入账，Q1）；
 6. 不改 P43 销毁面任何文件；
 7. 不迁移/转换既有 `verification-log.jsonl`（fail-closed，不洗白，Q2 / T229）；
@@ -136,12 +138,12 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 
 | 对手 | P44 前 | P44 后 |
 |---|---|---|
-| **持导出私钥**（文件泄露 / 备份 / RCE 读文件，P40 主对手） | 可伪造验证报告（同钥自验，§2 事实 1~4），本地全绿 | 伪报告 `verification_unauthorized` ⇒ 不可信 ⇒ 无断言（T227）。**本 Phase 的全部增量** |
+| **持导出私钥**（文件泄露 / 备份 / RCE 读文件，P40 主对手） | 可伪造验证报告（同钥自验，§2 事实 1~4），本地全绿；亦可伪造验证**锚定条目**发往见证端（§2 事实 6） | 伪**报告** ⇒ `verification_unauthorized` ⇒ 不可信 ⇒ 无断言（T227）——**本 Phase 的增量止于此**。**残差通道（R44-1，未闭合）**：同钥仍可伪造 `kind=verification` **锚定条目**——`ReportDigest`/`Overall` 在签名区（`snapshot_anchor.go:109-111`、`:146-148`），持写权限+导出私钥即可自填 `Overall=attested` 与任意 `ReportDigest`，本地验签走 manifest 信任锚即通过（`snapshot_verification.go:1053`），经 `dispatchAnchorPath` 发往见证端（`:919-936`）；锚定对账 A7-11 冻结（ADR-057 §8-8）⇒ **本地与域外均不可检测**（完整通道分析与处置见 ADR-064 §7 逃逸 A-3；已知代价 7） |
 | **控制进程/主机**（VAK 在线同进程） | 可伪造 + 可删账本 | **原样保留**：VAK 在线，主机级攻击者仍可伪造「已验证」或换 trust 配置重启。拓扑代价，代码断言不了（已知代价 1） |
 | **持 KAK 者** | 已能旋转/吊销全部签名钥（P41） | 与验证面无新增交集（VAK ≠ KAK，I1）；若运维把 VAK 交 KAK 持有者保管 ⇒ 独立性形式化（已知代价 2） |
 | **删账本** | `verification_absent`（P42） | 不变（同族逃逸，域外可检测） |
 
-**结论（不美化）**：P44 把「伪造验证裁定」的门槛从「持有在线证据密钥」抬到「持有独立观测密钥或控制主机」，**没有消除**。它与 P41 T177 / P42 `verification_absent` / P43 §10-1 同族——每轮把残差收缩一层、如实登记一层。
+**结论（不美化）**：P44 把「伪造验证**报告**」的门槛从「持有在线证据密钥」抬到「持有独立观测密钥或控制主机」，**没有消除**。且「伪造验证**锚定条目**」通道对持导出私钥者**原样保留**（上表行 1 / 已知代价 7）——P44 的收缩仅及于验证报告通道。它与 P41 T177 / P42 `verification_absent` / P43 §10-1 同族——每轮把残差收缩一层、如实登记一层。
 
 ---
 
@@ -152,7 +154,8 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 3. **启用即毒化旧账本**：既有 P42 账本（导出钥签）在独立模式下 ⇒ unauthorized ⇒ 不产断言。fail-closed 的代价；迁移 = 新导出目录，不提供转换器（Q2）；
 4. **`verifier_independent` 是构造期事实的投影**：互斥由守卫在构造期判定，运行期不持续重证（前提：trust 配置进程内不可变）；
 5. **词汇双轨**：`verification_unauthorized`（异族已知钥）与 `key_unknown`（无锚钥）的区分要求读者理解 I3——若 Architecture 轮认为区分成本 > 收益，可收敛为单一词汇（Q3 备选）；
-6. **继承自 P43 的两条程序债**（r218 裁定应补入 ADR-060/061 §8；本轮实测 grep 两 ADR 均无此二行，因单文件纪律未触碰已发布 ADR，登记如下保持账目可见）：① stuck-intended 组的 publications 可能同时出现在 `unaccounted` 与 `unconfirmed`；② destruction-anchor 流自身 compaction 不被观察（I5 自指，无外部损失）。
+6. **继承自 P43 的两条程序债**（r218 裁定应补入 ADR-060/061 §8；本轮实测 grep 两 ADR 均无此二行，因单文件纪律未触碰已发布 ADR，登记如下保持账目可见）：① stuck-intended 组的 publications 可能同时出现在 `unaccounted` 与 `unconfirmed`；② destruction-anchor 流自身 compaction 不被观察（I5 自指，无外部损失）；
+7. **【R44-1 新增】验证锚定条目通道原样**：持导出私钥者仍可伪造 `kind=verification` 锚定条目（`Overall=attested` + 任意 `ReportDigest`）并被见证端接收——本地验签走 manifest 信任锚（`snapshot_verification.go:1053`），本地不可检测；域外检测依赖被冻结的对账（A7-11，ADR-057 §8-8）。P44 收缩的是「验证报告」通道，**不是**「验证锚定条目」通道；处置（为何本 Phase 不修）见 ADR-064 §7，与 C2 一并列为 Phase 45 候选。
 
 ---
 
@@ -164,13 +167,13 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 
 ---
 
-## 10. 测试契约（T222~T235，14 例；T 编号全局连续，实测既有最大 = T221）
+## 10. 测试契约（T222~T236，15 例；T 编号全局连续，实测既有最大 = T221）
 
 - **T222（+ T222b 字节等价）**：VAK 未配置 ⇒ 全零回归：响应/报告/条目/锚定与 P42 基线逐字节一致。
 - **T223 V1**：VAK 无 trust / 不在自身 trust ⇒ 构造失败。
 - **T224 ★V2 互斥**：VAK ∈ manifest trust；导出钥 ∈ verifier trust；KAK ∈ verifier trust ⇒ 各自构造失败。
 - **T225 V3**：VAK == 导出钥；VAK == KAK ⇒ 构造失败。
-- **T226 合法流**：独立模式报告由 VAK 签；entry `key_id` = VAK；视图 `verifier_independent=true` + `verifier_key_id` 落盘。
+- **T226 合法流**：独立模式报告由 VAK 签；**落盘的是条目 `key_id` = VAK id**（`snapshot_verification.go:299`，R44-4 措辞更正）；视图 `verifier_independent=true` + `verifier_key_id` 为**派生展示字段，不落盘**。
 - **T227 ★核心红例**：持**导出私钥**末端追加伪造「全部 ok」验证条目 ⇒ `verification_unauthorized` ⇒ 账本不可信 ⇒ **无「已验证」断言**；且逐一验证 P35~P43 各判据在该场景仍为「不断言」（non-vacuousness 自证，T213 式）。
 - **T228 I2**：unauthorized 后追加被拒（fail-closed，绝不借 append 重建干净账本）。
 - **T229（Q2 判别）**：P42 旧账本 + 独立模式 ⇒ 旧条目 unauthorized ⇒ 不产断言，绝不美化。
@@ -180,6 +183,7 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 - **T233**：status 面新字段 omitempty；关闭时零变化。
 - **T234 V4**：VAK 配置而 `--export-verify-attest` 未开 ⇒ 构造失败。
 - **T235**：独立模式下窗口不连续 ⇒ 不断言（P42 I4 复用回归）。
+- **T236（R44-4）**：独立模式**开启**状态下，POST /verification 响应（手工 map，`snapshot_verification.go:1599-1605`）字节零改动；关闭模式的 GET/POST 由 T222b 覆盖。
 
 **变异 M1~M5**（摘判据 ⇒ 对应 T 必红，按 sha256 字节还原）：M1 摘互斥守卫 ⇒ T224；M2 验签回退 manifest trust store ⇒ T227 / T229；M3 摘同钥守卫 ⇒ T225；M4 unauthorized 降级为逐条跳过（不毒化账本）⇒ T228；M5 关闭模式回写新字段（非 omitempty）⇒ T222b。
 
@@ -187,9 +191,21 @@ P42 把「从未验证」变成可断言，但 ADR-057 §8.1 同一句明文承�
 
 ## 11. 文件与接线（Scope 预估，实现轮可微调）
 
-- `snapshot_verification.go`：config 加 verifier signer/trust（`:502-519`）；`signVerificationEntry` 换源（`:641`）；`verifyVerificationEntrySignature` 按 I3 分轨（`:663-690`）；append 路径（`:900-979`）；视图新字段（`:1219-1237`）。**条目 schema 零改动**。
-- `history_export_scheduler.go`：守卫 V1~V4（紧跟 `:367-401` 既有守卫块）；`verificationConfig` 接线（`:993-1006`）。
-- `snapshot_verification_test.go`：T222~T235。
+- `snapshot_verification.go`：config 加 verifier signer/trust 与异族 key 集（`:502-519`）；`verificationConfig()` 接线换源（`:993-1006`，R44-2 更正：先前误记为 `history_export_scheduler.go:1000-1001`——该区间实为 ledger 错误处理 + Phase 40 锚定 `:993-1008`）；`signVerificationEntry` 换源（`:641`）；`verifyVerificationEntrySignature` 按 I3 分轨（`:663-690`）；append 路径（`:900-979`）；视图新字段（`:1219-1237`）；POST 响应零改动（`:1599-1605`，T236）。**条目 schema 零改动**。
+- `history_export_scheduler.go`：守卫 V1~V4（紧跟 `:367-401` 既有守卫块之后追加）。
+- `snapshot_verification_test.go`：T222~T236。
 - `cmd/opscore/main.go`：2 个 flag（`--export-verifier-key` / `--export-verifier-trust`，紧邻 `:488-490`）。
-- `server.go`：**零新路由**（复用 `:1660-1661`）；视图字段经既有 handler 暴露。
-- `go.mod` / `go.sum` 零改动；四冻结包零 diff；P40 / P43 文件零改动。
+- `server.go`：**零新路由**（复用 `:1660-1661`）；GET 视图字段经既有 handler 暴露；POST 响应零改动（T236）。
+- `go.mod` / `go.sum` 零改动；四冻结包零 diff；P40 / P43 文件零改动；冻结文件（`snapshot_signature/chain/ledger/history_export_coverage/history_export_manifest`）与 `appendonly_log.go` 零改动。
+
+---
+
+## 12. Scope 必修闭合表（R220）
+
+| 编号 | 级别 | judge 意见（R219 评审） | 闭合位置 | 状态 |
+|---|---|---|---|---|
+| **R44-1** | **major** | §7 行1 对「持导出私钥」对手只写伪报告被拒，漏掉同钥仍可伪造 `kind=verification` **锚定条目**（ReportDigest/Overall 在签名区，`snapshot_anchor.go:109-111/:146-148`；导出钥签发 `snapshot_verification.go:1150-1184`；manifest 锚验签 `:1053`；发往见证端 `snapshot_anchor.go:919-931`）且对账 A7-11 冻结 ⇒ 本地域外均不可检测的残差通道；§8 亦无此项 | 本文 §7 行1 重写（「P44 后」列显式保留 A-3 残差）、§8 新增第 7 条；完整通道分析与「为何本 Phase 不修」的处置见 **ADR-064 §7** | **闭合** |
+| **R44-2** | minor | verificationConfig 接线两处行号引错文件：实为 `snapshot_verification.go:1000-1001` / `:993-1006`（`history_export_scheduler.go:995-1008` 是 ledger 错误处理 + Phase 40 锚定）；§11 恰漏 `993-1006` | 本文 §2.1 事实1 更正；§11 接线移入 `snapshot_verification.go` 条目（`:993-1006`），scheduler 条目只保留守卫 V1~V4 | **闭合** |
+| **R44-3** | minor | §3「让权限最高的**离线**密钥为每份报告在线签名」前提与代码不符：KAK 构造期即入进程（`history_export_scheduler.go:337`）、验证 compaction 周期性产生 KAK 签名（`snapshot_verification.go:1004`） | 本文 §3 末段重写：显式声明「离线」非代码事实，论证改立于「授权域 ∪ 观测域分离 + 三锚互斥」，不依赖离线假设 | **闭合** |
+| **R44-4** | note（酌情闭合） | T226「`verifier_key_id` 落盘」措辞不准（落盘的是条目 `key_id`，`snapshot_verification.go:299`；视图字段不落盘）；POST 响应（手工 map `:1599-1605`）开启模式字节契约未钉死 | 本文 §10 T226 措辞更正 + 新增 **T236**（POST 响应开启模式零改动）；§4.4 加注；ADR-064 §6 钉死 | **闭合** |
+| — | note×4 | V2/V3 密码学健全性（key_id 恒为公钥派生不可配置 ⇒ key_id 级比对等价公钥级）；冻结面三重核实通过；T222~T235 无碰撞且既有最大 T221 属实；检查范围声明 | judge 确认项，**原样接受**，无需改动；T 编号沿用至 T236（仍无碰撞） | 确认 |
