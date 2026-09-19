@@ -83,6 +83,10 @@ func newAcceptanceFixture(t *testing.T, tune func(cfg *HistoryExportConfig)) *ac
 		KeyAuthorityTrustPaths: []string{kakPub},
 		AcceptanceLog:          true,
 		AcceptanceCapacity:     0,
+		// G4: the acceptance ledger's compaction must be accounted, so every
+		// acceptance fixture deploys with the destruction log on (tests that
+		// need it off tune the config and expect construction failure).
+		DestructionLog: true,
 	}
 	if tune != nil {
 		tune(&cfg)
@@ -343,7 +347,14 @@ func TestP45T238AppendCommitsAcceptanceEntry(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestP45T239TamperedRecordIsObservedOnlyByP45(t *testing.T) {
-	f := newAcceptanceFixture(t, nil)
+	// Final review MINOR-2: the "P35~P44 stay green" claim is only honest with
+	// those faces actually RUNNING — anchor and destruction are enabled here
+	// (G4 already forces destruction), and their error surfaces are asserted
+	// below alongside the export pipeline.
+	f := newAcceptanceFixture(t, func(cfg *HistoryExportConfig) {
+		cfg.AnchorEndpoint = "file://" + filepath.Join(filepath.Dir(cfg.Dir), "witness-t239")
+		cfg.AnchorCapacity = 4096
+	})
 	f.append(acceptT1, 3)
 	f.append(acceptT2, 5)
 	f.append(acceptT3, 7)
@@ -353,6 +364,9 @@ func TestP45T239TamperedRecordIsObservedOnlyByP45(t *testing.T) {
 	st := f.sched.Status()
 	if st.LastError != "" || st.Published != 1 || st.Failed != 0 {
 		t.Fatalf("the pre-tamper tick must be green, got %+v", st)
+	}
+	if st.AnchorError != "" || st.LedgerError != "" || (st.Destruction != nil && st.Destruction.Error != "") {
+		t.Fatalf("P40~P43 faces must be green pre-tamper: anchor=%q destruction=%+v ledger=%q", st.AnchorError, st.Destruction, st.LedgerError)
 	}
 
 	// The store-write-permission attacker rewrites record 2's payload.
@@ -370,6 +384,9 @@ func TestP45T239TamperedRecordIsObservedOnlyByP45(t *testing.T) {
 	st = f.sched.Status()
 	if st.LastError != "" || st.Published != 1 || st.Failed != 0 {
 		t.Fatalf("P35~P44 must stay green after the tamper, got %+v", st)
+	}
+	if st.AnchorError != "" || st.LedgerError != "" || (st.Destruction != nil && st.Destruction.Error != "") {
+		t.Fatalf("P40~P43 faces must stay green after the tamper: anchor=%q destruction=%+v ledger=%q", st.AnchorError, st.Destruction, st.LedgerError)
 	}
 
 	// Only P45 observes the modification.
@@ -985,6 +1002,7 @@ func TestP45T252PreEnablementHistoryIsOutsideCoverage(t *testing.T) {
 		KeyAuthorityPath:       kakPriv,
 		KeyAuthorityTrustPaths: []string{kakPub},
 		AcceptanceLog:          true,
+		DestructionLog:         true, // G4: acceptance compaction must be accounted
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1232,5 +1250,105 @@ func TestP45ConstructionGuardsAndRoute(t *testing.T) {
 	}
 	if got.Verdict != inputVerdictOK || !got.Enabled {
 		t.Fatalf("the route must serve the reconciliation verdict, got %+v", got)
+	}
+}
+
+// T256b — G4 (final review MAJOR-2): the acceptance ledger's compaction is
+// evidence destruction and must be accounted, so deploying acceptance WITHOUT
+// the destruction log is a construction failure, never a silent unaccounted
+// trim.
+func TestP45T256bAcceptanceRequiresDestructionLog(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "export")
+	keyDir := filepath.Join(root, "keys")
+	for _, d := range []string{dir, keyDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	signPriv, signPub, _, _ := genKeyPair(t, keyDir, "signer")
+	kakPriv, kakPub, _, _ := genKeyPair(t, keyDir, "kak")
+	store, err := NewFileBackedTransitionStore(filepath.Join(root, "alert-transitions.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := HistoryExportConfig{
+		Store:                  store,
+		Dir:                    dir,
+		Interval:               time.Hour,
+		Formats:                []string{"json"},
+		SignKeyPath:            signPriv,
+		TrustKeyPaths:          []string{signPub},
+		KeyAuthorityPath:       kakPriv,
+		KeyAuthorityTrustPaths: []string{kakPub},
+		AcceptanceLog:          true,
+		DestructionLog:         false, // the G4 violation
+	}
+	if _, err := NewHistoryExportScheduler(cfg); err == nil {
+		t.Fatal("T256b/G4: acceptance without the destruction log must fail construction — its compaction would trim evidence unaccounted")
+	} else if !strings.Contains(err.Error(), "--export-destruction-log") {
+		t.Fatalf("T256b/G4: the error must name the missing flag, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T244b — the M5 discriminator (final review round 2): a hand-forged entry
+// with an OLD entry_seq but a VALID prev pointer (the current chain head) and
+// a valid KAK signature passes the chain-continuity check — ONLY the
+// duplicate-seq guard can refuse it. Removing that guard must turn this test
+// red (the forged entry would be accepted, creating a second line for an
+// already-used entry_seq).
+// ---------------------------------------------------------------------------
+func TestP45T244bForgedOldSeqWithValidPrevIsRefused(t *testing.T) {
+	f := newAcceptanceFixture(t, nil)
+	f.append(acceptT1, 3)
+	f.append(acceptT2, 5)
+
+	// The current chain head.
+	lines := f.ledgerLines()
+	var head acceptanceEntry
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &head); err != nil {
+		t.Fatal(err)
+	}
+
+	// Forge: entry_seq = 1 (already used), prev = the CURRENT head, real KAK
+	// signature, self-consistent digest.
+	forged := acceptanceEntry{
+		V:               1,
+		EntrySeq:        1,
+		RecordSeq:       1,
+		RecordDigest:    head.RecordDigest,
+		RecordedAt:      acceptT3.UTC().Format(time.RFC3339Nano),
+		AuthorityKeyID:  head.AuthorityKeyID,
+		PrevEntryDigest: head.EntryDigest,
+	}
+	dg, derr := acceptanceEntryDigest(&forged)
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	forged.EntryDigest = dg
+	if serr := f.sched.keyAuthority.signer.signAcceptanceEntry(&forged, acceptT3); serr != nil {
+		t.Fatal(serr)
+	}
+	raw, merr := serializeAcceptanceEntryBytes(&forged)
+	if merr != nil {
+		t.Fatal(merr)
+	}
+	if aerr := appendLogLine(acceptanceLogPath(f.dir), raw); aerr != nil {
+		t.Fatal(aerr)
+	}
+
+	// record() must refuse it BY THE DUPLICATE-SEQ GUARD — not by the chain
+	// check (which this forgery deliberately satisfies) and not silently.
+	line3, err := json.Marshal(newPersisted(3, protection.AlertTransition{At: acceptT3, To: true, UnknownRate: 7, Threshold: 50}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.store.acceptance.record(3, line3)
+	if err == nil {
+		t.Fatal("T244b: the forged old-seq entry must be refused by the duplicate-seq guard")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("T244b: the refusal must come from the duplicate-seq guard (not the chain check), got %v", err)
 	}
 }

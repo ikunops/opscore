@@ -42,6 +42,8 @@ package server
 //     no output field appears anywhere (I9 — default zero regression).
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -50,6 +52,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -434,6 +437,26 @@ type acceptanceRecorder struct {
 	// entry for the acceptance-anchor dispatch. It must be zero-I/O and never
 	// block on witness activity (B1).
 	onAnchor func(acceptanceEntry)
+	// tail is the INCREMENTALLY VERIFIED state of the ledger (final review
+	// MAJOR-1): the append path must be O(new bytes), never O(capacity) — a
+	// full read+verify of every entry on every Append serialized the whole
+	// alert-transition hot path behind O(n) Ed25519 work. The cache holds the
+	// file size the verification covers plus the verified chain head; record()
+	// verifies only bytes beyond it. A same-size rewrite of already-verified
+	// bytes is NOT caught here — it is caught by the full verification at
+	// reconcile/compaction time (≤1 tick later), the documented I2 refinement
+	// (ADR-066 §3).
+	tail acceptanceTailState
+}
+
+// acceptanceTailState is the verified-prefix cache. valid=false forces the
+// next record() through the full load (construction, shrink, external rewrite).
+type acceptanceTailState struct {
+	valid      bool
+	size       int64
+	prevDigest string // EntryDigest of the last verified entry (chain head)
+	maxEntry   int64
+	entries    int64
 }
 
 // record commits one accepted record: seq is the durable record identity, line
@@ -453,47 +476,74 @@ func (a *acceptanceRecorder) record(seq int64, line []byte) error {
 	if a.ka == nil || !a.ka.writable() {
 		return errors.New("acceptance: no key-authority key configured (writes disabled)")
 	}
-	lines, ok, err := readLogLines(a.path, acceptanceGroupOf)
-	if err != nil {
-		return err
-	}
-	if !ok {
-		// T243: a ledger we cannot fully evaluate is refused — rebuilding a
-		// clean-looking file around lines we cannot read is exactly the
-		// laundering this discipline exists to prevent. The file (including the
-		// unreadable evidence) stays byte-identical.
-		return fmt.Errorf("acceptance: ledger holds %d unclassifiable line(s); refusing to append", countUnclassified(lines))
-	}
 
-	maxEntry := int64(0)
-	prevDigest := ""
-	seenEntry := map[int64]bool{}
-	for i := range lines {
-		var e acceptanceEntry
-		if jerr := json.Unmarshal(lines[i].raw, &e); jerr != nil {
-			return fmt.Errorf("acceptance line %d is not readable: %w", i+1, jerr)
+	// Establish the verified tail state. Three cases (final review MAJOR-1 —
+	// the append path must be O(new bytes), never O(capacity)):
+	//   equal size  ⇒ no new bytes: the cached chain head IS the state;
+	//   grew        ⇒ verify ONLY the suffix bytes, continuing the cached chain;
+	//   shrank/miss ⇒ full load (construction, compaction rewrite, external
+	//                 rewrite) — the expensive path, taken rarely by design.
+	var prevDigest string
+	var maxEntry, entries int64
+	fi, serr := os.Stat(a.path)
+	switch {
+	case serr != nil && !os.IsNotExist(serr):
+		return serr
+	case serr != nil && os.IsNotExist(serr):
+		// An absent ledger is an empty one: genesis starts fresh.
+		prevDigest, maxEntry, entries = "", 0, 0
+		a.tail = acceptanceTailState{valid: true, size: 0, prevDigest: "", maxEntry: 0, entries: 0}
+	case a.tail.valid && fi.Size() == a.tail.size:
+		prevDigest, maxEntry, entries = a.tail.prevDigest, a.tail.maxEntry, a.tail.entries
+	case a.tail.valid && fi.Size() > a.tail.size:
+		var nerr error
+		prevDigest, maxEntry, entries, nerr = a.verifySuffix(a.tail, fi.Size())
+		if nerr != nil {
+			return nerr
 		}
-		// I3 (append-side guard): a second line for one entry_seq is a
-		// conflict — never a fix-up, even with an identical payload (T244).
-		if seenEntry[e.EntrySeq] {
-			return fmt.Errorf("acceptance: refusing to append — entry_seq %d already carries a second line (conflict)", e.EntrySeq)
+		a.tail.size = fi.Size()
+	default:
+		lines, ok, err := readLogLines(a.path, acceptanceGroupOf)
+		if err != nil {
+			return err
 		}
-		seenEntry[e.EntrySeq] = true
-		if v := verifyAcceptanceEntrySignature(&e, a.ka.trust); v.Verdict != sigVerdictOK {
-			return fmt.Errorf("acceptance: refusing to append — entry_seq %d is %s (%s)", e.EntrySeq, v.Verdict, v.Detail)
+		if !ok {
+			// T243: a ledger we cannot fully evaluate is refused — rebuilding a
+			// clean-looking file around lines we cannot read is exactly the
+			// laundering this discipline exists to prevent. The file (including
+			// the unreadable evidence) stays byte-identical.
+			return fmt.Errorf("acceptance: ledger holds %d unclassifiable line(s); refusing to append", countUnclassified(lines))
 		}
-		dg, derr := acceptanceEntryDigest(&e)
-		if derr != nil || dg != e.EntryDigest {
-			return fmt.Errorf("acceptance: refusing to append — entry_seq %d entry_digest does not match its canonical payload", e.EntrySeq)
+		seenEntry := map[int64]bool{}
+		for i := range lines {
+			var e acceptanceEntry
+			if jerr := json.Unmarshal(lines[i].raw, &e); jerr != nil {
+				return fmt.Errorf("acceptance line %d is not readable: %w", i+1, jerr)
+			}
+			// I3 (append-side guard): a second line for one entry_seq is a
+			// conflict — never a fix-up, even with an identical payload (T244).
+			if seenEntry[e.EntrySeq] {
+				return fmt.Errorf("acceptance: refusing to append — entry_seq %d already carries a second line (conflict)", e.EntrySeq)
+			}
+			seenEntry[e.EntrySeq] = true
+			if v := verifyAcceptanceEntrySignature(&e, a.ka.trust); v.Verdict != sigVerdictOK {
+				return fmt.Errorf("acceptance: refusing to append — entry_seq %d is %s (%s)", e.EntrySeq, v.Verdict, v.Detail)
+			}
+			dg, derr := acceptanceEntryDigest(&e)
+			if derr != nil || dg != e.EntryDigest {
+				return fmt.Errorf("acceptance: refusing to append — entry_seq %d entry_digest does not match its canonical payload", e.EntrySeq)
+			}
+			// I4: the first surviving entry's incoming pointer is exempt.
+			if i > 0 && e.PrevEntryDigest != prevDigest {
+				return fmt.Errorf("acceptance: refusing to append — entry_seq %d breaks the hash chain", e.EntrySeq)
+			}
+			prevDigest = e.EntryDigest
+			if e.EntrySeq > maxEntry {
+				maxEntry = e.EntrySeq
+			}
 		}
-		// I4: the first surviving entry's incoming pointer is exempt.
-		if i > 0 && e.PrevEntryDigest != prevDigest {
-			return fmt.Errorf("acceptance: refusing to append — entry_seq %d breaks the hash chain", e.EntrySeq)
-		}
-		prevDigest = e.EntryDigest
-		if e.EntrySeq > maxEntry {
-			maxEntry = e.EntrySeq
-		}
+		entries = int64(len(seenEntry))
+		a.tail = acceptanceTailState{valid: true, size: fi.Size(), prevDigest: prevDigest, maxEntry: maxEntry, entries: entries}
 	}
 
 	// I7 (ADR-066 §3): boundedness is the OBSERVED compaction — never an
@@ -502,7 +552,7 @@ func (a *acceptanceRecorder) record(seq int64, line []byte) error {
 	// unaccepted — loud, T256) and the ledger never exceeds capacity. There is
 	// deliberately no "full" state otherwise: the ledger is bounded by rotating
 	// through accounting (A8-6).
-	if a.capacity > 0 && int64(len(seenEntry))+1 > int64(a.capacity) {
+	if a.capacity > 0 && entries+1 > int64(a.capacity) {
 		keep := a.capacity - 1
 		if keep <= 0 {
 			return fmt.Errorf("acceptance: capacity %d cannot rotate (the shared compaction primitive always keeps at least one group); refusing the new entry (I7)", a.capacity)
@@ -510,6 +560,15 @@ func (a *acceptanceRecorder) record(seq int64, line []byte) error {
 		if cerr := compactLogPrefixGroupsObserved(a.path, keep, acceptanceGroupOf, a.observe); cerr != nil {
 			return fmt.Errorf("acceptance: compaction refused (%v) — new acceptance entries are refused until accounting recovers (I7)", cerr)
 		}
+		// The rewrite kept the newest `keep` groups verbatim: the chain head and
+		// max entry are UNCHANGED; only the file size and the group count move
+		// (the shared primitive's verbatim-copy guarantee, T124d). The next full
+		// verification (reconcile / compaction) re-derives them anyway.
+		if fi2, serr2 := os.Stat(a.path); serr2 == nil {
+			a.tail.size = fi2.Size()
+		}
+		entries = int64(keep)
+		a.tail.entries = int64(keep)
 	}
 
 	e := acceptanceEntry{
@@ -536,12 +595,76 @@ func (a *acceptanceRecorder) record(seq int64, line []byte) error {
 	if aerr := appendLogLine(a.path, raw); aerr != nil {
 		return aerr
 	}
+	// The cache follows the append: the chain head is this entry, the size the
+	// post-append stat. From here the next record() takes the equal-size fast
+	// path (or the suffix path if someone else grew the file).
+	if fi3, serr3 := os.Stat(a.path); serr3 == nil {
+		a.tail.size = fi3.Size()
+	}
+	a.tail.prevDigest = e.EntryDigest
+	a.tail.maxEntry = e.EntrySeq
+	a.tail.entries = entries + 1
+	a.tail.valid = true
 	// B1: the anchor dispatch is COLLECTED here (zero I/O, never blocking on
 	// witness activity) and performed by the scheduler tick tail.
 	if a.onAnchor != nil {
 		a.onAnchor(e)
 	}
 	return nil
+}
+
+// verifySuffix classifies and verifies ONLY the bytes beyond a verified prefix
+// (final review MAJOR-1): every line must be classifiable, carry the NEXT
+// entry_seq (a seq at or below the cached max is the append-side I3 conflict —
+// externally appended duplicates are refused here), verify against the KAK
+// trust, match its canonical payload digest, and continue the cached chain
+// (the first suffix line's prev must equal the cached head — exempt only when
+// the cached ledger was empty, i.e. this suffix starts the genesis).
+// Any failure refuses the append with the file byte-identical (I2 fail-closed).
+func (a *acceptanceRecorder) verifySuffix(tail acceptanceTailState, upto int64) (string, int64, int64, error) {
+	f, err := os.Open(a.path)
+	if err != nil {
+		return "", 0, 0, err
+	}
+	defer f.Close()
+	if _, serr := f.Seek(tail.size, io.SeekStart); serr != nil {
+		return "", 0, 0, serr
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	prev, maxEntry, entries := tail.prevDigest, tail.maxEntry, tail.entries
+	first := tail.entries == 0 // genesis: the very first entry's prev is exempt
+	for scanner.Scan() {
+		trimmed := bytes.TrimSpace(scanner.Bytes())
+		if len(trimmed) == 0 {
+			continue
+		}
+		var e acceptanceEntry
+		if jerr := json.Unmarshal(trimmed, &e); jerr != nil {
+			return "", 0, 0, fmt.Errorf("acceptance: refusing to append — suffix line is not readable (%w); the ledger stays byte-identical", jerr)
+		}
+		if e.EntrySeq <= maxEntry {
+			return "", 0, 0, fmt.Errorf("acceptance: refusing to append — suffix entry_seq %d already exists (conflict)", e.EntrySeq)
+		}
+		if v := verifyAcceptanceEntrySignature(&e, a.ka.trust); v.Verdict != sigVerdictOK {
+			return "", 0, 0, fmt.Errorf("acceptance: refusing to append — suffix entry_seq %d is %s (%s)", e.EntrySeq, v.Verdict, v.Detail)
+		}
+		dg, derr := acceptanceEntryDigest(&e)
+		if derr != nil || dg != e.EntryDigest {
+			return "", 0, 0, fmt.Errorf("acceptance: refusing to append — suffix entry_seq %d entry_digest does not match its canonical payload", e.EntrySeq)
+		}
+		if !first && e.PrevEntryDigest != prev {
+			return "", 0, 0, fmt.Errorf("acceptance: refusing to append — suffix entry_seq %d breaks the hash chain", e.EntrySeq)
+		}
+		first = false
+		prev = e.EntryDigest
+		maxEntry = e.EntrySeq
+		entries++
+	}
+	if serr := scanner.Err(); serr != nil {
+		return "", 0, 0, serr
+	}
+	return prev, maxEntry, entries, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -910,10 +1033,4 @@ func (s *Server) handleHistoryExportInputIntegrity(w http.ResponseWriter, r *htt
 type inputIntegrityStatusSummary struct {
 	Enabled bool   `json:"enabled"`
 	Error   string `json:"error,omitempty"`
-}
-
-// acceptanceLedgerAbsent reports whether the Phase has never produced a file.
-func acceptanceLedgerAbsent(dir string) bool {
-	_, err := os.Stat(acceptanceLogPath(dir))
-	return os.IsNotExist(err)
 }

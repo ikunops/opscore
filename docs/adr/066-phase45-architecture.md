@@ -125,7 +125,7 @@ input_integrity(c):
 | # | 不变量 |
 |---|---|
 | I1 | record-first：durable Sync 成功后才记账；崩溃窗 = unaccepted（响亮），绝不 phantom |
-| I2 | record_digest = sha256(durable 行字节)；重序列化唯一构造点 newPersisted；T257 反向守卫防漂移假阳性 |
+| I2 | record_digest = sha256(canonical durable 行字节)；重序列化唯一构造点 newPersisted；T257 反向守卫防漂移假阳性。**追加路径评估 = 增量验证**（终审 MAJOR-1 修订）：recorder 缓存已验证前缀 {size, chain head, max entry, group count}，record() 只验证增量字节（O(new bytes)，实测与账本长度无关）；同尺寸改写已验证字节不被追加路径捕获——由对账/compaction 的全量验证在 ≤1 tick 内捕获（诚实细化，非削弱：对账每 tick 跑） |
 | I3 | 接受条目事实非状态：同 entry_seq 任何第二行 ⇒ conflict fail-closed |
 | I4 | 链首豁免（合法 compaction 后首行 prev 指向被裁条目不算篡改） |
 | I5 | 接受账本自身 compaction 记入销毁账本；acceptance-anchor 流自身 compaction 不被观察（无环终止） |

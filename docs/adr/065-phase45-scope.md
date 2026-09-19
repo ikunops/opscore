@@ -111,6 +111,8 @@ durable 行 Sync 成功（既有代码）→ 接受条目追加（同 s.mu 临�
 6. 记账有界 ⇒ 早期接受条目被合法 compaction 裁掉 ⇒ 对应记录的 intact 断言不可用（账本窗口纪律：结果强制携带 `acceptance_window{min_entry, max_entry, entries, continuous}` + `coverage_floor`；段不连续 ⇒ `window_discontinuous` 可断言）。
 7. **启用但账本缺失/空** ⇒ `input_absent`（与「从未接受任何记录」本地同形，诚实）。
 8. **记账失败不补记**（补记弱化「接受时事实」语义）：`acceptanceErr` 粘滞至下一次成功追加；Append 热路径 double-Sync（store + 账本）+ KAK 签名（CPU，Ed25519 微秒级）为已知运维代价。
+9. **acceptance-anchor 派发为收集后置**（B1 强制）：crash 于 tick 尾部排水前 ⇒ 该条目不被锚定且无回填——R40-6「pending 行在联系 witness 前 durable」的家族语义在本流的放宽，诚实声明（P43 的 destruction-anchor 无重试 sweep 为既有同族缺口）。
+10. **追加路径评估为增量验证**（终审 MAJOR-1 修订，见 ADR-066 I2）：已验证前缀缓存 + 增量连续性；同尺寸前缀篡改由对账/compaction 全量验证在 ≤1 tick 内捕获。tick 尾排水持 destructionDispatchMu 做 witness I/O 期间，轮转触发的 Append 在该锁上等待（有界超时、仅轮转点发生）；Status() 经 AcceptanceError() 读 store s.mu 存在可用性耦合（O(1) 化后可忽略）。
 
 ## 5. 测试契约（T237~T257；T236 已被 P44 占用，全表右移一号）
 

@@ -562,6 +562,13 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 			return nil, fmt.Errorf("history export: key authority %s is absent from the configured KAK trust keys — acceptance entries would verify as unauthorized", kakSigner.keyID)
 		}
 	}
+	if cfg.AcceptanceLog && !cfg.DestructionLog {
+		// G4 (final review MAJOR-2): the acceptance ledger's own compaction is
+		// evidence destruction and MUST be accounted (I7). Without the
+		// destruction log the trim would be silent — exactly the laundering the
+		// discipline forbids.
+		return nil, errors.New("history export: --export-acceptance-log requires --export-destruction-log — the acceptance ledger's own compaction is evidence destruction and must be accounted (G4)")
+	}
 	if cfg.AcceptanceCapacity < 0 {
 		return nil, fmt.Errorf("history export: acceptance capacity %d is negative", cfg.AcceptanceCapacity)
 	}
