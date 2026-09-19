@@ -130,6 +130,15 @@ type HistoryExportConfig struct {
 	// DestructionCapacity bounds `destruction-log.jsonl` by whole
 	// `destruction_seq` groups. 0 disables the cap.
 	DestructionCapacity int
+	// AcceptanceLog (Phase 45) turns the input-integrity acceptance ledger
+	// on. FALSE by default: no file, no hook, no behaviour change anywhere
+	// (ADR-065 A6 — default zero regression).
+	AcceptanceLog bool
+	// AcceptanceCapacity bounds `record-acceptance.jsonl` by whole `entry_seq`
+	// groups. 0 disables the cap. Boundedness is the OBSERVED compaction
+	// (destruction-accounted, A8-6); a REFUSED compaction refuses new entries
+	// (I7) — there is deliberately no other "full" state.
+	AcceptanceCapacity int
 }
 
 // HistoryExportStatus is the read-only scheduler state surfaced via
@@ -174,6 +183,11 @@ type HistoryExportStatus struct {
 	Interval       string                    `json:"interval,omitempty"`
 	Formats        []string                  `json:"formats,omitempty"`
 	Retain         int                       `json:"retain"`
+	// Phase 45: input-integrity roll-up. nil (and therefore absent) unless the
+	// acceptance ledger is enabled (ADR-065 A6 — default deployment stays
+	// byte-identical to Phase 44). Kept as its own alignment group so every
+	// pre-existing line of this struct stays byte-identical.
+	InputIntegrity *inputIntegrityStatusSummary `json:"input_integrity,omitempty"`
 }
 
 // HistoryExportScheduler materializes the durable alert-transition history to
@@ -221,6 +235,22 @@ type HistoryExportScheduler struct {
 
 	// Phase 43: destruction accountability. The log is never cached either.
 	destructionError string
+
+	// Phase 45 (ADR-066 §1): input-integrity state.
+	//   - acceptanceErrSource reads the store's sticky acceptance-recording
+	//     failure (the status-face input_error). Non-nil only when the Phase is
+	//     on and the store is the concrete file-backed store.
+	//   - acceptancePending holds the acceptance entries COLLECTED by the
+	//     recorder during Appends (B1: zero-I/O under the store's locks); the
+	//     tick tail dispatches them (guarded by acceptancePendingMu).
+	//   - destructionAnchorQueue holds the terminal destruction entries whose
+	//     observation point was COLLECT-ONLY (the acceptance ledger's
+	//     compaction, B1); the tick tail drains it (accessed only inside
+	//     destructionDispatchMu critical sections — enqueues arrive through
+	//     dispatchDestructionPending, which already holds it).
+	acceptanceErrSource    interface{ AcceptanceError() string }
+	acceptancePending      []acceptanceEntry
+	destructionAnchorQueue []destructionEntry
 
 	mu             sync.Mutex
 	started        bool
@@ -511,7 +541,32 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		}
 	}
 
-	return &HistoryExportScheduler{
+	// Phase 45 (ADR-065 A1 / ADR-066 §3): the input-integrity acceptance
+	// ledger. G1/G2 are the same guards P43 applies to the destruction log —
+	// an acceptance entry nobody can verify is not evidence, it is the
+	// appearance of evidence:
+	//   G1  acceptance log on with no KAK private key ⇒ the ledger cannot be
+	//       written at all (an "every record is committed" that commits nothing);
+	//   G2  acceptance log on with no usable KAK trust anchor ⇒ we could sign
+	//       acceptance entries nobody can ever check (P37 T79b / P41 I1);
+	//   G3  (KAK == signing key) is inherited from the Phase 41 block above and
+	//       already fails construction whenever a KAK is configured at all.
+	if cfg.AcceptanceLog {
+		if kakSigner == nil {
+			return nil, errors.New("history export: --export-acceptance-log is set but no --export-key-authority is configured — acceptance entries could never be signed")
+		}
+		if kakTrust == nil || len(kakTrust.keys) == 0 {
+			return nil, errors.New("history export: --export-acceptance-log is set but no --export-key-authority-trust is configured — acceptance entries could never be verified")
+		}
+		if _, ok := kakTrust.keys[kakSigner.keyID]; !ok {
+			return nil, fmt.Errorf("history export: key authority %s is absent from the configured KAK trust keys — acceptance entries would verify as unauthorized", kakSigner.keyID)
+		}
+	}
+	if cfg.AcceptanceCapacity < 0 {
+		return nil, fmt.Errorf("history export: acceptance capacity %d is negative", cfg.AcceptanceCapacity)
+	}
+
+	s := &HistoryExportScheduler{
 		cfg:             cfg,
 		clock:           clock,
 		logger:          cfg.Logger,
@@ -521,7 +576,32 @@ func NewHistoryExportScheduler(cfg HistoryExportConfig) (*HistoryExportScheduler
 		keyAuthority:    &keyAuthority{signer: kakSigner, trust: kakTrust},
 		verifierSigner:  vakSigner,
 		verifierTrust:   verifierTrust,
-	}, nil
+	}
+	// Phase 45: construct the acceptance recorder and inject it into the store
+	// at construction time (构造期注入, ADR-066 §1). The recorder must exist
+	// BEFORE the tracker can observe anything, so a composition root that
+	// enables the Phase with a non-file-backed (or failed) store is a fail-fast
+	// configuration error: input integrity has no meaning without durable
+	// records to commit.
+	if cfg.AcceptanceLog {
+		rec := &acceptanceRecorder{
+			path:     acceptanceLogPath(cfg.Dir),
+			capacity: cfg.AcceptanceCapacity,
+			ka:       &keyAuthority{signer: kakSigner, trust: kakTrust},
+			clock:    time.Now,
+		}
+		rec.observe = s.acceptanceCompactionObserver()
+		if s.anchorEnabled() {
+			rec.onAnchor = s.enqueueAcceptanceAnchor
+		}
+		fbs, ok := cfg.Store.(*FileBackedTransitionStore)
+		if !ok {
+			return nil, errors.New("history export: --export-acceptance-log requires the durable file-backed transition store — input integrity has no meaning without durable records to commit")
+		}
+		fbs.installAcceptanceRecorder(rec)
+		s.acceptanceErrSource = fbs
+	}
+	return s, nil
 }
 
 // keyLifecycleConfig assembles the Phase 41 bundle. It is rebuilt on every use:
@@ -701,6 +781,15 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 	pubErrs, manifestErr, pubStateErr := s.publishSnapshot(res)
 
 	s.refreshAnchorStatus()
+
+	// Phase 45 (ADR-066 §3): the tick tail is the ONLY place the two Phase 45
+	// collect-only sources reach the witness — the acceptance-anchor pendings
+	// the recorder collected during Appends (B1) and the terminal destruction
+	// entries queued by the acceptance ledger's collect-only compaction
+	// observer. Both run here holding NO store lock, so witness network I/O
+	// never holds s.mu / acceptanceMu / destructionWriteMu (I6).
+	s.dispatchAcceptancePending()
+	s.drainDestructionAnchorQueue()
 
 	s.mu.Lock()
 	if pubStateErr != "" {
@@ -1388,6 +1477,14 @@ func snapshotGroupKey(name string) string {
 
 // Status returns a snapshot of the scheduler state for the read API.
 func (s *HistoryExportScheduler) Status() HistoryExportStatus {
+	// Phase 45: the store's sticky acceptance error is read BEFORE s.mu — the
+	// acceptance-compaction observer legitimately runs under the STORE's
+	// critical section and reports destruction errors via s.mu, so taking
+	// s.mu and then the store's mutex would invert the lock order (I6).
+	acceptanceErr := ""
+	if s.acceptanceErrSource != nil {
+		acceptanceErr = s.acceptanceErrSource.AcceptanceError()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := HistoryExportStatus{
@@ -1434,6 +1531,13 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 		if ds.Error == "" && s.destructionError != "" {
 			st.Destruction.Error = s.destructionError
 		}
+	}
+	// Phase 45: likewise omitted unless the acceptance ledger is enabled, so a
+	// default deployment's status document is byte-identical to Phase 44. The
+	// Error carries the store's sticky acceptance-recording failure
+	// (input_error, ADR-066 §3).
+	if s.cfg.AcceptanceLog {
+		st.InputIntegrity = &inputIntegrityStatusSummary{Enabled: true, Error: acceptanceErr}
 	}
 	if s.trust != nil {
 		st.TrustedKeys = len(s.trust.keys)

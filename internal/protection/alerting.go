@@ -126,6 +126,12 @@ type TransitionLoadResult struct {
 	// dropped holes). 0/0 when the result carries no transitions.
 	MinSeq int64
 	MaxSeq int64
+	// Seqs (Phase 45) aligns 1:1 with Transitions, carrying each record's
+	// durable seq. Nil when the store does not track per-record seq (nil store,
+	// legacy, degraded store). Only the ReadAll projection fills it — the
+	// Phase 45 input-integrity reconciliation is its sole consumer, so the
+	// Load/ReadRecent/ReadBefore results stay byte-for-byte what they were.
+	Seqs []int64
 }
 
 // AlertTransitionStore is the durable, cross-restart retention boundary for

@@ -122,6 +122,21 @@ type FileBackedTransitionStore struct {
 	// to a clean in-memory one ("unreadable history" must never become
 	// "no history").
 	openErr error
+
+	// acceptance (Phase 45, ADR-066 §3) is the input-integrity recorder. nil ⇒
+	// Phase 45 is OFF and the Append hot path pays exactly ONE nil comparison
+	// (P45-I9 — default zero regression). Non-nil ⇒ every durable append is
+	// recorded into the acceptance ledger INSIDE the same s.mu critical
+	// section, after the durable Sync and the watermark advance (record-first,
+	// ADR-065 A3).
+	acceptance *acceptanceRecorder
+	// acceptanceErr is the sticky last acceptance-recording failure ("" when
+	// healthy). A recording failure can never roll the record back — the record
+	// is already durable (the only success point is behind us) — so it is
+	// surfaced here (input_error on the status face) and the reconciliation
+	// reports the record `record_unaccepted` (loud, honest). It clears on the
+	// next successful recording; failures are never re-recorded (A8-8).
+	acceptanceErr string
 }
 
 // NewFileBackedTransitionStore opens (creating and writing the metadata line if
@@ -472,6 +487,22 @@ func (s *FileBackedTransitionStore) Append(ctx context.Context, t protection.Ale
 	s.lastSeq = seq
 	s.count++
 
+	// Phase 45 (ADR-066 §3): the record is DURABLE and its sequence CONSUMED —
+	// record it into the acceptance ledger inside the SAME s.mu critical
+	// section, at the P32-I15 point (after the durable Sync and the watermark
+	// advance). record-first (ADR-065 A3): a crash or refusal here leaves the
+	// record persisted but unaccepted ⇒ the reconciliation reports
+	// `record_unaccepted` (loud) — never a phantom ledger entry. A recording
+	// failure never rolls the record back, never changes this call's return,
+	// and is never retried (A8-8): it is surfaced sticky via AcceptanceError.
+	if s.acceptance != nil {
+		if aerr := s.acceptance.record(seq, line); aerr != nil {
+			s.acceptanceErr = aerr.Error()
+		} else {
+			s.acceptanceErr = ""
+		}
+	}
+
 	closeErr := s.closeFn(f)
 
 	var evictErr error
@@ -555,6 +586,31 @@ func (s *FileBackedTransitionStore) evictLocked() error {
 // Close implements protection.AlertTransitionStore. The store opens/closes the
 // file per-operation, so there is no persistent handle to release.
 func (s *FileBackedTransitionStore) Close() error { return nil }
+
+// installAcceptanceRecorder wires the Phase 45 acceptance ledger into the
+// Append path (构造期注入, ADR-066 §1). It is called EXACTLY ONCE by the
+// scheduler constructor — before the tracker can observe anything — so no
+// concurrent Append exists yet; s.mu is taken anyway so the write is ordered
+// against every later reader.
+func (s *FileBackedTransitionStore) installAcceptanceRecorder(r *acceptanceRecorder) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.acceptance = r
+}
+
+// AcceptanceError reports the sticky last acceptance-recording failure
+// ("" when healthy). It is the status-face `input_error` source (ADR-066 §3).
+//
+// Lock-graph note (I6): this takes s.mu. It must NEVER be called while holding
+// the scheduler's mutex — the acceptance-compaction observer legitimately runs
+// under s.mu (it is inside the Append critical section) and reports destruction
+// errors via scheduler.mu, so scheduler.mu → s.mu would be a lock-order
+// inversion. Status() therefore reads this BEFORE taking scheduler.mu.
+func (s *FileBackedTransitionStore) AcceptanceError() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.acceptanceErr
+}
 
 // durableReadMaxBytes is the durable-read byte budget (P31-I3). It is enforced
 // via Stat BEFORE any read: a budget that only applies after the file has been
@@ -751,10 +807,17 @@ func (s *FileBackedTransitionStore) ReadAll(ctx context.Context) protection.Tran
 	}
 
 	// Return ALL retained records, NEWEST-FIRST (mirror of ReadRecent ordering).
+	// Phase 45: the parallel Seqs slice carries each record's durable seq
+	// (persistedTransition.Seq) — the input-integrity reconciliation pairs the
+	// canonical durable bytes with the acceptance ledger by this identity. The
+	// export serializers never read it, so every Phase 33~44 output stays
+	// byte-identical (P45-I9).
 	out := make([]protection.AlertTransition, 0, len(recs))
+	seqs := make([]int64, 0, len(recs))
 	var minSeq, maxSeq int64
 	for i := len(recs) - 1; i >= 0; i-- {
 		out = append(out, recs[i].rec)
+		seqs = append(seqs, recs[i].seq)
 		if i == len(recs)-1 || recs[i].seq < minSeq {
 			minSeq = recs[i].seq
 		}
@@ -764,6 +827,7 @@ func (s *FileBackedTransitionStore) ReadAll(ctx context.Context) protection.Tran
 	}
 	return protection.TransitionReadResult{
 		Transitions:                out,
+		Seqs:                       seqs,
 		FileDropped:                fd,
 		RetentionMetaInconsistent:  metaInc,
 		ExportedAt:                 time.Now().UTC(),

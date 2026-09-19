@@ -501,6 +501,14 @@ func cmdServe(args []string) {
 	// is introduced and anchoring reuses --export-anchor-*.
 	exportDestructionLog := fs.Bool("export-destruction-log", false, "record authorized destruction events (destruction-log.jsonl) so an unrecorded disappearance becomes assertable instead of silent (requires --export-key-authority and --export-key-authority-trust)")
 	exportDestructionCapacity := fs.Int("export-destruction-capacity", 4096, "max destruction record groups to retain (oldest whole groups first; the log accounts for its own compaction, 0 = keep all)")
+	// Phase 45 (input integrity): OPT-IN and OFF by default. It fixes the
+	// record's AT-ACCEPTANCE identity: after each durable append the store
+	// commits a KAK-signed acceptance entry (record-acceptance.jsonl), so a
+	// store-level tampering of durable history becomes assertable on the next
+	// verify/export. The signing authority is the Phase 41 KAK — no new trust
+	// anchor is introduced.
+	exportAcceptanceLog := fs.Bool("export-acceptance-log", false, "commit a KAK-signed acceptance entry for every durable alert-transition record (record-acceptance.jsonl) so store-level tampering becomes assertable (requires --export-key-authority and --export-key-authority-trust)")
+	exportAcceptanceCapacity := fs.Int("export-acceptance-capacity", 4096, "max acceptance entry groups to retain (oldest whole groups first; boundedness is the destruction-accounted compaction, a refused compaction refuses new entries, 0 = keep all)")
 	fs.Parse(args)
 
 	logger := newLogger()
@@ -658,6 +666,10 @@ func cmdServe(args []string) {
 			// are deliberately reused — no new trust anchor is introduced).
 			DestructionLog:      *exportDestructionLog,
 			DestructionCapacity: *exportDestructionCapacity,
+			// Phase 45: input integrity (KAK flags reused — no new trust
+			// anchor).
+			AcceptanceLog:      *exportAcceptanceLog,
+			AcceptanceCapacity: *exportAcceptanceCapacity,
 		})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)

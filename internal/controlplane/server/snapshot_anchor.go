@@ -51,6 +51,14 @@ const verificationAnchorFile = "verification-anchor.jsonl"
 // destructionAnchorFile (Phase 43) is the FOURTH anchor record stream.
 const destructionAnchorFile = "destruction-anchor.jsonl"
 
+// acceptanceAnchorFile (Phase 45) is the FIFTH anchor record stream: the
+// out-of-domain copy of the input-integrity acceptance entries (ADR-065 A5).
+// It is kept out of the four earlier files for the same reason every earlier
+// family got its own file: the shared group classifier keys on `anchor_seq`
+// alone, so one file holding two families would let a compaction drop a group
+// across the families.
+const acceptanceAnchorFile = "acceptance-anchor.jsonl"
+
 // anchorKind values. The empty kind is the Phase 40 publication family, so
 // every byte ever written by Phase 40 stays identical.
 const (
@@ -64,6 +72,10 @@ const (
 	// records. Every field it uses is omitempty, so all three earlier families
 	// keep serializing byte-for-byte as they always have (ADR-061 §6.4 / T221).
 	anchorKindDestruction = "destruction"
+	// anchorKindAcceptance (Phase 45) is the FIFTH family: input-integrity
+	// acceptance entries. Every field it uses is omitempty, so all four
+	// earlier families keep serializing byte-for-byte as they always have.
+	anchorKindAcceptance = "acceptance"
 )
 
 // Delivery states of one anchor_seq. Only `anchored` is a CONFIRMED state —
@@ -116,6 +128,12 @@ type anchorEntry struct {
 	DestructionDigest  string `json:"destruction_digest,omitempty"` // the group's entry_digest
 	DestructionVerdict string `json:"destruction_verdict,omitempty"`
 
+	// Phase 45 (the fifth anchor family). All omitempty, so Phase 40/41/42/43
+	// entries stay byte-identical.
+	AcceptanceSeq       int64  `json:"acceptance_seq,omitempty"`        // the acceptance entry_seq
+	AcceptanceDigest    string `json:"acceptance_digest,omitempty"`     // the entry's entry_digest
+	AcceptanceRecordSeq int64  `json:"acceptance_record_seq,omitempty"` // the committed record seq
+
 	// ---- delivery state: mutable, never signed ----
 	State      string `json:"state"`
 	Attempts   int    `json:"attempts"`
@@ -150,6 +168,10 @@ type anchorSigned struct {
 	DestructionSeq     int64  `json:"destruction_seq,omitempty"`
 	DestructionDigest  string `json:"destruction_digest,omitempty"`
 	DestructionVerdict string `json:"destruction_verdict,omitempty"`
+	// Phase 45 — omitempty keeps ALL earlier payloads byte-identical.
+	AcceptanceSeq       int64  `json:"acceptance_seq,omitempty"`
+	AcceptanceDigest    string `json:"acceptance_digest,omitempty"`
+	AcceptanceRecordSeq int64  `json:"acceptance_record_seq,omitempty"`
 }
 
 func anchorSignedFields(e *anchorEntry) anchorSigned {
@@ -173,6 +195,11 @@ func anchorSignedFields(e *anchorEntry) anchorSigned {
 		DestructionSeq:     e.DestructionSeq,
 		DestructionDigest:  e.DestructionDigest,
 		DestructionVerdict: e.DestructionVerdict,
+		// Phase 45 — a separate alignment group so every pre-existing line
+		// above stays byte-identical.
+		AcceptanceSeq:       e.AcceptanceSeq,
+		AcceptanceDigest:    e.AcceptanceDigest,
+		AcceptanceRecordSeq: e.AcceptanceRecordSeq,
 	}
 }
 
@@ -184,6 +211,8 @@ func (e *anchorEntry) identityID() int64 {
 		return e.EventSeq
 	case anchorKindDestruction:
 		return e.DestructionSeq
+	case anchorKindAcceptance:
+		return e.AcceptanceSeq
 	}
 	return e.PublicationID
 }
@@ -1004,6 +1033,10 @@ func verificationAnchorPath(dir string) string { return filepath.Join(dir, verif
 // the third: the shared classifier keys on `anchor_seq` alone.
 func destructionAnchorPath(dir string) string { return filepath.Join(dir, destructionAnchorFile) }
 
+// acceptanceAnchorPath (Phase 45) is the fifth anchor stream — same reason as
+// the fourth: the shared classifier keys on `anchor_seq` alone.
+func acceptanceAnchorPath(dir string) string { return filepath.Join(dir, acceptanceAnchorFile) }
+
 // anchorDestructionEntry records and dispatches the anchor of one destruction
 // record. The pending line is durable BEFORE the witness is contacted (R40-6),
 // and per I6 the result is an EXIT: it never feeds the destruction verdict.
@@ -1036,6 +1069,47 @@ func (s *HistoryExportScheduler) anchorDestructionEntry(e destructionEntry) erro
 	// termination rule as the destruction log's own self-compaction). The
 	// witness already holds every dispatched entry, so nothing external is
 	// lost by not re-recording our own bookkeeping.
+	if aerr := appendAnchorEntryPathObserved(path, s.cfg.AnchorCapacity, ae, nil); aerr != nil {
+		return aerr
+	}
+	return s.dispatchAnchorPath(context.Background(), path, ae)
+}
+
+// anchorAcceptanceEntry (Phase 45, ADR-065 A5) records and dispatches the
+// anchor of one input-integrity acceptance entry — the FIFTH anchor family,
+// into its own file and its own sequence space. The pending line is durable
+// BEFORE the witness is contacted (R40-6), and per I6 the result is an EXIT:
+// it never feeds the input-integrity verdict.
+//
+// It is called ONLY from the scheduler tick tail (dispatchAcceptancePending) —
+// never from the recorder's critical section (B1: the recorder collects, the
+// tick dispatches, so witness I/O never holds the store's locks).
+func (s *HistoryExportScheduler) anchorAcceptanceEntry(e acceptanceEntry) error {
+	if !s.anchorEnabled() || s.signer == nil {
+		return nil
+	}
+	path := acceptanceAnchorPath(s.cfg.Dir)
+	seq, err := nextAnchorSeqPath(path)
+	if err != nil {
+		return err
+	}
+	ae := anchorEntry{
+		AnchorSeq:           seq,
+		Kind:                anchorKindAcceptance,
+		AcceptanceSeq:       e.EntrySeq,
+		AcceptanceDigest:    e.EntryDigest,
+		AcceptanceRecordSeq: e.RecordSeq,
+		RecordedAt:          s.clock().UTC().Format(time.RFC3339Nano),
+		State:               anchorStatePending,
+	}
+	if serr := s.signer.signAnchorEntry(&ae, s.cfg.Dir, s.clock()); serr != nil {
+		return serr
+	}
+	// I5 for the fifth stream: the acceptance-anchor file is the
+	// accountability system's OWN bookkeeping. Its compaction must NOT be
+	// observed (nil observer) — the same structural termination rule as the
+	// destruction-anchor stream (R43-8): an observed compaction here would
+	// record a destruction whose dispatch appends back into THIS file.
 	if aerr := appendAnchorEntryPathObserved(path, s.cfg.AnchorCapacity, ae, nil); aerr != nil {
 		return aerr
 	}

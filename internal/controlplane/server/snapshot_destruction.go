@@ -56,7 +56,9 @@ const destructionLogFile = "destruction-log.jsonl"
 const destructionSubjectLimit = 100
 
 // The six destruction kinds — one per destroyed surface, plus the
-// log-accounting-for-itself case (I5).
+// log-accounting-for-itself case (I5). Phase 45 adds the seventh: the input
+// integrity acceptance ledger's own prefix compaction (ADR-066 §3 — it is
+// evidence too, so trimming it is a destruction that must be accounted for).
 const (
 	destructionKindSnapshotRetention      = "snapshot_retention"
 	destructionKindLedgerCompaction       = "ledger_compaction"
@@ -64,6 +66,7 @@ const (
 	destructionKindKeyLifecycleCompaction = "key_lifecycle_compaction"
 	destructionKindVerificationCompaction = "verification_compaction"
 	destructionKindSelfCompaction         = "self_compaction"
+	destructionKindAcceptanceCompaction   = "acceptance_compaction"
 )
 
 // The state of one destruction group. `state` is the ONLY field in the STATE
@@ -732,6 +735,7 @@ var destructionKinds = map[string]bool{
 	destructionKindKeyLifecycleCompaction: true,
 	destructionKindVerificationCompaction: true,
 	destructionKindSelfCompaction:         true,
+	destructionKindAcceptanceCompaction:   true,
 }
 
 // destructionWriteMu is the log's critical section (R43-3 / review finding 1).

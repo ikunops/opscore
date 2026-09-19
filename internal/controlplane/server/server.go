@@ -1668,6 +1668,10 @@ func (s *Server) ProtectionReadMux() http.Handler {
 	// namespace follows the surface being extended (the export face), the same
 	// ruling R214 gave Phase 42.
 	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/destruction", s.handleHistoryExportDestruction)
+	// Phase 45: input integrity (WHAT ACCEPTED — is the record in the store
+	// still the one the system originally accepted?). Read-only, admin-only,
+	// :8082 only, same namespace ruling as Phase 43.
+	mux.HandleFunc("GET /management/v1/protection/alerts/history/export/input-integrity", s.handleHistoryExportInputIntegrity)
 	return mux
 }
 
