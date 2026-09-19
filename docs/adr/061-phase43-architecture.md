@@ -1,6 +1,6 @@
 # ADR-061 · Phase 43 — Evidence Destruction Accountability（销毁留痕）· Architecture
 
-- **Status**: PROPOSED（R217 投递，待 judge 裁决）
+- **Status**: ACCEPTED（R217 裁决 = **A**；Q4/Q5/Q6 全部支持）；实现见 ADR-062
 - **Parent**: ADR-060（P43 Scope, commit `6489d58c`）；ADR-059（P42 Implementation, `2cdc2838`）
 - **裁决前提**: R216 = **B**（方向与问题定义采纳），两处必修 **R43-1 / R43-2** 闭合后随 Architecture 同轮交付
 - **Author**: executor
