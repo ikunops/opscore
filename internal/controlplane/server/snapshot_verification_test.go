@@ -1874,3 +1874,73 @@ func TestP44POSTResponseIsUnchangedInIndependentMode(t *testing.T) {
 		t.Fatalf("T236: the POST response must not expose the verifier identity (R44-4): %s", independent)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// R221-review major fix — the write path is a SINGLE critical section FOR REAL
+// (R43-3 lineage, mirrored from destructionWriteMu). Before the fix the
+// comment claimed it while the code held no mutex: concurrent
+// AttestVerification calls (POST∥POST via server.go's POST route, or
+// verifyTick∥POST — verifyRunning only guards tick∥tick) all read the same
+// log, all derived report_seq = max+1, and both lines landed — a benign
+// concurrency forked the log, fail-closed detected it, and EVERY later append
+// was refused forever: one race, permanently bricked log, no repair path.
+// ---------------------------------------------------------------------------
+func TestP44ConcurrentAttestationNeverDuplicatesReportSeq(t *testing.T) {
+	f := newP44Fixture(t, true, false)
+	f.at(vT1)
+	f.publish(t)
+
+	// Wave 1 — 8 concurrent POST-equivalent attestations.
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = f.sched.AttestVerification(100)
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("wave 1: concurrent attestation %d failed: %v (a benign race must be serialized, not refused)", i, err)
+		}
+	}
+
+	// Wave 2 — verifyTick (the periodic entry, guarded only against tick∥tick)
+	// racing a direct POST-equivalent attestation.
+	tickErr := make(chan error, 1)
+	go func() { f.sched.verifyTick(); tickErr <- nil }()
+	_, directErr := f.sched.AttestVerification(100)
+	if err := <-tickErr; err != nil {
+		t.Fatalf("wave 2: verifyTick failed: %v", err)
+	}
+	if directErr != nil {
+		t.Fatalf("wave 2: direct attestation failed: %v (tick∥direct must be serialized, not refused)", directErr)
+	}
+
+	// Aftermath: n+2 distinct reports (8 direct + 1 tick + 1 direct), verifiable,
+	// and the log is still appendable — no permanent brick.
+	st, err := loadVerificationState(f.sched.verificationConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.verifiable {
+		t.Fatalf("the log must stay verifiable under concurrent attestation: %v", st.errs)
+	}
+	if len(st.entries) != n+2 {
+		t.Fatalf("want %d distinct reports, got %d (errs=%v)", n+2, len(st.entries), st.errs)
+	}
+	seen := map[int64]bool{}
+	for _, e := range st.entries {
+		if seen[e.ReportSeq] {
+			t.Fatalf("duplicate report_seq %d under concurrency — the write path is not a critical section", e.ReportSeq)
+		}
+		seen[e.ReportSeq] = true
+	}
+	f.at(vT3)
+	if _, err := f.sched.AttestVerification(100); err != nil {
+		t.Fatalf("the log must remain appendable after concurrent use (a benign race must never brick it), got %v", err)
+	}
+}

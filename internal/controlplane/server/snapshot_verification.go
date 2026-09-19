@@ -62,6 +62,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -986,13 +987,34 @@ func lifecycleRulerOf(st *keyLifecycleState, keyID string) string {
 // Appending (write path)
 // ---------------------------------------------------------------------------
 
-// appendVerificationReport records one report. It is a SINGLE critical section:
-// read the log, validate, allocate the seq, digest, sign, append, compact.
+// verificationWriteMu is the verification log's critical section (R43-3
+// lineage — the lesson P43 fixed for the destruction log with
+// destructionWriteMu, snapshot_destruction.go, now applied to this log, whose
+// writers live in three independent synchronization domains: the verify tick
+// (whose verifyRunning guard covers tick∥tick ONLY), the admin HTTP face's
+// POST route (direct AttestVerification), and every compaction observer that
+// may fire while the log is extended). Two interleaved read→append sequences
+// would both derive the same report_seq and prev_digest, and both lines would
+// land — a benign race would fork the log, fail-closed would detect it, and
+// EVERY later append would be refused: an unrecoverably bricked log. The
+// mutex makes the section the comment below always claimed it was; the only
+// edge it adds nests verificationWriteMu → destructionWriteMu (the compaction
+// observer), and no destruction path ever takes verificationWriteMu back, so
+// no cycle exists.
+var verificationWriteMu sync.Mutex
+
+// appendVerificationReport records one report. It is a SINGLE critical section
+// — now enforced by verificationWriteMu, not merely asserted: read the log,
+// validate, allocate the seq, digest, sign, append, compact.
 //
 // There is deliberately NO watermark file: report_seq is derived from the log's
 // own maximum inside this section (P41 R41-6, inherited verbatim). Persisting a
 // seq before the append would burn a number the append never used and leave a
-// hole that `window_discontinuous` would then have to read as tampering.
+// hole that `window_discontinuous` would then have to read as tampering. The
+// same intra-section derivation is why the section must be mutually exclusive:
+// the "a later appender's seq is always larger" boundary argument (ADR-059)
+// holds only when no other writer can interleave between the read and the
+// append.
 //
 // A report is a FACT: a second line for the same report_seq is always a
 // conflict, never a state advance (ADR-057 §3 — the opposite of the P40 anchor).
@@ -1000,6 +1022,8 @@ func appendVerificationReport(c verificationConfig, r *VerificationReport, at ti
 	if !c.enabled() {
 		return errors.New("verification: no signing key / trust anchor configured (writes disabled)")
 	}
+	verificationWriteMu.Lock()
+	defer verificationWriteMu.Unlock()
 	path := verificationLogPath(c.dir)
 	lines, ok, err := readLogLines(path, verificationGroupOf)
 	if err != nil {
