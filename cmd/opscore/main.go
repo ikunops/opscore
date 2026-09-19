@@ -643,12 +643,12 @@ func cmdServe(args []string) {
 			// Phase 42: verification attestation.
 			VerifyAttest:   *exportVerifyAttest,
 			VerifyInterval: *exportVerifyInterval,
-				VerifyCapacity: *exportVerifyCapacity,
-				// Phase 43: destruction accountability (KAK and anchor flags
-				// are deliberately reused — no new trust anchor is introduced).
-				DestructionLog:      *exportDestructionLog,
-				DestructionCapacity: *exportDestructionCapacity,
-			})
+			VerifyCapacity: *exportVerifyCapacity,
+			// Phase 43: destruction accountability (KAK and anchor flags
+			// are deliberately reused — no new trust anchor is introduced).
+			DestructionLog:      *exportDestructionLog,
+			DestructionCapacity: *exportDestructionCapacity,
+		})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)
 			os.Exit(1)

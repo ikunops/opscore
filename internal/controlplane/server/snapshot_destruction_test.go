@@ -1003,10 +1003,144 @@ func TestDestructionRealLedgerCompactionIsAccountedEndToEnd(T *testing.T) {
 	if !g.usable || g.state != destructionStateCompleted {
 		T.Fatalf("the destruction group must be usable and completed, got usable=%v state=%q", g.usable, g.state)
 	}
-	if g.entry.DestroyedCount <= 0 {
-		T.Fatalf("destroyed_count must record the actual dropped line count, got %d", g.entry.DestroyedCount)
+	// Pinned exactly (review round 2, N5): with capacity=1 every compaction
+	// drops exactly ONE ledger line — the pre-fix value (1 range target) also
+	// produced 1, so pin the number to keep the discriminator honest. A log
+	// face entry whose dropped-line count diverges from 1 must fail here.
+	if g.entry.DestroyedCount != 1 {
+		T.Fatalf("destroyed_count must equal the actual dropped line count (1), got %d", g.entry.DestroyedCount)
 	}
 	if len(g.entry.Targets) != 1 || g.entry.Targets[0].PrefixDigest == "" {
 		T.Fatalf("the log-face target must carry the prefix digest, got %+v", g.entry.Targets)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R43-8 (review round 2, N5) — a quarantined group in the MIDDLE of the log
+// must not poison the groups before or after it: the chain runs over on-disk
+// bytes, so order stays verifiable and healthy groups keep counting.
+// ---------------------------------------------------------------------------
+func TestDestructionMiddleGroupQuarantineKeepsTheRestUsable(T *testing.T) {
+	f := newDestructionFixture(T)
+	c := f.cfg()
+	f.recordOne(c, T, 1, dsT0)
+
+	// Group 2 is hand-forged with the EXPORT key (the adversary), chained onto
+	// group 1's on-disk tail exactly as a real end-append would be.
+	st1, err := loadDestructionState(c)
+	if err != nil {
+		T.Fatal(err)
+	}
+	tail := st1.bySeq[1].entry
+	tail.State = st1.bySeq[1].state
+	ld1, lerr := destructionLineDigest(&tail)
+	if lerr != nil {
+		T.Fatal(lerr)
+	}
+	forge := &destructionEntry{
+		V: 1, DestructionSeq: 2, Kind: destructionKindSnapshotRetention,
+		Targets: pubTargets(42), DestroyedCount: 1, Policy: "retain=1",
+		RecordedAt: dsT1.UTC().Format(time.RFC3339Nano), AuthorityKeyID: f.signer.keyID,
+		StreamID: f.streamID, PrevDigest: ld1, State: destructionStateIntended,
+	}
+	dg2, _ := destructionEntryDigest(forge)
+	forge.EntryDigest = dg2
+	if serr := f.signer.signDestructionEntry(forge, dsT1); serr != nil { // EXPORT key
+		T.Fatal(serr)
+	}
+	raw2, _ := serializeDestructionEntryBytes(forge)
+	if aerr := appendLogLine(destructionLogPath(f.dir), raw2); aerr != nil {
+		T.Fatal(aerr)
+	}
+	ld2, lerr := destructionLineDigest(forge)
+	if lerr != nil {
+		T.Fatal(lerr)
+	}
+
+	// Group 3 is KAK-legitimate and chains over group 2's on-disk tail.
+	g3 := &destructionEntry{
+		V: 1, DestructionSeq: 3, Kind: destructionKindSnapshotRetention,
+		Targets: pubTargets(43), DestroyedCount: 1, Policy: "retain=1",
+		RecordedAt: dsT2.UTC().Format(time.RFC3339Nano), AuthorityKeyID: c.ka.signer.keyID,
+		StreamID: f.streamID, PrevDigest: ld2, State: destructionStateIntended,
+	}
+	dg3, _ := destructionEntryDigest(g3)
+	g3.EntryDigest = dg3
+	if serr := c.ka.signer.signDestructionEntry(g3, dsT2); serr != nil {
+		T.Fatal(serr)
+	}
+	raw3, _ := serializeDestructionEntryBytes(g3)
+	if aerr := appendLogLine(destructionLogPath(f.dir), raw3); aerr != nil {
+		T.Fatal(aerr)
+	}
+	g3c := *g3
+	g3c.State = destructionStateCompleted
+	raw3c, _ := serializeDestructionEntryBytes(&g3c)
+	if aerr := appendLogLine(destructionLogPath(f.dir), raw3c); aerr != nil {
+		T.Fatal(aerr)
+	}
+
+	st, err := loadDestructionState(c)
+	if err != nil {
+		T.Fatal(err)
+	}
+	if !st.verifiable {
+		T.Fatalf("order must stay verifiable across a middle quarantine: %v", st.errs)
+	}
+	if g := st.bySeq[2]; g.usable || g.verdict != destructionVerdictUnauthorized {
+		T.Fatalf("group 2 must be quarantined as unauthorized, got %+v", g)
+	}
+	if g := st.bySeq[3]; !g.usable || g.state != destructionStateCompleted {
+		T.Fatalf("group 3 must stay usable and completed after a middle quarantine, got %+v", g)
+	}
+	if g := st.bySeq[1]; !g.usable {
+		T.Fatal("group 1 must stay usable")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R43-8 (review round 2, N1 regression guard) — the anchor dispatch must run
+// OUTSIDE the destruction write mutex. With the pre-N1-fix code (dispatch under
+// the lock), the second prune here deadlocks process-wide: its dispatch
+// compacts the destruction-anchor log (AnchorCapacity=1), whose observer
+// re-enters the PUBLIC beginDestruction. The watchdog turns that hang into a
+// failure instead of a frozen suite.
+// ---------------------------------------------------------------------------
+func TestDestructionAnchorDispatchNeverDeadlocksOnTheWriteMutex(T *testing.T) {
+	f := newDestructionFixture(T)
+	sched := f.scheduler(T, true)
+	tr, terr := newAnchorTransport("file://"+T.TempDir(), 5*time.Second)
+	if terr != nil {
+		T.Fatal(terr)
+	}
+	sched.anchorTransport = tr
+	sched.cfg.AnchorCapacity = 1
+	if !sched.destructionEnabled() || !sched.anchorEnabled() {
+		T.Fatal("fixture: destruction and anchoring must both be active")
+	}
+	if dc := sched.destructionConfig(); dc.anchorDispatch == nil {
+		T.Fatal("fixture: the anchorDispatch hook must be installed")
+	}
+	// Retain=1: every Tick publishes one unit and prunes the previous one, so
+	// every Tick produces a destruction record whose dispatch enters
+	// destruction-anchor.jsonl. With AnchorCapacity=2 the fourth Tick pushes
+	// that file over capacity, its compaction fires, and the pre-N1-fix code
+	// (dispatch under the write mutex) re-entered beginDestruction and
+	// deadlocked process-wide.
+	sched.cfg.Retain = 1
+	for i := 0; i < 4; i++ {
+		at := dsT0.Add(time.Duration(i) * time.Hour)
+		sched.cfg.Store.(*fakeExportStore).res.ExportedAt = at
+		sched.clock = func() time.Time { return at }
+		done := make(chan struct{}, 1)
+		go func() {
+			sched.Tick(context.Background())
+			done <- struct{}{}
+		}()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			T.Fatalf("N1 regression: tick %d deadlocked on the anchor dispatch re-entry", i)
+		}
 	}
 }

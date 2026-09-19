@@ -567,11 +567,14 @@ func (st *destructionState) markProblem(g *destructionGroup, verdict, detail str
 // this discipline exists to prevent.
 func appendDestructionEntry(c destructionConfig, e *destructionEntry, at time.Time) error {
 	destructionWriteMu.Lock()
-	defer destructionWriteMu.Unlock()
-	return appendDestructionEntryLocked(c, e, at)
+	pending := []destructionEntry{}
+	err := appendDestructionEntryLocked(c, e, at, &pending)
+	destructionWriteMu.Unlock()
+	dispatchDestructionPending(c, pending)
+	return err
 }
 
-func appendDestructionEntryLocked(c destructionConfig, e *destructionEntry, at time.Time) error {
+func appendDestructionEntryLocked(c destructionConfig, e *destructionEntry, at time.Time, pending *[]destructionEntry) error {
 	if !c.writable() {
 		return errors.New("destruction: no key-authority key configured (writes disabled)")
 	}
@@ -696,7 +699,7 @@ func appendDestructionEntryLocked(c destructionConfig, e *destructionEntry, at t
 	// another compaction, which is the recursion the dedicated path exists to
 	// avoid (termination is otherwise only "empirically" shallow).
 	if c.capacity > 0 && e.State != destructionStateIntended {
-		if cerr := compactDestructionSelfLocked(c, at); cerr != nil {
+		if cerr := compactDestructionSelfLocked(c, at, pending); cerr != nil {
 			return cerr
 		}
 	}
@@ -730,11 +733,17 @@ var destructionWriteMu sync.Mutex
 // destruction and call completeDestruction.
 func beginDestruction(c destructionConfig, kind, policy string, unavailable []string, targets []destructionTarget, destroyedCount int, at time.Time) (*destructionEntry, error) {
 	destructionWriteMu.Lock()
-	defer destructionWriteMu.Unlock()
-	return beginDestructionLocked(c, kind, policy, unavailable, targets, destroyedCount, at)
+	pending := []destructionEntry{}
+	e, err := beginDestructionLocked(c, kind, policy, unavailable, targets, destroyedCount, at, &pending)
+	destructionWriteMu.Unlock()
+	// beginDestruction appends an `intended` line, which never triggers the
+	// self-compaction tail, so `pending` is empty here in practice — the
+	// dispatch is threaded for signature uniformity and future safety.
+	dispatchDestructionPending(c, pending)
+	return e, err
 }
 
-func beginDestructionLocked(c destructionConfig, kind, policy string, unavailable []string, targets []destructionTarget, destroyedCount int, at time.Time) (*destructionEntry, error) {
+func beginDestructionLocked(c destructionConfig, kind, policy string, unavailable []string, targets []destructionTarget, destroyedCount int, at time.Time, pending *[]destructionEntry) (*destructionEntry, error) {
 	if !c.writable() {
 		return nil, errors.New("destruction: not writable")
 	}
@@ -746,7 +755,7 @@ func beginDestructionLocked(c destructionConfig, kind, policy string, unavailabl
 		State:                   destructionStateIntended,
 		TargetDigestUnavailable: unavailable,
 	}
-	if aerr := appendDestructionEntryLocked(c, e, at); aerr != nil {
+	if aerr := appendDestructionEntryLocked(c, e, at, pending); aerr != nil {
 		return nil, aerr
 	}
 	return e, nil
@@ -764,11 +773,19 @@ func beginDestructionLocked(c destructionConfig, kind, policy string, unavailabl
 // number.
 func completeDestruction(c destructionConfig, seq int64, state string, at time.Time) error {
 	destructionWriteMu.Lock()
-	defer destructionWriteMu.Unlock()
-	return completeDestructionLocked(c, seq, state, at)
+	pending := []destructionEntry{}
+	err := completeDestructionLocked(c, seq, state, at, &pending)
+	destructionWriteMu.Unlock()
+	// N1 fix (review round 2): the anchor dispatch runs AFTER the mutex is
+	// released. The dispatch can compact the destruction-anchor log, whose
+	// observer re-enters the PUBLIC beginDestruction — under the lock that was
+	// a deterministic self-deadlock (reproduced); here the mutex is free. It
+	// also keeps witness network I/O out of the critical section (N2).
+	dispatchDestructionPending(c, pending)
+	return err
 }
 
-func completeDestructionLocked(c destructionConfig, seq int64, state string, at time.Time) error {
+func completeDestructionLocked(c destructionConfig, seq int64, state string, at time.Time, pending *[]destructionEntry) error {
 	if !c.writable() {
 		return errors.New("destruction: not writable")
 	}
@@ -782,17 +799,28 @@ func completeDestructionLocked(c destructionConfig, seq int64, state string, at 
 	}
 	e := g.entry
 	e.State = state
-	if aerr := appendDestructionEntryLocked(c, &e, at); aerr != nil {
+	if aerr := appendDestructionEntryLocked(c, &e, at, pending); aerr != nil {
 		return aerr
 	}
 	// ADR-061 §4.3 step 4 — EVERY terminal destruction record is dispatched for
 	// anchoring (review finding 6: prune and self_compaction were previously
-	// never witnessed, an asymmetric accountability). The hook is I6-safe: it
-	// logs its own failures and never blocks.
-	if c.anchorDispatch != nil {
+	// never witnessed, an asymmetric accountability). The DISPATCH itself is
+	// deferred to the outermost public caller (N1): inside the Locked helpers
+	// we only collect.
+	*pending = append(*pending, e)
+	return nil
+}
+
+// dispatchDestructionPending runs the anchor hook for every durably appended
+// terminal record. I6-safe by contract: the hook logs its own failures and
+// never blocks. Called OUTSIDE the write mutex only.
+func dispatchDestructionPending(c destructionConfig, pending []destructionEntry) {
+	if c.anchorDispatch == nil {
+		return
+	}
+	for _, e := range pending {
 		_ = c.anchorDispatch(e)
 	}
-	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -806,11 +834,14 @@ func completeDestructionLocked(c destructionConfig, seq int64, state string, at 
 // triggers an observer (ADR-061 §6.2).
 func compactDestructionSelf(c destructionConfig, at time.Time) error {
 	destructionWriteMu.Lock()
-	defer destructionWriteMu.Unlock()
-	return compactDestructionSelfLocked(c, at)
+	pending := []destructionEntry{}
+	err := compactDestructionSelfLocked(c, at, &pending)
+	destructionWriteMu.Unlock()
+	dispatchDestructionPending(c, pending)
+	return err
 }
 
-func compactDestructionSelfLocked(c destructionConfig, at time.Time) error {
+func compactDestructionSelfLocked(c destructionConfig, at time.Time, pending *[]destructionEntry) error {
 	path := destructionLogPath(c.dir)
 	lines, ok, err := readLogLines(path, destructionGroupOf)
 	if err != nil {
@@ -873,7 +904,7 @@ func compactDestructionSelfLocked(c destructionConfig, at time.Time) error {
 	targets := []destructionTarget{{FromSeq: minSeq, ToSeq: maxSeq, PrefixDigest: hex.EncodeToString(h.Sum(nil))}}
 
 	// 1. intent FIRST — the digest is captured while the prefix still exists.
-	intent, berr := beginDestructionLocked(c, destructionKindSelfCompaction, fmt.Sprintf("capacity=%d", c.capacity), nil, targets, len(dropped), at)
+	intent, berr := beginDestructionLocked(c, destructionKindSelfCompaction, fmt.Sprintf("capacity=%d", c.capacity), nil, targets, len(dropped), at, pending)
 	if berr != nil {
 		return berr
 	}
@@ -900,7 +931,7 @@ func compactDestructionSelfLocked(c destructionConfig, at time.Time) error {
 	}
 	// 3. close the group (the anchor dispatch happens inside, via the config
 	// hook — self_compaction records are witnessed like every other kind).
-	return completeDestructionLocked(c, seq, destructionStateCompleted, at)
+	return completeDestructionLocked(c, seq, destructionStateCompleted, at, pending)
 }
 
 // ---------------------------------------------------------------------------

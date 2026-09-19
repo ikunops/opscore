@@ -1028,7 +1028,15 @@ func (s *HistoryExportScheduler) anchorDestructionEntry(e destructionEntry) erro
 	if serr := s.signer.signAnchorEntry(&ae, s.cfg.Dir, s.clock()); serr != nil {
 		return serr
 	}
-	if aerr := appendAnchorEntryPathObserved(path, s.cfg.AnchorCapacity, ae, s.destructionObserver(destructionKindAnchorCompaction)); aerr != nil {
+	// I5 for the fourth stream (R43-8): the destruction-anchor file is the
+	// accountability system's OWN bookkeeping. Its compaction must NOT be
+	// observed — an observed compaction here would record a destruction whose
+	// dispatch appends back into THIS file, which compacts again... an
+	// unbounded self-feeding loop for any finite capacity (the same structural
+	// termination rule as the destruction log's own self-compaction). The
+	// witness already holds every dispatched entry, so nothing external is
+	// lost by not re-recording our own bookkeeping.
+	if aerr := appendAnchorEntryPathObserved(path, s.cfg.AnchorCapacity, ae, nil); aerr != nil {
 		return aerr
 	}
 	return s.dispatchAnchorPath(context.Background(), path, ae)
