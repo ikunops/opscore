@@ -1,8 +1,9 @@
 # ADR-060 · Phase 43 — Evidence Destruction Accountability（销毁留痕）· Scope
 
-- **Status**: PROPOSED（R216 投递，待 judge 裁决）
+- **Status**: PROPOSED（R216 投递；**R216 = B**，R43-1/R43-2 已闭合于 **ADR-061**，本文已就地同步）
 - **Parent**: ADR-059（P42 Implementation, commit `2cdc2838`）
 - **裁决前提**: R215 = A，Phase 42 CLOSED；P30~P42 十三连 CLOSED
+- **覆盖关系**: 与 **ADR-061（Architecture）** 冲突处以 ADR-061 为准（尤其 §4.2 I1、§5 逃逸 A、§8 已知代价、§10 测试契约）
 - **Author**: executor（方向自拍板，依据 R216 授权）
 
 ---
@@ -102,19 +103,23 @@ judge 在 R215 给出「验证者独立性」的初步意见并授权比选。�
   destroyed_count,
   policy,                             // 声明性策略标识（如 "retain=96" / "capacity=4096"）
   recorded_at,
-  state,                              // intended | completed | aborted（分组状态推进）
-  prev_digest,                        // 哈希链
-  signature                           // 复用 P37 signatureBlock，禁第二套序列化器
+  state,                              // intended | completed | aborted（分组状态推进，永不进签名）
+  prev_digest,                        // 哈希链（= 前一行的 line_digest，含 state，见 ADR-061 §2.2）
+  entry_digest,                       // sha256(canonical payload) —— 两行相同
+  signature                           // 由 KAK 签发（R43-1 方案 A），复用 P37 signatureBlock
 }
 ```
+
+> **R43-1（已闭合，ADR-061 §1）**：`signature` 由**授权密钥 KAK** 签发，与导出签名密钥必须不同（G3：同 key_id ⇒ 构造失败）。**持导出私钥者无法伪造 `accounted`** —— 这是 T217 的判别点。
+> **R43-2（已闭合，ADR-061 §2）**：`state` 属 STATE 区，永不进 payload ⇒ `completed`/`aborted` 行**逐字复用 `intended` 行的签名字节**，推进不需要 KAK 在线。
 
 - **targets 形态二选一**：publication 面记 `{publication_id, manifest_digest}`（摘要在销毁前**已存在**于 manifest/ledger，无需保留内容）；日志面记 `{from_seq, to_seq, prefix_digest}`（被裁前缀在 compaction 时**正在内存中**，`prefix_digest` 当场可算）。
 - **摘要必须在销毁前可得**——这是本机制成立的**物理前提**，也是 §4.3 两阶段顺序的根本理由。
 
 ### 4.2 不变量
 
-- **I1 事实性**：销毁记录是**事实不是状态机**。同 `destruction_seq` 出现任何**第二行且 payload 不同** ⇒ `conflict` ⇒ fail-closed（与 ADR-055 §2.3、P42 报告纪律一致）；同 payload 第二行 = 状态推进合法（`intended`→`completed`，ADR-053 分组模型）。
-- **I2 拒绝追加**：账本不可验（不可解析行 / 签名不验 / 链断裂 / 异域 stream）⇒ **拒绝追加**（P41 I2 推广）。**绝不借 append 重建干净账本**。
+- **I1 事实性（R216=R43-2 指出其字面与两阶段顺序矛盾 ⇒ 已修订为 I1′，见 ADR-061 §2.3）**：判据以 `(destruction_seq, payload)` 为准 —— 同 seq 第二行 **payload 相同且 state 合法推进**（`intended → completed|aborted`）⇒ 合法；**payload 任一字段不同** ⇒ `conflict` ⇒ fail-closed；终态后任何第三行 ⇒ conflict。**字段级 payload/state 分离表见 ADR-061 §2**（`state` 永不进签名）。
+- **I2 拒绝追加**：账本不可验（不可解析行 / **签名不验，含 R43-1 的 `destruction_unauthorized`** / 链断裂 / 异域 stream）⇒ **拒绝追加**（P41 I2 推广）。**绝不借 append 重建干净账本**。
 - **I3 首行豁免**：哈希链首行 `prev_digest` 指向已被合法裁掉的条目 ⇒ 不判篡改（P41 I3 同构，否则合法 prefix compaction 自伤）。
 - **I4 窗口纪律（继承 R40-1）**：账本有界 ⇒ 结果**强制携带** `destruction_window{min,max,entries,continuous}`；窗口外**绝不**断言 `accounted`（下界丢失与「从未记账」不可区分）；段不连续 ⇒ `destruction_window_discontinuous`。
 - **I5 自指闭合**：销毁账本**自身**被 compaction 时，必须先为自己记一条 `self_compaction` 再裁。递归终止于「记录先于销毁」这条顺序铁律。
@@ -149,7 +154,8 @@ judge 在 R215 给出「验证者独立性」的初步意见并授权比选。�
 | **`unaccounted_disappearance`** | **证据已知曾存在，现已不在，且无任何销毁记录为其记账** | **核心产出** |
 | `accounted` | 所有缺失项均有 `completed` 销毁记录覆盖 | 合法 retain/compaction |
 | `destruction_unconfirmed` | 有 `intended` 无 `completed` | 崩溃/中断（**响，但不指控**） |
-| `destruction_conflict` | 同 seq 第二行 payload 不同 | I1 |
+| `destruction_conflict` | 同 seq 第二行 payload 不同 / 终态后第三行 | I1′ / I8 |
+| **`destruction_unauthorized`** | 条目签名缺失 / 不在 KAK 信任集 / 与 `authority_key_id` 不符 / 对 payload 不验 ⇒ **不记账** + 拒绝追加 | **R43-1** |
 | `destruction_chain_broken` | 链摘要不匹配（非首行） | I2/I3 |
 | `destruction_window_discontinuous` | 幸存 seq 段不连续 | I4 |
 | `destruction_absent` | 无账本（未启用 / 被整体删除） | 启用前 / 攻击 |
@@ -160,10 +166,15 @@ P38 链 `prev_manifest_digest` 引用了一个不存在的前驱 / P39 ledger �
 
 > 曾存在（ledger ∪ chain ∪ anchor ∪ report） − 现存（disk） − 已记账销毁（destruction log） = **无记录的消失**
 
-### 逃逸分析（诚实）
+### 逃逸分析（诚实）—— **R216 = R43-1 指出现文只写了 1 条路且自相矛盾，已在 ADR-061 §5 重写**
 
-- **逃逸 A：攻击者补写一条伪造销毁记录。** 因 seq 单调且后序条目的 `prev_digest` 依赖前序 ⇒ 必须**插在链中间** ⇒ 重写其后全部条目 ⇒ 若那些条目已锚定 ⇒ **P40 reconcile `divergent`（双信号，T145 式冗余）**。**若未启用锚定 ⇒ 本地不可检测**（同 P40 已知代价，见 §9）。
-- **逃逸 B：连销毁账本一起删。** ⇒ `destruction_absent`；与「从未启用」本地不可区分（同 P42 `verification_absent`、P41 T177 的同一族弱点），**域外可检测**（锚定见证端见过它）。
+现文初版只写了「插链中」一条路，**遗漏了「末端追加」**，而后者是完全合法的追加、锚定检不出 ⇒ 核心判据对持钥攻击者形同虚设。修订后：
+
+- **逃逸 A-1 插在链中**：须重写其后全部条目 ⇒ 已锚定 ⇒ P40 reconcile `divergent`（双信号）；未启用锚定 ⇒ 本地不可检测。
+- **逃逸 A-2 末端追加（初版遗漏）**：**持导出私钥者**（P40 主攻击的对手模型）在 **R43-1 方案 A（KAK 签发）** 下签不出合法记录 ⇒ `destruction_unauthorized` ⇒ 不记账 ⇒ 仍 `unaccounted_disappearance`（T217）。**持 KAK 者**仍可完成 ⇒ **本地与域外均不可检测**（见证端从未见过「X 未被销毁」的断言；且 `recorded_at` 自证 ⇒ 可声称销毁发生在最后一次验证之后）。
+- **逃逸 B：连销毁账本一起删。** ⇒ `destruction_absent`；与「从未启用」本地不可区分，域外可检测。
+
+⇒ **结论（不美化）**：方案 A 把伪造 `accounted` 的能力从「在线导出私钥持有者」**收缩**到「离线 KAK 持有者」，**未消除**。已升为已知代价第 1 条。
 
 **两种逃逸都落在「本系统自己保存自己的销毁账本」这一前提上**——这正是 P40 用锚定、P41 用 KAK 反复削弱但未消除的同一前提。P43 不解决它，只把它**从四处分散的沉默收敛为一处显式声明**。
 
@@ -196,24 +207,24 @@ P38 链 `prev_manifest_digest` 引用了一个不存在的前驱 / P39 ledger �
 
 ## 8. 已知代价（如实）
 
-1. **上界 = 账本自身独立性**：同域保存 ⇒ 逃逸 A/B 在未启用锚定时本地不可检测（§5）；
+1. **【R43-1 后重写】伪造能力收缩而非消除**：持 **KAK** 者可末端追加伪造销毁记录，**本地与域外均不可检测**（§5 / ADR-061 §5）。方案 A 把门槛从「在线导出私钥」抬到「离线授权密钥」，但没让它变成不可能 —— 本 Phase 最强残留弱点，与 P41 T177 / P42 `verification_absent` 同族；
 2. **`destruction_absent` 大概率是常态**（未启用时），**宁可说无法断言，不说一切正常**；
 3. 只覆盖**启用之后**发生的销毁 —— 历史遗留的空洞**永远是 `indeterminate`**，P43 **不追溯**；
 4. `destruction_unconfirmed` 会在崩溃恢复后**长期滞留**（无自动收敛，避免自动收敛成为洗白通道）；
-5. **C1 残差原样保留**：销毁记录由同一把签名密钥签发 ⇒ 持钥者可伪造销毁记录（逃逸 A）。**P43 让伪造必须破坏锚定，但不让伪造不可能**；
+5. **【R43-1 后按对手分层】C1 残差**：对持**导出私钥**者已闭合（T217）；对持 **KAK** 者残差原样保留（第 1 条）。**P43 让伪造必须破坏锚定或持有授权密钥，但不让伪造不可能**；
 6. pre-export 丢失（ring 256 / file 10000 的 `runtime_dropped`/`file_dropped`）**不在本平面**，记录从未进入证据链 ⇒ P43 无法记账。
 
 ---
 
-## 9. 三处提请裁决
+## 9. 三处提请裁决（**R216 已全部采纳**）
 
-- **Q1 锚定是否强制？** 我：**不强制**，复用 `--export-anchor-*`（与 P42 一致）。代价：未启用 ⇒ 逃逸 A 本地不可检测。
-- **Q2 `policy` 是否升级为授权判定？** 我：**否**。授权需要策略引擎 + 授权者身份（P37 域），会把 Phase 撑成两套。
-- **Q3 pre-export drop 是否纳入？** 我：**否**（另一平面，需记录级标识）。列为 Phase 45 候选。
+- **Q1 锚定是否强制？** 我：**不强制**，复用 `--export-anchor-*` ⇒ **judge 采纳**。代价：未启用 ⇒ 逃逸 A-1 本地不可检测。
+- **Q2 `policy` 是否升级为授权判定？** 我：**否** ⇒ **judge 采纳**（正确的 scope 收窄：P43 只判「是否被记账」，不判「是否被允许」）。
+- **Q3 pre-export drop 是否纳入？** 我：**否** ⇒ **judge 采纳**，列 Phase 45。
 
 ---
 
-## 10. 测试契约（T200~T216，17 例）
+## 10. 测试契约（**T200~T221，22 例**；ADR-061 §11 为准，新增 T217~T221）
 
 - **T200~T205**：账本原语（单调 seq / 事实性 conflict / 拒绝追加 / 首行豁免 / 分组状态推进 / 自指 compaction）。
 - **T206~T210**：五条销毁路径各自记账（prune / ledger / anchor / key-lifecycle / verification compaction）。
@@ -223,8 +234,13 @@ P38 链 `prev_manifest_digest` 引用了一个不存在的前驱 / P39 ledger �
 - **T214 ★non-vacuousness**：M1（摘掉 prune 的记账）⇒ T213/T211 **必红**。
 - **T215**：追溯补写销毁记录 ⇒ 链/锚定 `divergent`。
 - **T216**：销毁账本整体删除 ⇒ `destruction_absent`，且**不**被美化成 `accounted`。
+- **T217 ★（R43-1 判别）**：持**导出私钥**末端追加伪造销毁记录 ⇒ `destruction_unauthorized` ⇒ 仍 `unaccounted_disappearance`。
+- **T218 ★（R43-2 合法推进）**：同 seq 同 payload 异 state 合法，且 completed 行 signature/`entry_digest` 与 intended 行**字节相同**。
+- **T219（R43-2 conflict）**：同 seq 第二行 `targets` 不同 ⇒ `destruction_conflict`。
+- **T220（终态）**：`completed` 后第三行 ⇒ conflict（即便 payload 相同）。
+- **T221（P40 字节等价）**：销毁 anchor family 加入后，既有三族条目逐字节不变。
 
-**变异 M1~M5**：①摘 prune 记账 ②放行窗口外断言 ③放行同 seq 第二行 ④摘 prev_digest 校验 ⑤改事后补记 ⇒ 各自对应用例必红，按 sha256 字节还原。
+**变异 M1~M7**：①摘 prune 记账 ②放行窗口外断言 ③放行同 seq 第二行 ④摘链校验 ⑤改事后补记 ⑥**用导出签名密钥签销毁记录（摘 G3）** ⑦**把 `state` 纳入签名 payload（破 I7）** ⇒ 各自对应用例必红，按 sha256 字节还原。
 
 ---
 
@@ -235,6 +251,7 @@ P38 链 `prev_manifest_digest` 引用了一个不存在的前驱 / P39 ledger �
 - `history_export_scheduler.go`：顺序接线（意图先行）；
 - `server.go`：新路由 `GET /management/v1/protection/alerts/history/export/destruction`（:8082 admin-only，未启用 503）；
 - `main.go`：`--export-destruction-log`(false) / `--export-destruction-capacity`(4096)；**锚定零新增 flag**；
-- **构造守卫**：启用销毁记账但 signer==nil ⇒ 失败（同 P42）。
+- **构造守卫（R43-1，三条 fail-fast，ADR-061 §1.5）**：G1 启用而 KAK 私钥未配 ⇒ 失败；G2 启用而 KAK trust 为空 ⇒ 失败；G3 KAK key_id == 导出签名 key_id ⇒ 失败（继承 `history_export_scheduler.go:339`）。
+- **`snapshot_anchor.go`**：第 4 个 anchor family（`kind=destruction` + 三 `omitempty` 字段）+ `identityID()` 一个 case —— **本轮对 P40 文件的全部改动**，T221 钉字节等价。
 
 冻结面：`appendonly_log.go` 仅**加法**、P36/P39/P40/P41/P42 响应零改动、`go.mod`/`go.sum` 零改动、四冻结包零 diff。
