@@ -206,6 +206,20 @@ func reconcileWitnessFamily(f witnessFamily, dir string, identity *anchorIdentit
 		res.Error = "the local anchor window is empty or discontinuous; refusing to assert"
 		return res
 	}
+	if len(st.conflicts) > 0 {
+		// The shared loader deletes a conflicted seq from latest BEFORE
+		// computing the window (snapshot_anchor.go), so a same-seq
+		// contradiction in the local log shifts the window boundary and would
+		// misfile the witness's seq: at the window's max boundary the window
+		// shrinks and the seq reads a FALSE family_ledger_truncated (ADR-068
+		// §3's upper-bound uniqueness proof presumes a self-consistent log);
+		// at the min boundary it silently falls into the outside branch and
+		// reads a FALSE family_intact. The log the family's own I5 discipline
+		// calls a violation bounds NO assertion — fail-closed.
+		res.Verdict = witnessVerdictUnverifiable
+		res.Error = fmt.Sprintf("the local anchor log records contradictory payloads for anchor_seq(s) %v; refusing to assert", st.conflicts)
+		return res
+	}
 
 	// ---- three-segment window over the anchor_seq axis (I3 / review
 	// BLOCKER-2: NO waiver layer).

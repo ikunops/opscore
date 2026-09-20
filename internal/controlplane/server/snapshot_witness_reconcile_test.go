@@ -978,3 +978,139 @@ func TestP46T273GetPostVocabularyUnified(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T274/T275 — the review-major discriminator pair: the shared loader
+// (loadAnchorStatePath, snapshot_anchor.go) deletes a CONFLICTED seq from
+// latest BEFORE computing the window, so a same-seq contradiction inside the
+// anchor log shifts the window boundary and the three-segment loop misfiles
+// the witness's seq:
+//
+//   - conflict at the window's MAX boundary (T274): the window shrinks, the
+//     witness's seq falls into the above branch and reads a FALSE
+//     family_ledger_truncated — while the local log still physically holds
+//     the seq (twice, contradicting itself). ADR-068 §3's upper-bound
+//     uniqueness proof presumes a SELF-CONSISTENT local log; a log the
+//     family's own I5 discipline calls a violation falsifies it.
+//   - conflict at the window's MIN boundary (T275): the witness's seq falls
+//     BELOW the lower bound into the outside branch (R40-1 silence) and the
+//     family reads a clean family_intact over a self-contradictory log.
+//
+// The window gate must fail closed: len(st.conflicts) > 0 ⇒ unverifiable,
+// zero assertions. (Produced the only way the state is reachable — a byte
+// edit / dual writer, per ADR-053 I5: the append face REFUSES to write a
+// conflicting payload itself.)
+//
+// RED@07a19a2 (pre-fix): T274 got "family_ledger_truncated"
+// TruncatedRanges=[{3,3}] and T275 got "family_intact" OutsideCount=1 —
+// exactly the false readings the window gate's conflict blindness produces.
+// ---------------------------------------------------------------------------
+
+// p46TamperOneAnchorLine rewrites exactly ONE line of one seq group with a
+// poisoned manifest_digest (same shape, different signed payload), so the
+// group then holds the same anchor_seq with TWO contradictory statements.
+// Differs from p46TamperAnchorGroup, which rewrites EVERY line of the group
+// and therefore keeps the log conflict-free.
+func p46TamperOneAnchorLine(t *testing.T, path string, seq int64) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lines []string
+	var group []anchorEntry
+	tampered := false
+	for _, ln := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		var e anchorEntry
+		if jerr := json.Unmarshal([]byte(ln), &e); jerr != nil {
+			t.Fatalf("anchor line unparseable: %v", jerr)
+		}
+		if e.AnchorSeq == seq && !tampered {
+			e.ManifestDigest = "p46-conflicted-digest"
+			fresh, merr := json.Marshal(e)
+			if merr != nil {
+				t.Fatal(merr)
+			}
+			ln = string(fresh)
+			tampered = true
+		}
+		lines = append(lines, ln)
+		if e.AnchorSeq == seq {
+			group = append(group, e)
+		}
+	}
+	if !tampered {
+		t.Fatalf("fixture: anchor log %s holds no anchor_seq %d group", path, seq)
+	}
+	// Fixture integrity: the group must now genuinely CONTRADICT itself —
+	// ≥2 lines, and the tampered statement differs from a surviving one. A
+	// one-line group cannot contradict itself (the tamper would just be a
+	// divergence, a different scenario entirely).
+	if len(group) < 2 {
+		t.Fatalf("fixture: anchor_seq %d group holds %d line(s); a one-line group cannot contradict itself", seq, len(group))
+	}
+	contradicts := false
+	for _, e := range group[1:] {
+		if !anchorPayloadEqual(group[0], e) {
+			contradicts = true
+		}
+	}
+	if !contradicts {
+		t.Fatalf("fixture: anchor_seq %d group is not self-contradictory after the one-line tamper", seq)
+	}
+	if werr := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); werr != nil {
+		t.Fatal(werr)
+	}
+}
+
+func TestP46T274ConflictedMaxBoundaryReadsUnverifiable(t *testing.T) {
+	f := newP46Fixture(t, nil)
+	f.driveAllFamilies()
+	byFamily := f.witnessByFamily()
+	f.expectFamilyCount(byFamily, witnessFamilyAcceptance, 3)
+
+	// ONE contradictory line inside the TOP acceptance anchor group (seq 3):
+	// the loader's conflict deletion shrinks the window to [1,2] and the
+	// witness's seq 3 would misfile as a truncated tail.
+	p46TamperOneAnchorLine(t, acceptanceAnchorPath(f.dir), 3)
+
+	_, res := f.postReconcile(f.sched, byFamily)
+	row := res.Families[witnessFamilyAcceptance]
+	if row.Verdict != witnessVerdictUnverifiable {
+		t.Fatalf("T274: a conflicted max-boundary seq must fail closed (family_unverifiable), got %q (row=%+v)", row.Verdict, row)
+	}
+	if !strings.Contains(row.Error, "contradictory") {
+		t.Fatalf("T274: the refusal must name the local contradiction loudly, got error=%q", row.Error)
+	}
+	if len(row.TruncatedRanges) != 0 || len(row.DivergentSeqs) != 0 || row.OutsideCount != 0 || row.MissingCount != 0 {
+		t.Fatalf("T274: an unverifiable family must carry ZERO assertions (no false truncated range): %+v", row)
+	}
+}
+
+func TestP46T275ConflictedMinBoundaryReadsUnverifiable(t *testing.T) {
+	f := newP46Fixture(t, nil)
+	f.driveAllFamilies()
+	byFamily := f.witnessByFamily()
+	f.expectFamilyCount(byFamily, witnessFamilyAcceptance, 3)
+
+	// ONE contradictory line inside the OLDEST acceptance anchor group
+	// (seq 1): the window becomes [2,3] and the witness's seq 1 falls below
+	// the lower bound — the silent outside branch — over a log the family's
+	// own I5 discipline calls a violation.
+	p46TamperOneAnchorLine(t, acceptanceAnchorPath(f.dir), 1)
+
+	_, res := f.postReconcile(f.sched, byFamily)
+	row := res.Families[witnessFamilyAcceptance]
+	if row.Verdict != witnessVerdictUnverifiable {
+		t.Fatalf("T275: a conflicted min-boundary seq must fail closed (family_unverifiable), got %q (row=%+v)", row.Verdict, row)
+	}
+	if !strings.Contains(row.Error, "contradictory") {
+		t.Fatalf("T275: the refusal must name the local contradiction loudly, got error=%q", row.Error)
+	}
+	if len(row.TruncatedRanges) != 0 || len(row.DivergentSeqs) != 0 || row.OutsideCount != 0 || row.MissingCount != 0 {
+		t.Fatalf("T275: an unverifiable family must carry ZERO assertions (no silent outside): %+v", row)
+	}
+}
