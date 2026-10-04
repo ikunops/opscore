@@ -1,6 +1,6 @@
 # ADR-069 — Phase 47: Anchor Delivery Reliability（锚定投递可靠性 / 投递面全流化）
 
-- **Status**: Proposed (Phase 47, Scope stage) · Revised per review（评审 5 项 major 全部闭合，见 §10）
+- **Status**: Proposed (Phase 47, Scope stage) · Revised per review（评审 6 项 major 全部闭合，见 §10）
 - **Phase**: 47（Anchor Delivery Reliability）
 - **Base**: Phase 46 CLOSED（HEAD = `9aaab99`）
 - **Supersedes**: 无。不修改 P35~P46 的任何冻结判据；P40 的 delivery 状态机语义（pending/anchored/unanchored、attempts 上限、conflict 不落行）逐字沿用；`snapshot_anchor.go` 零 diff。
@@ -41,7 +41,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 
 | 新判据 | 条件 | 语义 |
 |---|---|---|
-| **`converged`**（每流 + 全局） | 该流 `pending == 0` ∧ 无 `conflicts` ∧ 无 `error` | 投递状态机**静止**。**≠ 全部投递成功**（`unanchored` 是终态也计入收敛，ADR-052 §6-12）——故必须与 `anchored`/`unanchored` 计数同面呈现（A8-1） |
+| **`converged`**（每流 + 全局） | 该流 `pending == 0` ∧ 无 `conflicts` ∧ 无**结构性** `error`（load 失败/冲突）——**派发结果不参与**（评审 M6） | 投递状态机**静止**。**≠ 全部投递成功**（`unanchored` 是终态也计入收敛，ADR-052 §6-12）——故必须与 `anchored`/`unanchored` 计数同面呈现（A8-1） |
 | **`pending_retryable`** | pending ∧ attempts < max | 尚有重试余量，sweep 会推进它 |
 | **`pending_exhausted`** | pending ∧ attempts ≥ max | 与投递状态机**自相矛盾**（`dispatchAnchorPath:993` 在 attempts 达上限时直接落 `unanchored`）⇒ 下一轮 sweep 终态化。读面必须**显式单列**，绝不并入 pending（否则「自相矛盾」被静默） |
 | **`swept_by`**（每流一个 owner） | 静态分区 | ledger→`anchor_housekeeping`；acceptance→`acceptance_pending`；key_lifecycle / verification / destruction→`delivery_sweep`。**分区可断言**（ADR-070 I1/T277） |
@@ -51,16 +51,16 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 
 ## 4. 能力定义（A1~A8）
 
-- **A1 投递面格式**：`HistoryExportStatus` 追加**末位** `omitempty` 组 `anchor_delivery`（nil 当且仅当 anchoring 关闭 ⇒ 默认部署状态文档逐字节不变，沿 P41/P42/P43/P45 的追加纪律）。每流一行：`{family, present, swept_by, anchored, unanchored, pending, pending_retryable, pending_exhausted, conflicts[], oldest_pending_recorded_at, converged, error?}`；另给全局 `converged`（**当且仅当五流皆 `converged` ∧ 皆无 `conflicts` ∧ 皆无 `error`**）。**不新增路由**（最小闭环：既有 `GET .../export/scheduler` 已承载全部家族状态）。
+- **A1 投递面格式**：`HistoryExportStatus` 追加**末位** `omitempty` 组 `anchor_delivery`（nil 当且仅当 anchoring 关闭 ⇒ 默认部署状态文档逐字节不变，沿 P41/P42/P43/P45 的追加纪律）。每流一行：`{family, present, swept_by, anchored, unanchored, pending, pending_retryable, pending_exhausted, conflicts[], oldest_pending_recorded_at, last_unanchored_reason?, converged, error?}`；另给全局 `converged`（**当且仅当五流皆 `converged` ∧ 皆无 `conflicts` ∧ 皆无结构性 `error`**）。**该组完全读派生**（每次读取现算，零新增调度器状态）；`error` **只承载结构性状态**（load 失败 / conflicts），**派发结果（含 `unanchored` 终态）一律不参与**（评审 M6，理由见 ADR-070 §4）。**不新增路由**（最小闭环：既有 `GET .../export/scheduler` 已承载全部家族状态）。
 - **A2 分区（sweeper 所有权）**：五条流各恰有一个 sweeper；分区为**静态表**并冻结：`anchor_housekeeping`（chain-anchor）、`acceptance_pending`（acceptance-anchor）、`delivery_sweep`（其余三条）。**禁止两条 sweep 覆盖同一条流**（P40 起「同一 tick 内绝不重复派发一条」的纪律，`history_export_scheduler.go:779-781`）。**精确表述（评审 M4 修正）**：sweep 只重投「本 tick 开始时已 pending」的义务，且在 tick 尾的 in-tick 生产者（`drainDestructionAnchorQueue`）**之前**运行 ⇒ 对任何 anchor_seq，**同一 Tick 内至多 +1 次 sweep 投递**（T277/T283/T295 以此判别）；本 tick 新产生的义务由其生产者投递，若首投失败则下一 tick 才被 sweep 重投。
 - **A3 sweep 语义**：对每条属 `delivery_sweep` 的流，`loadAnchorStatePath(该流路径, dir, s.trust)`（与既有两处 sweep 同款：`anchorHousekeeping` 用 `s.trust`、`dispatchAcceptancePending` 用 `s.trust`）⇒ 逐条 `pending`：`attempts ≥ max` ⇒ 终态化 `unanchored`（与 `anchorHousekeeping:1166-1172`、`dispatchAcceptancePending:712-718` 逐字同款，含 `last_error="attempts exhausted (N)"`）；否则重投。**`unanchored` 永不复活**（ADR-052 §6-12 冻结）。
 - **A4 fail-closed（评审 M1/M5 修正）**：**两类**不可用状态都必须整条不 sweep（不落盘、不改字节）+ 响亮报错：①**不可分类行**——`loadAnchorStatePath` 自己返回 error（`:486-489`「skipping is how a tampered prefix disappears」，注释 `:470-471`）；②**冲突 seq**——`loadAnchorStatePath` **不返回 error**：它只把该 seq 记入 `st.conflicts` 并从 `latest` 删除（`:496-505`），故 sweep 与读面**必须显式检查 `len(st.conflicts) > 0`**，否则会把「被静默剔除的 seq」呈现为已收敛（这正是 P46 对账面已有的纪律：`snapshot_witness_reconcile.go:208-222` 判 `unverifiable`，理由是「被删边界会让窗口位移并误判」）。**流间隔离**：一条流的失败不阻断其余四条（T286/T293）。**术语区分（防混淆）**：A4 的「冲突 seq」= **日志冲突**（同一 anchor_seq 出现不同 payload，`st.conflicts`）；与 A7-④/A8-② 的**投递冲突**（witness 返回 `409 reason="conflict"`，`snapshot_anchor.go:974-978`）是两回事——前者是本地日志自相矛盾（整条不 sweep），后者是域外拒收（本地只记 error、条目仍 pending）。
 - **A5 读面零副作用**：投递面**只读**（`os.Stat` + 既有 load），不落盘、不写 audit、不发网络、**不派发**（T290）。sweep 只在 Tick 内发生。
-- **A6 正交与零回归**：P40~P46 的判据取值零变化；五家族既有 status 组、顶层 `PendingCount`/`AnchoredCount`/`UnanchoredCount`、P46 的 GET/POST 两面**逐字节不变**；`snapshot_anchor.go` 零 diff；`go.mod`/`go.sum` 零改动。**错误状态隔离**：sweep 的错误只进新的 `anchor_delivery` 组（`s.deliveryError`），**不写** `AnchorError`/`destruction.error` 等既有判据面（见 ADR-070 §4）。
+- **A6 正交与零回归**：P40~P46 的判据取值零变化；五家族既有 status 组、顶层 `PendingCount`/`AnchoredCount`/`UnanchoredCount`、P46 的 GET/POST 两面**逐字节不变**；`snapshot_anchor.go` 零 diff；`go.mod`/`go.sum` 零改动。**错误分类与隔离**：`anchor_delivery` 组零新增调度器状态（完全读派生）；其 `error` **只**承载 load 失败/冲突等**结构性**状态，**派发结果一律不参与**（`dispatchAnchorPath` 对任何非 anchored 终态都返回 error，`:1003-1005`，其中 `unanchored` 是合法终态——并入即会把「放弃投递」误判为「未收敛」）；sweep 的派发失败**只进 `s.logger`**，且**不写** `AnchorError`/`destruction.error` 等既有判据面（见 ADR-070 §4）。
 - **A7 非目标**：①不拉取 witness（不做 P46 的逆操作）；②不改 `family_incomplete` 语义（它继续只描述「域外缺」）；③不新增路由/不改响应字节；④不修 witness-conflict 语义（`409 reason=conflict` 仍 refuse-to-record，`snapshot_anchor.go:974-978`）；⑤不做跨部署；⑥不新增常驻组件；⑦不修 `destructionObserver` 路径的既有并发缺口（`snapshot_destruction.go:1365-1400` 经 `destructionConfig:1327-1336` 内联派发，**不**受 `destructionDispatchMu` 保护——本 Phase 显式不碰，列为已知代价 7）；⑧不引入重投上限之外的退避/抖动策略（沿用既有 attempts 语义）。
-- **A8 已知代价**：①**`converged` ≠ 投递成功**：`unanchored`（放弃投递）也收敛 ⇒ 读面必须同面给出 `anchored`/`unanchored`，否则「放弃」会被误读为「完成」。②**witness-conflict 的 pending 既不可收敛也不可区分**：conflict 路径**不落任何行**（ADR-052 A4/A5），日志里它与普通 pending 完全同形且 attempts 不增长 ⇒ sweep 每轮都会重投它一次（与 `anchorHousekeeping` 今日行为一致），读面只能报 `pending_retryable` + 家族 error 字符串；**P47 不声称它能收敛**。③只治本地投递欠账，**不治见证端丢失**（P46 `family_incomplete` 若源于 witness 保留策略，sweep 不能自愈）。④sweep 的派发与 `dispatchAnchorPath` 是**同义实现**（冻结面无法给该函数加 observer 参数，见 ADR-070 §3），靠差分用例钉住不漂移。⑤**行为变更声明**：lifecycle/verification 此前没有锚定派发互斥，P47 为 sweep 引入 per-stream 派发互斥并包裹生产者调用点——收敛了既有并发暴露面，同时改变了并发时序。⑥读面成本：状态面每次多读五条锚定日志（原已读 3 个家族状态 + chain-anchor）。⑦`destructionObserver` 路径的既有并发缺口不修（A7-7）。⑧**本 tick 新产生义务的重投残差**：三条流的锚定 seq 由冻结面分配（`anchorKeyLifecycleEvent`/`anchorVerificationReport`/`anchorDestructionEntry` 各自 `nextAnchorSeqPath`），生产者调用点**拿不到该 seq**，故无法建立「本 tick 已投递 seq」集合；结论：本 tick 内由**生产者**新建、且 sweep 的加载点之前已落 pending 行的条目，可能在同一 tick 内被 sweep 追加一次尝试（attempts ≤ 2）。**不修的理由与代价边界**：重复投递是幂等的（`409 duplicate` ⇒ `anchored`，事实 7/T129）；收敛上界（≤ max 轮）不受影响；受影响的只是「+1/轮」这一**测试级**断言，A2 已把它精确限定为「本 tick 开始时已 pending」的条目。⑨**新增锁依赖**：lifecycle/verification 的 sweep 持 L1（新 per-stream 派发互斥）期间，其派发引发的压缩会同步调用 `destructionObserver` → `completeDestruction` → `dispatchDestructionPending` → 取 L2（`destructionDispatchMu`）⇒ 存在 L1→L2 的锁依赖（ADR-070 I8 已给出无环证明）；该依赖是 P47 新引入的。
+- **A8 已知代价**：①**`converged` ≠ 投递成功**：`unanchored`（放弃投递）也收敛 ⇒ 读面必须同面给出 `anchored`/`unanchored`，否则「放弃」会被误读为「完成」。**且派发结果绝不参与 `converged`（评审 M6）**：`unanchored` 有两条到达路径（4xx 拒收 `:987-989`、attempts 耗尽 `:996-998`），二者都必须判 `converged=true ∧ error=""`；「为何放弃」由 `last_unanchored_reason`（读派生）+ 该条自身的 `LastError` 提供，不靠粘滞错误字段。②**witness-conflict 的 pending 既不可收敛也不可区分**：conflict 路径**不落任何行**（ADR-052 A4/A5），日志里它与普通 pending 完全同形且 attempts 不增长 ⇒ sweep 每轮都会重投它一次（与 `anchorHousekeeping` 今日行为一致），读面只能报 `pending_retryable` + 家族 error 字符串；**P47 不声称它能收敛**。③只治本地投递欠账，**不治见证端丢失**（P46 `family_incomplete` 若源于 witness 保留策略，sweep 不能自愈）。④sweep 的派发与 `dispatchAnchorPath` 是**同义实现**（冻结面无法给该函数加 observer 参数，见 ADR-070 §3），靠差分用例钉住不漂移。⑤**行为变更声明**：lifecycle/verification 此前没有锚定派发互斥，P47 为 sweep 引入 per-stream 派发互斥并包裹生产者调用点——收敛了既有并发暴露面，同时改变了并发时序。⑥读面成本：状态面每次多读五条锚定日志（原已读 3 个家族状态 + chain-anchor）。⑦`destructionObserver` 路径的既有并发缺口不修（A7-7）。⑧**本 tick 新产生义务的重投残差**：三条流的锚定 seq 由冻结面分配（`anchorKeyLifecycleEvent`/`anchorVerificationReport`/`anchorDestructionEntry` 各自 `nextAnchorSeqPath`），生产者调用点**拿不到该 seq**，故无法建立「本 tick 已投递 seq」集合；结论：本 tick 内由**生产者**新建、且 sweep 的加载点之前已落 pending 行的条目，可能在同一 tick 内被 sweep 追加一次尝试（attempts ≤ 2）。**不修的理由与代价边界**：重复投递是幂等的（`409 duplicate` ⇒ `anchored`，事实 7/T129）；收敛上界（≤ max 轮）不受影响；受影响的只是「+1/轮」这一**测试级**断言，A2 已把它精确限定为「本 tick 开始时已 pending」的条目。⑨**新增锁依赖**：lifecycle/verification 的 sweep 持 L1（新 per-stream 派发互斥）期间，其派发引发的压缩会同步调用 `destructionObserver` → `completeDestruction` → `dispatchDestructionPending` → 取 L2（`destructionDispatchMu`）⇒ 存在 L1→L2 的锁依赖（ADR-070 I8 已给出无环证明）；该依赖是 P47 新引入的。
 
-## 5. 测试契约（T276~T295，20 例）
+## 5. 测试契约（T276~T296，21 例）
 
 | # | 断言 |
 |---|---|
@@ -80,10 +80,11 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | T289 | **序列化**：sweep 与生产者并发派发同一流 ⇒ 每 seq 仅一条终态行、无冲突 seq、无 fork（新 per-stream 派发互斥生效） |
 | T290 | **读面零副作用**：调用状态面不改任何文件字节、不写 audit、不发网络（witness 文件零变化） |
 | T291 | **差分**：同输入 + 同 scripted witness 响应下，sweep 落的状态推进行与生产者路径落行**逐字节相同**（A8-4 的防漂移判据） |
-| T292 | 变异 MU1~MU5（MU1 摘 sweep 调用 / MU2 摘不可分类行的 fail-closed（对不可读流仍 sweep）/ MU3 摘 `unanchored` 不复活 / MU4 破分区（两处 sweep 同流）/ MU5 摘 `st.conflicts` 检查（⇒ T293 必红）⇒ 对应用例必红，sha256 还原）。**编号用 MU 以避开本轮评审发现的 M1~M5** |
+| T292 | 变异 MU1~MU6（MU1 摘 sweep 调用 / MU2 摘不可分类行的 fail-closed（对不可读流仍 sweep）/ MU3 摘 `unanchored` 不复活 / MU4 破分区（两处 sweep 同流）/ MU5 摘 `st.conflicts` 检查（⇒ T293 必红）/ MU6 把派发结果并入 `converged` 条件（⇒ T296 必红）⇒ 对应用例必红，sha256 还原）。**编号用 MU 以避开本轮评审发现的 M1~M5** |
 | T293 | **冲突 seq fail-closed（评审 M1/M5，新增）**：某流锚定日志含同 seq 不同 payload 的条目 ⇒ 该流**整条不被 sweep**（文件字节零变化）∧ 读面 `conflicts` 非空 ∧ `error` 响亮 ∧ `converged == false`（全局亦然）；与 T286 的「不可分类行」路径判别开 |
 | T294 | **本 tick 新产生义务的残差边界（评审 M4，新增）**：本 tick 内由生产者新建且首投失败（503）的条目，**本 tick 内 attempts ≤ 2**（sweep 至多追加一次），下一 tick 起 +1/轮，且 ≤ `anchorMaxAttempts()` 轮内达终态（A8-⑧） |
 | T295 | **顺序判别（评审 M4，新增）**：`drainDestructionAnchorQueue` 在本 tick 新建的 destruction 条目，**本 tick 内 attempts 恰好 = 1**——sweep 在 drain **之前**运行故不重投本 tick 新产生的义务；把 sweep 挪到 drain 之后（原稿设计）该断言必红 |
+| T296 | **派发结果不参与 converged（评审 M6，新增）**：同一 `unanchored` 终态的两条到达路径——①witness 返 4xx 直接拒收（`:987-989`）、②503 直到 attempts 耗尽（`:996-998`）——都必须给出 `converged == true` ∧ `error == ""` ∧ `unanchored` 计数如实 ∧ `last_unanchored_reason` 非空；把「派发失败/unanchored」并入 `error`/`converged`（MU6）该断言必红 |
 
 ## 6. 与既有 Phase 的关系
 
@@ -116,7 +117,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | ② 运行时判定面留痕（protection kill/decision → 证据体系） | **延后（不淘汰）** | 判定面已有 provenance 面（`Gate.emitDecision` `internal/protection/gate.go:324-341`、`ProvenanceStore` `:347-351`），把它接进**签名证据体系**是新维度（新家族 + 新威胁模型），≥1 Phase，且不属承重面收敛 |
 | ③ 呈现面整合 | **淘汰** | 不产生此前给不出的判据（R210） |
 
-## 10. 评审闭合表（双镜头合并，本轮）
+## 10. 评审闭合表（两轮双镜头评审）
 
 | 发现 | 级别 | 闭合 |
 |---|---|---|
@@ -125,4 +126,5 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | **M3** I8 把 `destructionDispatchMu` 列为 per-stream 锁之一，又断言「绝不嵌套两个 per-stream 锁」；但 lifecycle/verification 的 sweep 持 L1 期间的压缩会同步走 `destructionObserver → completeDestruction → dispatchDestructionPending → destructionDispatchMu`，必然嵌套；且 I8 的锁序漏掉 `destructionDispatchMu` | major | **I8 重写**：给出完整偏序 L1（keyLifecycle/verification dispatchMu）→ L2（`destructionDispatchMu`）→ L3（`destructionWriteMu`）→ L4（`s.mu`）＋无环证明（不存在 L2→L1 路径）＋允许且仅允许 L1→L2 的嵌套；**A8-⑨** 登记该新锁依赖；§3 伪码注释同步改正 |
 | **M4** sweep 接在 `drainDestructionAnchorQueue`（`:799`）之后 ⇒ 同一 Tick 内 destruction 条目被派发两次（drain 先投一次，sweep 再把该 pending 重投），attempts 1→2，违反 A2/§3/I1/T283 | major | **I10 重排**：sweep 移到 `dispatchAcceptancePending`（`:798`）与 `drainDestructionAnchorQueue`（`:799`）**之间**（in-tick 生产者之前）；**A2/§3 精确化**为「本 tick 开始时已 pending 的义务 +1/轮」；新增 **T295**（顺序判别）；**A8-⑧** 显式登记「本 tick 新产生义务」的残差与其边界（seq 由冻结面分配，生产者拿不到，无法建 per-seq tick 集合；重复投递幂等，收敛上界不受影响）＋ **T294** |
 
-**修订面**：§2 事实 5/悖论、§3 表、A1/A2/A4/A8、§5（+T293/T294/T295）、§8、§9、§10 为本轮修订面；§1、§2 事实 1~4/6~8、A3/A5/A6/A7、§6、§7 未动（事实 4 的括注与事实 7 的行号在上一提交已修正）。
+| **M6（第二轮）** 修订把 `error == ""` 并入 per-row `converged`，而 `error` 含「派发失败」；但 `dispatchAnchorPath` 对**任何**非 anchored 终态（含合法的 `unanchored`）都返回 error（`:1003-1005`）⇒ 经 4xx 或经 attempts 耗尽而落 `unanchored` 的条目会 `converged=false`，与 A8-①/T285「`unanchored` 也收敛」矛盾；且同一终态因到达路径不同（sweep 直接 append vs 经 dispatch）判定相反；`s.deliveryError` 的生命周期（粘滞 vs 每 tick 清空）未规定 | major | **投递面改为完全读派生、零新增调度器状态**（消除生命周期问题）：`error` **只**承载结构性状态（load 失败/conflicts），**派发结果一律不参与 converged**；sweep 的派发失败**只写 `s.logger`**；新增读派生字段 `last_unanchored_reason` 保住「为何放弃」的可见性；**T296** 判别两条到达路径；**MU6** 变异；ADR-070 §4/I6/§8 同步 |
+**修订面**：第一轮——§2 事实 5/悖论、§3 表、A1/A2/A4/A8、§5（+T293/T294/T295）、§8、§9、§10；第二轮（M6）——§3 表 `converged` 行、A1（字段与 converged 定义）、A6（错误分类）、A8-①、§5（+T296、MU6）、§10；§1、§2 事实 1~4/6~8、A3/A5/A6/A7、§6、§7 未动（事实 4 的括注与事实 7 的行号在上一提交已修正）。

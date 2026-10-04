@@ -52,11 +52,11 @@ sweepAnchorDelivery(ctx):            // Tick 尾：dispatchAcceptancePending() �
       path := st.AnchorPath(s.cfg.Dir)
       state, err := loadAnchorStatePath(path, s.cfg.Dir, s.trust)
       if err != nil:                            // ①不可分类行：load 自己返回 error（:486-489）
-          s.setDeliveryError(...)               // A4 fail-closed：该流整条不 sweep，字节零变化
-          st.DispatchMu.Unlock(); continue      // 流间隔离：不阻断其余流
+          s.logger.Warn(...)                    // A4 fail-closed：该流整条不 sweep，字节零变化；只进日志
+          st.DispatchMu.Unlock(); continue      // 流间隔离：不阻断其余流（读面自行 load 并报错，见 §4）
       if len(state.conflicts) > 0:              // ②冲突 seq：load **不返回 error**，必须显式判（评审 M1/M5）
-          s.setDeliveryError(fmt.Sprintf("anchor log records contradictory payloads for anchor_seq(s) %v; refusing to sweep", state.conflicts))
-          st.DispatchMu.Unlock(); continue      // 同上：整条不 sweep + 响亮
+          s.logger.Warn(...)                    // 同上：整条不 sweep + 响亮（只进日志，不进判据面）
+          st.DispatchMu.Unlock(); continue
       for seq in state.seqs():
           e := state.latest[seq]
           if e.State != anchorStatePending: continue          // anchored/unanchored 一律跳过（I2）
@@ -66,9 +66,13 @@ sweepAnchorDelivery(ctx):            // Tick 尾：dispatchAcceptancePending() �
               appendAnchorEntryPathObserved(path, s.cfg.AnchorCapacity, final, st.Observer)
               continue
           if derr := s.dispatchAnchorPathObserved(ctx, path, e, st.Observer); derr != nil:
-              s.setDeliveryError(derr.Error())
+              s.logger.Warn(...)   // ★评审 M6：派发结果**绝不**进任何读面/判据字段——dispatchAnchorPath 对**任何**
+                                   //   非 anchored 终态都返回 error（:1003-1005，含 unanchored），若并入 converged
+                                   //   则「放弃投递」会被判成「未收敛」，与 A8-①/T285 直接矛盾
       st.DispatchMu.Unlock()
 
+// 本函数**零调度器状态**：不写任何 error 字段（新或既有），失败只进 s.logger；投递面的 error/converged 全部在读取时
+// 由锚定日志**重新派生**（§4）——故不存在「粘滞错误毒化 converged」或「错误生命周期」问题。
 // 「本 tick 新产生的义务」不在此列：sweep 在 in-tick 生产者（drainDestructionAnchorQueue）**之前**运行，
 // 故其加载点看不到本 tick 新建的 seq（I10/T295）。本 tick 内由 HTTP 生产者新建且已落 pending 行的条目
 // 仍可能被本 tick 的 sweep 追加一次尝试（A8-⑧ 的残差，attempts ≤ 2）。
@@ -93,13 +97,18 @@ row.pending_retryable  = pending ∧ attempts <  max
 row.pending_exhausted  = pending ∧ attempts >= max         // 单列，绝不并入 pending（ADR-069 A8-①/②）
 row.conflicts          = st.conflicts（原样，已排序；评审 M1/M5）——**非空 ⇒ 该流不 converged 且必须带 error**
 row.oldest_pending_recorded_at = min{ e.RecordedAt | e.State==pending }（time.Parse 比较；解析失败则省略该字段，绝不猜）
-row.converged          = pending == 0 ∧ len(conflicts) == 0 ∧ error == ""
-row.error              = 该流 load 失败 / 冲突 seq / 派发失败时的响亮原因（绝不静默为 0/0/0）
-全局 converged         = 五流皆 converged（即皆无 pending、无 conflicts、无 error）
+row.last_unanchored_reason = 最高 seq 的 unanchored 条目的 LastError（读派生；无则省略）——让「为何被放弃」可见而不引入粘滞错误
+row.error              = **仅结构性**：该流 load 失败 / 存在 conflicts（读派生，每次读重算）——**派发结果绝不进入**
+row.converged          = pending == 0 ∧ len(conflicts) == 0 ∧ error == ""（★评审 M6：派发失败/unanchored 均**不**参与）
+全局 converged         = 五流皆 converged（即皆无 pending、无 conflicts、无结构性 error）
 ```
 
 - `oldest_pending_recorded_at` 的语义**精确声明**：`RecordedAt` 是锚定条目**首次记录**的时间，状态推进保留它（`next := e`，`:980`），故它是 backlog 年龄的**下界**，不是「进入 pending 的时刻」。
-- **错误状态隔离（承重细节）**：sweep 的错误**绝不**写入既有 `s.anchorError` / `s.destructionError`——它们分别喂 P40 的 `AnchorError` 与 P43 的 destruction summary（既有判据面，A6/I7 要求零变化）。本 Phase 新增独立的 `s.deliveryError`（per-family + 全局），只喂 `anchor_delivery` 组；§3 伪码里的 `s.setDeliveryError` 即指此，`sweepAnchorDelivery` **不调用** `setAnchorError`/`setDestructionError`。
+- **零新增调度器状态 + 错误分类（承重细节，评审 M6 修正）**：`anchor_delivery` 组**完全读派生**——每次 `Status()` 自己 load 五条流并现算，**不引入任何新调度器字段**（故不存在「`deliveryError` 是否每 tick 清空」的生命周期问题）。
+  - `error` **只承载结构性状态**：load 失败（不可分类行）与 conflicts。二者都由读取时的 load 直接得出。
+  - **派发结果一律不参与**：`dispatchAnchorPath` 对任何非 anchored 终态都返回 error（`:1003-1005`），其中 `unanchored` 是**合法终态**——若把它并入 converged，则「放弃投递」被判为「未收敛」，与 ADR-069 A8-①/T285 矛盾，且同一终态会因到达路径不同（sweep 直接 append vs 经 dispatch）而判定相反。故 sweep 的派发失败**只写 `s.logger`**，不写任何判据/读面字段。
+  - sweep **不调用** `setAnchorError`/`setDestructionError`（它们分别喂 P40 的 `AnchorError` 与 P43 的 destruction summary，A6/I7 要求零变化）。
+  - 可见性不因此受损：投递失败由**状态**承载（`pending`/`pending_retryable` 的 attempts 增长，直至 `unanchored`），「为何放弃」由 `last_unanchored_reason` + 该条自身的 `LastError`（`UnanchoredIDs` 亦可查，`snapshot_anchor.go:1272-1273`）给出。
 - 读面**不派发、不落盘、不写 audit、不发网络**（T290）；sweep 只发生在 Tick 内（I4）。
 
 ## 5. 不变量（I1~I10）
@@ -111,7 +120,7 @@ row.error              = 该流 load 失败 / 冲突 seq / 派发失败时的响
 | I3 | fail-closed：**①不可分类行（load 返回 error）与②冲突 seq（`len(st.conflicts)>0`，load **不**返回 error，必须显式判）**两种状态都令该流**整条不 sweep**（不落盘、字节零变化）+ 错误响亮 + 读面绝不报 converged + **流间隔离**（T286/T293） |
 | I4 | 读面零副作用：只读、不派发、不写 audit、不发网络（T290） |
 | I5 | **投递语义等价**：sweep 的状态推进与 `dispatchAnchorPath` 逐字节相同，唯一差异是家族 observer（T291） |
-| I6 | `converged` ≠ 投递成功：`unanchored` 也收敛 ⇒ 必须与 `anchored`/`unanchored` 计数同面呈现（T285） |
+| I6 | `converged` ≠ 投递成功：`unanchored`（含 4xx 拒收与 attempts 耗尽两条路径）**都收敛** ⇒ 必须与 `anchored`/`unanchored` 计数同面呈现，且**派发结果绝不参与 converged**（error 只承载 load 失败/conflicts）（T285/T296，评审 M6） |
 | I7 | 冻结面零 diff；`go.mod`/`go.sum` 零改动；P40~P46 判据取值零回归（T276） |
 | I8 | **每流一个派发互斥（评审 M3 重写）**：L1 = `keyLifecycleDispatchMu` / `verificationDispatchMu`（新增），L2 = `destructionDispatchMu`（既有），L3 = `destructionWriteMu`（既有），L4 = `s.mu`（错误字段）。**允许且仅允许的锁序**：`L1 → L2 → L3 → L4`。**L1→L2 的嵌套是设计的一部分**：L1 下的派发若触发锚定流前缀压缩，`appendonly_log.go:182-183` 会同步调用 observer 的 complete 闭包 ⇒ `destructionObserver` → `completeDestruction`（`snapshot_destruction.go:807`）→ `dispatchDestructionPending`（`:853` 取 L2）。**无环证明**：不存在任何 `L2 → L1` 的获取路径（destruction 侧从不取 lifecycle/verification 的派发互斥），故偏序无环；持 L2 的 sweep 分支（destruction 流）也不会再取 L1。**反向获取 = 死锁，禁止**（T289） |
 | I9 | 状态面 append-only：`anchor_delivery` 为**末位** `omitempty` 组，anchoring 关闭时整组缺席 ⇒ 默认部署逐字节不变（T284） |
@@ -125,16 +134,17 @@ row.error              = 该流 load 失败 / 冲突 seq / 派发失败时的响
 4. 生产者调用点包裹 L1（I8）+ T283/T289；残差边界 T294
 5. `AnchorDeliveryStatus` + `Status()` 末位组（I6/I9）+ T284/T285/T290
 6. Tick 尾**插入位置**接入（I10：`:798`/`:799` 之间）+ T277/T288/T295
-7. 跨维/冻结/回归 T276 + 变异 MU1~MU5（红→绿，sha256 还原）+ 三道门禁 + mktree 提交
+7. 跨维/冻结/回归 T276 + 变异 MU1~MU6（红→绿，sha256 还原）+ 三道门禁 + mktree 提交
 
 ## 7. 测试映射
 
-T276→I7；T277→I1；T278/T279/T280→§3 恢复路径；T281→§3 上限终态化；T282→I2；T283→I1；T284→I9；T285→I6；T286→I3；T287→§3 矛盾 pending；T288→ADR-069 §3 压缩活性；T289→I8；T290→I4；T291→I5；T292→MU1~MU5（MU1 摘 sweep 调用 ⇒ §3 恢复路径必红；MU2 摘不可分类行 fail-closed ⇒ I3；MU3 摘 unanchored 不复活 ⇒ I2；MU4 破分区 ⇒ I1；MU5 摘 `st.conflicts` 检查 ⇒ T293）；T293→I3 冲突分支（评审 M1/M5）；T294→A8-⑧ 残差边界；T295→I10 顺序（评审 M4）。
+T276→I7；T277→I1；T278/T279/T280→§3 恢复路径；T281→§3 上限终态化；T282→I2；T283→I1；T284→I9；T285→I6；T286→I3；T287→§3 矛盾 pending；T288→ADR-069 §3 压缩活性；T289→I8；T290→I4；T291→I5；T292→MU1~MU5（MU1 摘 sweep 调用 ⇒ §3 恢复路径必红；MU2 摘不可分类行 fail-closed ⇒ I3；MU3 摘 unanchored 不复活 ⇒ I2；MU4 破分区 ⇒ I1；MU5 摘 `st.conflicts` 检查 ⇒ T293）；T293→I3 冲突分支（评审 M1/M5）；T294→A8-⑧ 残差边界；T295→I10 顺序（评审 M4）；T296→I6 派发结果不参与 converged（评审 M6）；MU6 摘「派发结果不参与 converged」⇒ T296 必红。
 
 ## 8. 容量与成本（诚实声明）
 
 - **Tick 成本**：每 tick 多 3 次锚定日志 load（pending 通常为 0 ⇒ 无派发、无网络）。这是 P47 换取恢复面的固定开销；不引入新常驻组件（ADR-069 A7-6）。
 - **读面成本**：每次 `Status()` 多 5 次锚定日志 load（原已 load chain-anchor + 3 个家族状态）。管理读面，非热路径；不缓存（缓存会引入「读到的不是当前状态」的第二真相源）。
 - **日志成本**：sweep 的每次推进追加一条状态行（与生产者同款，`state` 不进签名区 ⇒ 状态推进不需重签，ADR-053 §1.3）。
+- **零新增调度器状态**：投递面每次读取时现算（多 5 次 load，见上），故不引入缓存/粘滞错误，也不存在字段生命周期问题（评审 M6）。
 - **本 tick 新产生义务的重投残差（评审 M4）**：三条流的锚定 seq 由冻结面分配，生产者调用点拿不到 ⇒ 无法建「本 tick 已投递 seq」集合；本 tick 内由生产者新建、且在 sweep 加载点之前已落 pending 行的条目可能被同 tick 追加一次尝试（attempts ≤ 2）。重复投递幂等（`409 duplicate` ⇒ `anchored`，T129），收敛上界（≤ max 轮）不变，受影响的仅是「+1/轮」这一测试级断言（A2/I1 已限定为「本 tick 开始时已 pending」的条目）。
 - **重投的 witness 成本**：`409 reason=duplicate` 是幂等确认（`:823-825`，T129）；HTTP witness 无额外副作用。**离线 `file://` dev witness 会把重投逐字追加一行**（`fileAnchorTransport.deliver` `:715-737` 不去重，ack_id 按同 seq 行数递增）——这是 P45 acceptance sweep 已在承受的既有代价，P47 不新增也不掩盖（ADR-069 A8 未列此项，因为它不改变判据取值；此处显式登记以免被读成新保证）。
