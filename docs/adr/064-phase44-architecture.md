@@ -98,7 +98,7 @@ verifyVerificationEntrySignatureIn(e, trust, foreign)         // 新实体：
 | | 条件（`vakSigner`/`verifierTrust` 经 `newExportSigner`/`newExportTrustStore` 装载，空即 nil） | 结果 |
 |---|---|---|
 | **V1** | `vakSigner != nil` 而 `verifierTrust` 为 nil/空；或 `vakSigner.keyID ∉ verifierTrust.keys` | 构造失败（T79b / P41 I1 血统，同 `:345-351` 形状） |
-| **V2 互斥可达** | ① `∀id ∈ verifierTrust.keys: id ∈ trust.keys`（与 manifest 锚相交）② `signer != nil && signer.keyID ∈ verifierTrust.keys`（发布者可自证）③ `kakSigner != nil && kakSigner.keyID ∈ verifierTrust.keys` ④ `vakSigner.keyID ∈ trust.keys` ⑤ `kakSigner != nil && vakSigner.keyID ∈ kakTrust.keys` | 任一命中 ⇒ 构造失败。**一把钥匙不得同时出现在两个信任锚**（key_id 派生不可配置 ⇒ id 级比对等价公钥级，judge 已确认） |
+| **V2 互斥可达** | ① `∀id ∈ verifierTrust.keys: id ∈ trust.keys`（与 manifest 锚相交，`:524-529`）② `signer != nil && signer.keyID ∈ verifierTrust.keys`（发布者可自证，`:504-508`）③ `kakSigner != nil && kakSigner.keyID ∈ verifierTrust.keys`（`:509-513`）④ `vakSigner.keyID ∈ trust.keys`（`:514-518`）⑤ `kakSigner != nil && vakSigner.keyID ∈ kakTrust.keys`（`:519-523`）⑥ `∀id ∈ verifierTrust.keys: id ∈ kakTrust.keys`（与 KAK 锚相交，`:530-535`——**①~⑤ 单独会漏掉的残差**：非 VAK、非 KAK、非 signer 的第三方密钥同时被 verifier 锚与 KAK 锚信任） | 任一命中 ⇒ 构造失败。**一把钥匙不得同时出现在两个信任锚**（key_id 派生不可配置 ⇒ id 级比对等价公钥级，judge 已确认）。**扫描面 = verifier 锚**：manifest 锚 ∩ KAK 锚的第三方共享不在 V2 扫描范围内（I1 残差，见 §8） |
 | **V3** | `vakSigner.keyID == signer.keyID`（signer 非 nil 时）；或 `kakSigner != nil && vakSigner.keyID == kakSigner.keyID` | 构造失败（G3 血统推广，`:352-354`） |
 | **V4** | `vakSigner != nil && !cfg.VerifyAttest` | 构造失败（对称 `:375-377` interval 守卫） |
 
@@ -121,7 +121,7 @@ verifyVerificationEntrySignatureIn(e, trust, foreign)         // 新实体：
 | 编号 | 通道 | 对手 | P44 后 | 处置 |
 |---|---|---|---|---|
 | A-1 | 伪造验证**报告**（本地账本末端追加/整体重写） | 持导出私钥 | `verification_unauthorized` ⇒ 账本不可信 ⇒ 无断言（T227/T228） | **闭合**——本 Phase 增量 |
-| **A-3** | 伪造验证**锚定条目**（`kind=verification`，`Overall=attested` + 任意 `ReportDigest`） | 持写权限 + 导出私钥 | **原样保留，未闭合**：条目字段在签名区（`snapshot_anchor.go:109-111`、`:146-148`），导出钥签发即合法（`anchorVerificationReport` 同款 `:1163-1172`），本地对 anchor log 的验签走 manifest 信任锚（`loadAnchorState(s.cfg.Dir, s.trust)`，`:1053`），`dispatchAnchorPath`（`:919-936`）照常发往见证端；锚定对账 A7-11 冻结（ADR-057 §8-8）⇒ **本地与域外均不可检测** | **不修（Scope §8-7 / 已知代价 7）**：修法一=锚定条目 VAK 会签，但见证端今日不验签（`anchorRequest` 携带 `Sig` 无验证方），且五族锚定共用导出钥传输层，单族改签撕裂传输模型；修法二=实现 A7-11 对账——两条都超本 Phase，**列 Phase 45 候选（与 C2 并案评估）** |
+| **A-3** | 伪造验证**锚定条目**（`kind=verification`，`Overall=attested` + 任意 `ReportDigest`） | 持写权限 + 导出私钥 | **原样保留，未闭合**：条目字段在签名区（`snapshot_anchor.go:109-111`、`:146-148`），导出钥签发即合法（`anchorVerificationReport` 同款 `:1163-1172`），本地对 anchor log 的验签走 manifest 信任锚（`loadAnchorState(s.cfg.Dir, s.trust)`，`:1053`），`dispatchAnchorPath`（`:919-936`）照常发往见证端；锚定对账 A7-11 冻结（ADR-057 §4 A7-11）⇒ **本地与域外均不可检测** | **不修（Scope §8-7 / 已知代价 7）**：修法一=锚定条目 VAK 会签，但见证端今日不验签（`anchorRequest` 携带 `Sig` 无验证方），且五族锚定共用导出钥传输层，单族改签撕裂传输模型；修法二=实现 A7-11 对账——两条都超本 Phase，**列 Phase 45 候选（与 C2 并案评估）** |
 | A-2 | 连账本一起删 | 任意写权限 | `verification_absent`（P42 原样） | 不变 |
 | — | 控制进程/主机（VAK 在线同进程） | 主机级攻击者 | 可伪造 VAK 签名 / 更换 trust 配置重启 | 拓扑代价（Scope 已知代价 1），代码断言不了 |
 
@@ -133,7 +133,7 @@ verifyVerificationEntrySignatureIn(e, trust, foreign)         // 新实体：
 
 | | 内容 | 执行点 |
 |---|---|---|
-| **I1** | 三信任锚（verifier/manifest/KAK）两两不相交；三私钥两两不同 | V2/V3，构造期（§5） |
+| **I1** | **verifier 锚与其余两锚逐 key 不相交**（扫描 `verifierTrust.keys` × {manifest `:524-529`, KAK `:530-535`}）+ 显式成员检查 ②③④⑤（`:504-523`）+ 三私钥两两不同（`:401` signer≠KAK、`:485` VAK≠signer、`:488` VAK≠KAK）。**残差（未闭合）**：非 VAK、非 KAK、非 signer 的第三方密钥同时出现在 **manifest 锚与 KAK 锚**时不被拒（V2 的扫描面只有 verifier 锚）——措辞与实际执行面对齐，不再声称「三信任锚两两不相交」 | V2/V3，构造期（§5） |
 | **I2** | 账本不可验（含 unauthorized）⇒ 拒绝追加、无断言 | load `:589-594` / append `:927`，fail-closed 原样 |
 | **I3** | 判据分轨：已知异族 ⇒ `verification_unauthorized`；无锚钥 ⇒ `key_unknown` | `verifyVerificationEntrySignatureIn`（§2） |
 | **I4** | 尺子不变：同输入 `items[]`/`overall` 与关闭模式一致 | T232 |
