@@ -127,4 +127,4 @@ T276→I7；T277→I1；T278/T279/T280→§3 恢复路径；T281→§3 上限终
 - **Tick 成本**：每 tick 多 3 次锚定日志 load（pending 通常为 0 ⇒ 无派发、无网络）。这是 P47 换取恢复面的固定开销；不引入新常驻组件（ADR-069 A7-6）。
 - **读面成本**：每次 `Status()` 多 5 次锚定日志 load（原已 load chain-anchor + 3 个家族状态）。管理读面，非热路径；不缓存（缓存会引入「读到的不是当前状态」的第二真相源）。
 - **日志成本**：sweep 的每次推进追加一条状态行（与生产者同款，`state` 不进签名区 ⇒ 状态推进不需重签，ADR-053 §1.3）。
-- **重投的 witness 成本**：`409 reason=duplicate` 是幂等确认（`:805-813`，T129）；HTTP witness 无额外副作用。**离线 `file://` dev witness 会把重投逐字追加一行**（`fileAnchorTransport.deliver` `:715-737` 不去重，ack_id 按同 seq 行数递增）——这是 P45 acceptance sweep 已在承受的既有代价，P47 不新增也不掩盖（ADR-069 A8 未列此项，因为它不改变判据取值；此处显式登记以免被读成新保证）。
+- **重投的 witness 成本**：`409 reason=duplicate` 是幂等确认（`:823-825`，T129）；HTTP witness 无额外副作用。**离线 `file://` dev witness 会把重投逐字追加一行**（`fileAnchorTransport.deliver` `:715-737` 不去重，ack_id 按同 seq 行数递增）——这是 P45 acceptance sweep 已在承受的既有代价，P47 不新增也不掩盖（ADR-069 A8 未列此项，因为它不改变判据取值；此处显式登记以免被读成新保证）。

@@ -20,15 +20,15 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 2. **pending 行先于联系见证端落盘（R40-6）**，五条流一致：`anchorDestructionEntry` `:1072-1075`、`anchorAcceptanceEntry` `:1113-1116`、`anchorKeyLifecycleEvent` `:1143-1147`、`anchorVerificationReport`（`snapshot_verification.go:1338-1344`）、publication 流经 `dispatchAnchor`/`dispatchAnchorPath` `:944-948`。
 3. **crash 恢复只有两处**（Tick 内）：
    - `chain-anchor` ← `anchorHousekeeping`（`:1154-1181`；`loadAnchorState` 即默认流 `:473-474`；调用点 `history_export_scheduler.go:781`）；
-   - `acceptance-anchor` ← `dispatchAcceptancePending`（`snapshot_acceptance.go:698-731`，显式 `loadAnchorStatePath(acceptanceAnchorPath)` `:702-703`；调用点 `history_export_scheduler.go:798`）。
+   - `acceptance-anchor` ← `dispatchAcceptancePending`（`snapshot_acceptance.go:698-733`，显式 `loadAnchorStatePath(acceptanceAnchorPath)` `:702-703`；调用点 `history_export_scheduler.go:798`）。
 4. **另外三条流只有 inline 派发，无任何持久恢复**：
    - lifecycle：`history_export_scheduler.go:672`（在 `AppendKeyLifecycleEvent` 内）；
    - verification：`snapshot_verification.go:1342`（内联）；
    - destruction：`snapshot_destruction.go:1334` → `destructionConfig.anchorDispatch`（`:1327-1336`）→ `dispatchDestructionPending`（`:849-858`，只吃**当次调用收集到的内存队列**）；Tick 尾的 `drainDestructionAnchorQueue`（`snapshot_acceptance.go:819-831`）drain 的也是**内存**队列。
-   ⇒ **crash 落在「pending 行已落盘、状态推进未落盘」之间 ⇒ 该条永久 pending，永不重投**（三条流均无 `loadAnchorStatePath(<自己的锚定流>)` 的扫描点：全仓非测试代码里只有 `snapshot_acceptance.go:703`、`snapshot_witness_reconcile.go:196/389` 三处按路径加载，前者是 acceptance sweep，后两者是 P46 只读对账）。
+   ⇒ **crash 落在「pending 行已落盘、状态推进未落盘」之间 ⇒ 该条永久 pending，永不重投**（三条流均无「扫 `pending` 并重投」的路径：非测试代码里按路径加载它们各自锚定流的点只有三处，**无一是重投**——P46 的 digest 探针 `history_export_scheduler.go:1678-1690`（只返回 digest、绝不派发）、`snapshot_anchor.go:543-545`（`nextAnchorSeqPath` 的 seq 分配）、`:628-629`（`compactAnchorPrefixPathObserved` 的压缩判据）；`snapshot_acceptance.go:703` 是 acceptance sweep、`snapshot_witness_reconcile.go:196/389` 是 P46 只读对账）。
 5. **且不可见**：五家族各自的 status 组（`keyLifecycleStatusSummary` `snapshot_key_lifecycle.go:816`、`verificationStatusSummary` `snapshot_verification.go:1402`、`destructionStatusSummary` `snapshot_destruction.go:995`、`inputIntegrityStatusSummary` `snapshot_acceptance.go:1033`）**没有任何锚定投递字段**；顶层 `PendingCount`（`history_export_scheduler.go:162`）只由 `refreshAnchorStatus`（`snapshot_anchor.go:1187-1199`）用 `loadAnchorState`（默认 `chain-anchor` 流）填充。P46 的 GET 面（`witnessReconcileLocalView` `snapshot_witness_reconcile.go:360-401`）只报存在性/窗口，也不含 pending。⇒ **三条流的投递欠账在本地没有任何表示**：既不自愈，也数不出来。
 6. **后果升级为存储欠账**：`compactAnchorPrefixPathObserved`（`:628-641`）**拒绝逐出未确认组**——`if oldest.State != anchorStateAnchored { return error }`（`:636-639`）。一条 stranded pending 会让该流「超容量且永不可压缩」，欠账随新条目无界增长。
-7. **重投在本系统内是安全的、已冻结的**：`classifyAnchorResponse`（`:805-813`）把 `409 + reason="duplicate"` 判为 **anchored**（幂等，T129 冻结）；只有 `reason="conflict"`（同 seq 不同 payload）才 refuse-to-record（`:974-978`，ADR-052 A4/A5）。P45 的 acceptance sweep 已经在使用这条 at-least-once 语义。
+7. **重投在本系统内是安全的、已冻结的**：`classifyAnchorResponse`（`:809-838`）的 duplicate 分支（`:823-825`）把 `409 + reason="duplicate"` 判为 **anchored**（幂等，T129 冻结）；只有 `reason="conflict"`（同 seq 不同 payload）才 refuse-to-record（`:974-978`，ADR-052 A4/A5）。P45 的 acceptance sweep 已经在使用这条 at-least-once 语义。
 8. **P46 是镜子不是修复路径**：`family_incomplete`（ADR-068 §3「本地条目 seq 无投影覆盖 ⇒ missing」）把「本地有、域外没有」暴露出来，但 A7-1 明确不做 witness 拉取 ⇒ 它不自愈。**P47 治的正是这面镜子照出来的那一半：本地侧的投递欠账。**
 
 **悖论**：系统已经能断言「域外没有」（P46 `family_incomplete`）、「账本被删」（P46 `family_ledger_deleted`）、「从未验证」（P42）、「为何缺席」（P43）——**唯独不能断言「这条锚定投递已经被清偿」**。五条流里三条的 pending 欠账在本地既不可见、也不自愈，而它的代价（不可压缩、无界增长）是即时的。
