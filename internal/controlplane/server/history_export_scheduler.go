@@ -188,6 +188,11 @@ type HistoryExportStatus struct {
 	// byte-identical to Phase 44). Kept as its own alignment group so every
 	// pre-existing line of this struct stays byte-identical.
 	InputIntegrity *inputIntegrityStatusSummary `json:"input_integrity,omitempty"`
+	// Phase 47: anchor delivery roll-up. nil (and therefore absent) unless
+	// anchoring is enabled (ADR-069 A1 — the LAST alignment group, so a default
+	// deployment's status document stays byte-identical). Every field is
+	// read-derived; there is deliberately NO cached delivery state (ADR-070 §4).
+	AnchorDelivery *anchorDeliveryStatusSummary `json:"anchor_delivery,omitempty"`
 }
 
 // HistoryExportScheduler materializes the durable alert-transition history to
@@ -669,7 +674,15 @@ func (s *HistoryExportScheduler) AppendKeyLifecycleEvent(req keyLifecycleRequest
 	}
 	s.setKeyLifecycleError("")
 	if s.anchorEnabled() {
-		if aerr := s.anchorKeyLifecycleEvent(e); aerr != nil {
+		// Phase 47 (ADR-070 I8/L1): the producer is now ONE of two dispatchers
+		// on this stream (the other is sweepAnchorDelivery), so it must hold the
+		// stream's dispatch mutex — otherwise a producer and a sweep could both
+		// derive a seq / append a state line against the same state and fork the
+		// stream. This is a BEHAVIOUR CHANGE, declared in ADR-069 A8-⑤.
+		keyLifecycleDispatchMu.Lock()
+		aerr := s.anchorKeyLifecycleEvent(e)
+		keyLifecycleDispatchMu.Unlock()
+		if aerr != nil {
 			// An anchor failure NEVER rolls back the recorded fact: the ledger
 			// is the evidence, the anchor is only the out-of-domain copy
 			// (ADR-053 I6, carried into Phase 41).
@@ -796,6 +809,13 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 	// observer. Both run here holding NO store lock, so witness network I/O
 	// never holds s.mu / acceptanceMu / destructionWriteMu (I6).
 	s.dispatchAcceptancePending()
+	// Phase 47 (ADR-070 I10): the delivery sweep runs AFTER dispatchAcceptancePending
+	// and BEFORE drainDestructionAnchorQueue — i.e. BEFORE this tick's in-tick
+	// producers — so a destruction seq created later in the same tick is never
+	// re-dispatched here (T295). Order is frozen:
+	// anchorHousekeeping → dispatchAcceptancePending → sweepAnchorDelivery →
+	// drainDestructionAnchorQueue → prune.
+	s.sweepAnchorDelivery(ctx)
 	s.drainDestructionAnchorQueue()
 
 	s.mu.Lock()
@@ -1545,6 +1565,14 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 	// (input_error, ADR-066 §3).
 	if s.cfg.AcceptanceLog {
 		st.InputIntegrity = &inputIntegrityStatusSummary{Enabled: true, Error: acceptanceErr}
+	}
+	// Phase 47 (ADR-070 §4): the delivery face is computed HERE, holding s.mu,
+	// in the same position as the other family summaries. It is fully
+	// read-derived (no new scheduler state), and anchoring off leaves the group
+	// nil so the JSON stays byte-identical to Phase 46 (I9).
+	if s.anchorEnabled() {
+		ad := s.AnchorDeliveryStatus()
+		st.AnchorDelivery = &ad
 	}
 	if s.trust != nil {
 		st.TrustedKeys = len(s.trust.keys)

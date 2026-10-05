@@ -85,10 +85,10 @@ const (
 // value class at all: it means the dimension could not be evaluated in this
 // report, which by the monotone rule yields `unattested` — never `attested`.
 const (
-	classOK          = "ok"
+	classOK           = "ok"
 	classContradicted = "contradicted"
-	classUnattested  = "unattested"
-	classUnavailable = "unavailable"
+	classUnattested   = "unattested"
+	classUnavailable  = "unavailable"
 )
 
 // The seven judgement dimensions, in a FIXED order. The order is part of the
@@ -1261,7 +1261,14 @@ func (s *HistoryExportScheduler) AttestVerification(limit int) (VerificationRepo
 	}
 	s.setVerificationError("")
 	if s.anchorEnabled() {
-		if aerr := s.anchorVerificationReport(&report); aerr != nil {
+		// Phase 47 (ADR-070 I8/L1): the verification anchor producer is now one
+		// of two dispatchers on this stream (the other is sweepAnchorDelivery),
+		// so it holds the stream's dispatch mutex. BEHAVIOUR CHANGE, declared in
+		// ADR-069 A8-⑤.
+		verificationDispatchMu.Lock()
+		aerr := s.anchorVerificationReport(&report)
+		verificationDispatchMu.Unlock()
+		if aerr != nil {
 			// Never rolls back: the log is the evidence, the anchor is the
 			// out-of-domain copy (ADR-052 I6, carried into Phase 42).
 			s.setAnchorError(aerr.Error())
