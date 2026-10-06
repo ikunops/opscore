@@ -260,20 +260,21 @@ func TestP47T276DefaultStatusByteFrozen(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// T277 — static partition: five streams, one sweeper each, no double coverage
+// T277 — static partition: SIX streams, one sweeper each, no double coverage
 // ---------------------------------------------------------------------------
 
 func TestP47T277StaticPartition(t *testing.T) {
 	streams := anchorDeliveryStreams()
-	if len(streams) != 5 {
-		t.Fatalf("the partition table must hold five streams, got %d", len(streams))
+	if len(streams) != 6 {
+		t.Fatalf("the partition table must hold six streams, got %d", len(streams))
 	}
 	want := map[string]string{
-		witnessFamilyLedger:       anchorSweeperHousekeeping,
-		witnessFamilyKeyLifecycle: anchorSweeperDeliverySweep,
-		witnessFamilyVerification: anchorSweeperDeliverySweep,
-		witnessFamilyDestruction:  anchorSweeperDeliverySweep,
-		witnessFamilyAcceptance:   anchorSweeperAcceptancePending,
+		witnessFamilyLedger:             anchorSweeperHousekeeping,
+		witnessFamilyKeyLifecycle:       anchorSweeperDeliverySweep,
+		witnessFamilyVerification:       anchorSweeperDeliverySweep,
+		witnessFamilyDestruction:        anchorSweeperDeliverySweep,
+		witnessFamilyAcceptance:         anchorSweeperAcceptancePending,
+		witnessFamilyProtectionDecision: anchorSweeperDeliverySweep,
 	}
 	seen := map[string]int{}
 	for _, st := range streams {
@@ -287,12 +288,12 @@ func TestP47T277StaticPartition(t *testing.T) {
 			t.Fatalf("family %q is covered %d times (I1 requires exactly one sweeper)", fam, n)
 		}
 	}
-	// The three delivery_sweep streams carry distinct, non-nil mutexes.
+	// The FOUR delivery_sweep streams carry distinct, non-nil mutexes.
 	swept := deliverySweepStreams()
-	if len(swept) != 3 {
-		t.Fatalf("delivery_sweep must own exactly three streams, got %d", len(swept))
+	if len(swept) != 4 {
+		t.Fatalf("delivery_sweep must own exactly four streams, got %d", len(swept))
 	}
-	order := []string{witnessFamilyKeyLifecycle, witnessFamilyVerification, witnessFamilyDestruction}
+	order := []string{witnessFamilyKeyLifecycle, witnessFamilyVerification, witnessFamilyDestruction, witnessFamilyProtectionDecision}
 	mus := map[*sync.Mutex]bool{}
 	for i, st := range swept {
 		if st.Family != order[i] {
@@ -338,6 +339,14 @@ func p47PendingEntry(kind string) anchorEntry {
 		e.ReportSeq = 1
 		e.ReportDigest = strings.Repeat("ef", 32)
 		e.Overall = "attested"
+	case witnessFamilyProtectionDecision:
+		// Phase 48: the sixth family's carrier is Kind + PublicationID (chain head
+		// seq) + ManifestDigest (chain head digest). The seeded head seq is left 0
+		// here so the shared dispatch counter (which keys on PublicationID == 0)
+		// keeps counting exactly the swept streams; T309 seeds a REALISTIC
+		// non-zero head instead.
+		e.Kind = anchorKindProtectionDecision
+		e.ManifestDigest = strings.Repeat("12", 32)
 	}
 	return e
 }
@@ -350,6 +359,9 @@ func p47StreamPath(fam string) func(string) string {
 		return keyLifecycleAnchorPath
 	case witnessFamilyVerification:
 		return verificationAnchorPath
+	case witnessFamilyProtectionDecision:
+		// Phase 48: the SIXTH family's anchor stream, the fourth swept stream.
+		return decisionAnchorPath
 	}
 	panic("unknown family " + fam)
 }
@@ -470,22 +482,23 @@ func TestP47T282UnanchoredNeverRevived(t *testing.T) {
 
 // ---------------------------------------------------------------------------
 // T283 — zero double dispatch: an entry pending at tick start gains EXACTLY +1
-// attempt in one tick (all three swept streams).
+// attempt in one tick (all four swept streams).
 // ---------------------------------------------------------------------------
 
 func TestP47T283ExactlyOneAttemptPerTick(t *testing.T) {
 	f := newP47Fixture(t, nil)
-	for _, fam := range []string{witnessFamilyKeyLifecycle, witnessFamilyVerification, witnessFamilyDestruction} {
+	sweptFamilies := []string{witnessFamilyKeyLifecycle, witnessFamilyVerification, witnessFamilyDestruction, witnessFamilyProtectionDecision}
+	for _, fam := range sweptFamilies {
 		f.seedPending(p47StreamPath(fam)(f.dir), p47PendingEntry(fam))
 	}
 	tr := f.useScripted(200, `{"ack_id":"a-1"}`)
 	f.tick(f.sched)
-	// All three swept streams share seq 1 (independent sequence spaces), so the
-	// witness must have seen exactly one dispatch per stream — three, not six.
-	if got := p47CountReqs(tr, 1); got != 3 {
-		t.Fatalf("T283: three streams must dispatch once each, got %d", got)
+	// All four swept streams share seq 1 (independent sequence spaces), so the
+	// witness must have seen exactly one dispatch per stream — four, not eight.
+	if got := p47CountReqs(tr, 1); got != 4 {
+		t.Fatalf("T283: four streams must dispatch once each, got %d", got)
 	}
-	for _, fam := range []string{witnessFamilyKeyLifecycle, witnessFamilyVerification, witnessFamilyDestruction} {
+	for _, fam := range sweptFamilies {
 		e := p47Latest(t, f.sched, p47StreamPath(fam)(f.dir), 1)
 		if e.Attempts != 1 {
 			t.Fatalf("T283: stream %q attempts = %d, want exactly 1 (no double dispatch)", fam, e.Attempts)

@@ -129,6 +129,20 @@ func anchorDeliveryStreams() []anchorDeliveryStream {
 			AnchorPath: acceptanceAnchorPath,
 			SweptBy:    anchorSweeperAcceptancePending,
 		},
+		// Phase 48 (ADR-072 §2(c)): the SIXTH family is the FOURTH stream swept by
+		// delivery_sweep. It carries its own dispatch mutex (I10) because it has two
+		// dispatchers — the tick drain and this sweep — exactly like the three
+		// streams P47 added. Its Observer is nil for the same structural reason as
+		// destruction/acceptance: this anchor stream is the accountability system's
+		// own bookkeeping, and observing its compaction would record a destruction
+		// whose dispatch appends back into this very file (ADR-070 §2, R43-8).
+		{
+			Family:     witnessFamilyProtectionDecision,
+			AnchorPath: decisionAnchorPath,
+			SweptBy:    anchorSweeperDeliverySweep,
+			DispatchMu: &decisionDispatchMu,
+			Observer:   func(*HistoryExportScheduler) compactionObserver { return nil },
+		},
 	}
 }
 
@@ -334,6 +348,27 @@ type anchorDeliveryStreamStatus struct {
 	Converged bool `json:"converged"`
 	// Error carries STRUCTURAL state ONLY: a load failure or conflicting seqs.
 	Error string `json:"error,omitempty"`
+
+	// ---- Phase 48: the sixth family's THREE source-specific fields ----
+	// They are pointers/strings with omitempty precisely so the other five rows
+	// omit them and stay byte-identical (ADR-072 §4). A pointer (rather than a
+	// plain bool/int) is required for the same reason: `false` and `0` are
+	// MEANINGFUL values on the sixth family's row and must be visible, not
+	// silently dropped by omitempty.
+	//
+	// DecisionQueueDropped is the persisted count of decisions that reached no
+	// durable byte (queue eviction, or a refused append). It counts ONLY genuine
+	// loss: a legal prefix compaction is bounded retention and never increments it
+	// (I6).
+	DecisionQueueDropped *int64 `json:"decision_queue_dropped,omitempty"`
+	// DecisionLogState is the LOCAL RECOMPUTE verdict (ADR-072 §3.3):
+	// attested | divergent | truncated | no_anchor | not_enabled. P46 has no
+	// vocabulary for any of these — it never reads the main ledger's content.
+	DecisionLogState string `json:"decision_log_state,omitempty"`
+	// DecisionAttested is the four-way conjunction of ADR-072 §4. It is FALSE
+	// whenever any conjunct fails, including a non-zero loss count — a window that
+	// lost a decision is never presented as a window where nothing happened.
+	DecisionAttested *bool `json:"decision_attested,omitempty"`
 }
 
 // anchorDeliveryStatusSummary is the `anchor_delivery` group (A1).
@@ -358,6 +393,11 @@ func (s *HistoryExportScheduler) AnchorDeliveryStatus() anchorDeliveryStatusSumm
 		if err != nil {
 			// Structural: the stream cannot be evaluated, so it is not converged.
 			row.Error = err.Error()
+			if st.Family == witnessFamilyProtectionDecision {
+				// The sixth family's source fields are still reported, fail-closed:
+				// a nil anchor state means the local recompute can assert nothing.
+				s.fillDecisionAttest(&row, nil)
+			}
 			out.Families = append(out.Families, row)
 			out.Converged = false
 			continue
@@ -399,6 +439,13 @@ func (s *HistoryExportScheduler) AnchorDeliveryStatus() anchorDeliveryStatusSumm
 		row.Converged = row.Pending == 0 && len(row.Conflicts) == 0 && row.Error == ""
 		if !row.Converged {
 			out.Converged = false
+		}
+		if st.Family == witnessFamilyProtectionDecision {
+			// Phase 48: the sixth family's source fields (ADR-072 §4). Everything
+			// here is read-derived — one more load already in hand, one walk of the
+			// decision log and one persisted counter. No write, no audit, no
+			// network, no dispatch (T311).
+			s.fillDecisionAttest(&row, state)
 		}
 		out.Families = append(out.Families, row)
 	}

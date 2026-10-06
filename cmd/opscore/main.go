@@ -238,6 +238,11 @@ type protectionBundle struct {
 	rateHistory  *protection.RateHistory
 	alertTracker *protection.AlertTracker
 	alertPolicy  protection.AlertPolicy
+	// decisionAttest is the Phase 48 decision sink when the scheduled export face
+	// is on (nil otherwise). It wraps `provenance` — the ring stays the read
+	// projection (I5) — and is handed to the scheduler as the sixth family's
+	// producer.
+	decisionAttest *server.DecisionAttestSink
 	// transitionStore is the durable alert-transition store (nil in memory
 	// mode). Shared: the tracker owns writes, the server reads it for the
 	// Phase 31 bounded durable projection (P31-I6).
@@ -250,7 +255,14 @@ type protectionBundle struct {
 // breaker/rate/timeout are backend-agnostic. The provenance sink is bounded and
 // non-blocking (R24-4/R24-7); the rate history + alert tracker are off-path
 // read projections (R24-5 Projection Only, never a Source of Truth).
-func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPath string) protectionBundle {
+//
+// decisionDir (Phase 48) is the scheduled export directory, or "" when the
+// export face is off. When it is set, the Gate is handed a DecisionAttestSink
+// instead of the bare ring: the sink delegates every read to that SAME ring, so
+// the Gate's ProvenanceStore() semantics — and the P24.2 response bytes — are
+// unchanged (I5/A6). The Gate itself is not otherwise told anything: the seven
+// guards and the emitDecision call sites are untouched (A2).
+func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPath, decisionDir string) protectionBundle {
 	var killPersist protection.KillPersistence
 	if s, ok := stor.(*sqlite.SQLiteStorage); ok {
 		killPersist = sqlite.NewProtectionStore(s.DB())
@@ -283,6 +295,18 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPa
 
 	// Phase 24.2 observability projections.
 	sink := protection.NewRecordingProvenanceSink(4096) // bounded, non-blocking
+	// Phase 48: when the scheduled export face is on, the Gate emits into a
+	// delegating sink instead of the bare ring. The ring keeps its exact
+	// behaviour (the sink forwards to it first, unchanged), and the extra half is
+	// a bounded, non-blocking hand-off to the durable decision chain. With the
+	// export face off there is nowhere durable to write, so the bare ring is
+	// wired exactly as before (default zero regression).
+	var provenanceSink protection.ProvenanceSink = sink
+	var decisionAttest *server.DecisionAttestSink
+	if decisionDir != "" {
+		decisionAttest = server.NewDecisionAttestSink(sink, decisionDir)
+		provenanceSink = decisionAttest
+	}
 	rateHistory := protection.NewRateHistory(time.Minute, 120)
 	// Phase 30: durable, cross-restart alert-transition retention. The store is
 	// attached only when a path is provided (non-memory storage).
@@ -326,7 +350,7 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPa
 		Evidence:   evidence,
 		Audit:      &storageAuditWriter{store: stor.Audit()},
 		Timeout:    protection.NewTimeoutConfig(),
-		Provenance: sink,
+		Provenance: provenanceSink,
 	})
 	return protectionBundle{
 		gate:            gate,
@@ -334,6 +358,7 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPa
 		rateHistory:     rateHistory,
 		alertTracker:    alertTracker,
 		alertPolicy:     alertPolicy,
+		decisionAttest:  decisionAttest,
 		transitionStore: transitionStore,
 	}
 }
@@ -621,12 +646,15 @@ func cmdServe(args []string) {
 	if *storageKind != "memory" {
 		transitionPath = *dbPath + ".alert-transitions.jsonl"
 	}
-	bundle := buildProtectionGate(stor, logger, transitionPath)
-
 	// Phase 34: build the OPT-IN scheduled exporter. Enabled only when BOTH a
 	// positive interval and a destination dir are configured; a PARTIAL config
 	// (one set, the other not) or an unknown/empty format fails fast (P34-I5 —
 	// never silently degrades to disabled).
+	//
+	// Phase 48: this decision is taken BEFORE the protection gate is built,
+	// because the export directory is where the sixth evidence family's durable
+	// decision log lives — so it is also the decision-attestation sink's home. The
+	// wiring below therefore has one owner for the fact "the export face is on".
 	var exportScheduler *server.HistoryExportScheduler
 	exportEnabled := *exportInterval > 0 && *exportDir != ""
 	if *exportInterval > 0 != (*exportDir != "") {
@@ -634,6 +662,12 @@ func cmdServe(args []string) {
 			"interval", exportInterval.String(), "dir", *exportDir)
 		os.Exit(1)
 	}
+	decisionDir := ""
+	if exportEnabled {
+		decisionDir = *exportDir
+	}
+	bundle := buildProtectionGate(stor, logger, transitionPath, decisionDir)
+
 	if exportEnabled {
 		formats := parseExportFormats(*exportFormats)
 		sc, err := server.NewHistoryExportScheduler(server.HistoryExportConfig{
@@ -670,6 +704,10 @@ func cmdServe(args []string) {
 			// anchor).
 			AcceptanceLog:      *exportAcceptanceLog,
 			AcceptanceCapacity: *exportAcceptanceCapacity,
+			// Phase 48: the sixth family's producer. Same sink instance the Gate
+			// emits into, so "the Gate's decisions" and "the family's records" can
+			// never be two different streams.
+			DecisionAttest: bundle.decisionAttest,
 		})
 		if err != nil {
 			logger.Error("scheduled history export config invalid — refusing to start (P34-I5 fail-fast)", "err", err)

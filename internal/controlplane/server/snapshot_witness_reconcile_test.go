@@ -415,8 +415,8 @@ func TestP46T259AllFamiliesIntactFromRealDispatchBytes(t *testing.T) {
 	f.expectFamilyCount(byFamily, witnessFamilyDestruction, 1)
 
 	_, res := f.postReconcile(f.sched, byFamily)
-	if len(res.Families) != 5 {
-		t.Fatalf("the aggregate must cover the five registered families, got %v", res.Families)
+	if len(res.Families) != 6 {
+		t.Fatalf("the aggregate must cover the six registered families, got %v", res.Families)
 	}
 	for _, name := range []string{witnessFamilyLedger, witnessFamilyKeyLifecycle, witnessFamilyDestruction, witnessFamilyVerification, witnessFamilyAcceptance} {
 		row := res.Families[name]

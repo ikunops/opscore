@@ -139,6 +139,14 @@ type HistoryExportConfig struct {
 	// (destruction-accounted, A8-6); a REFUSED compaction refuses new entries
 	// (I7) — there is deliberately no other "full" state.
 	AcceptanceCapacity int
+	// DecisionAttest (Phase 48) is the sixth family's producer: the non-blocking
+	// decision sink that both feeds the existing ring and queues decisions for the
+	// durable hash chain. NIL = the sixth family has no producer, so its GET probe
+	// reports `not_enabled` and no decision file is ever created — a default
+	// deployment stays byte-identical (ADR-071 A6). The sink is built at the
+	// assembly root and injected into the Gate as `Provenance` too, so the Gate
+	// never learns that anything changed (ADR-072 §1/A2).
+	DecisionAttest *DecisionAttestSink
 }
 
 // HistoryExportStatus is the read-only scheduler state surfaced via
@@ -817,6 +825,12 @@ func (s *HistoryExportScheduler) Tick(ctx context.Context) {
 	// drainDestructionAnchorQueue → prune.
 	s.sweepAnchorDelivery(ctx)
 	s.drainDestructionAnchorQueue()
+	// Phase 48 (ADR-072 §3.4): the sixth family's producer. It runs as the LAST
+	// in-tick producer — after sweepAnchorDelivery — so the anchor entry it creates
+	// this tick is never re-dispatched by the sweep in the same tick (the P47
+	// T295 ordering discipline, applied to the fourth swept stream). It takes no
+	// store lock and does no witness I/O under s.mu.
+	s.drainDecisionAttest(ctx)
 
 	s.mu.Lock()
 	if pubStateErr != "" {
@@ -1650,9 +1664,9 @@ type witnessFamily struct {
 	LocalDigest func(dir string, seq int64) (string, bool)
 }
 
-// witnessFamilyRegistry is the static five-family table (ADR-068 §2). The
-// registry is CLOSED: an unknown family name is a caller error, never a
-// family with an empty projection set.
+// witnessFamilyRegistry is the static SIX-family table (ADR-068 §2; the sixth
+// family added by ADR-072 §2). The registry is CLOSED: an unknown family name is
+// a caller error, never a family with an empty projection set.
 func witnessFamilyRegistry() []witnessFamily {
 	return []witnessFamily{
 		{
@@ -1685,11 +1699,22 @@ func witnessFamilyRegistry() []witnessFamily {
 			AnchorPath:  acceptanceAnchorPath,
 			LocalDigest: witnessAnchorDigestFunc(acceptanceAnchorPath),
 		},
+		// Phase 48 (ADR-072 §2(a)): the SIXTH family. Its main ledger is the hash
+		// chain of decision records and its anchor stream carries the chain head
+		// digest. Registering it here is what buys the family P46's absence matrix
+		// and window comparison — the half P46 CAN cover (ADR-071 §2 M1: P46 never
+		// reads the main ledger's CONTENT, so the content check is the new local
+		// recompute in snapshot_decision_attest.go).
+		{
+			Name:        witnessFamilyProtectionDecision,
+			LedgerPath:  decisionLogPath,
+			AnchorPath:  decisionAnchorPath,
+			LocalDigest: witnessAnchorDigestFunc(decisionAnchorPath),
+		},
 	}
 }
 
-// witnessFamilyKnown reports whether name is one of the five registered
-// families.
+// witnessFamilyKnown reports whether name is one of the registered families.
 func witnessFamilyKnown(name string) bool {
 	for _, f := range witnessFamilyRegistry() {
 		if f.Name == name {
@@ -1756,6 +1781,12 @@ func witnessFamilyEnabled(s *HistoryExportScheduler, name string) bool {
 		return s.verificationConfig().enabled()
 	case witnessFamilyAcceptance:
 		return s.cfg.AcceptanceLog
+	case witnessFamilyProtectionDecision:
+		// Phase 48 (ADR-072 §2(b), D7): the sixth family has its OWN gate — the
+		// sink's presence. Without this case the 5-case switch's `default false`
+		// would make the GET probe report `not_enabled` forever while the producer
+		// was demonstrably running, i.e. the two faces would contradict each other.
+		return s.decisionAttestConfig().enabled()
 	}
 	return false
 }

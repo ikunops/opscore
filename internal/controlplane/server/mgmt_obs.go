@@ -410,6 +410,15 @@ func transitionKind(from, to bool) string {
 // The envelope therefore carries export_completeness = "current-retention-snapshot"
 // plus the raw capacity/buffered/dropped/truncated from store.Stats() unchanged.
 //
+// Phase 48 (ADR-071 D5) — the boundary above is a statement about THE RING, not
+// about the decision face as a whole, and the two must not be confused. The
+// durable, hash-chained forensic history of decisions is the sixth evidence
+// family `protection_decision` (protection-decision.jsonl + decision-anchor.jsonl,
+// snapshot_decision_attest.go), which is asserted as `decision_attested` on the
+// scheduler's anchor_delivery face. This endpoint stays a retention snapshot of
+// the ring; its response bytes are UNCHANGED by Phase 48 (A6) — the new sink
+// delegates every ProvenanceStore method to this same ring (I5).
+//
 // Completeness is never recomputed (R127-fix-2 / I3): an export omission is NOT
 // a new provenance loss. CSV trailing '#' lines are export-format metadata
 // (R127-fix-3 / I4), not data rows; consumers may ignore them.
