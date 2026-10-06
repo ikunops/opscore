@@ -83,12 +83,15 @@ decisionRecord := {
 ```
 attestDecision():
   st  := loadAnchorStatePath(decisionAnchorPath(dir), dir, s.trust)   // 复用 P47 同款加载
-  e   := st.latest[st.window.MaxSeq]                                   // 最新锚定条目
+  if len(st.conflicts) > 0:                      return DIVERGENT     // 锚定流自相矛盾：不可评估
+  a   := 最新【anchored】条目（State==anchored 中 max PublicationID）   // 存在但未确认的条目锚定不了任何东西
+  if 无 anchored 条目:                            return NO_ANCHOR
   recs, headSeq, headDigest, chainOK := walkDecisionChain(decisionLogPath(dir))
   if !chainOK:                                   return DIVERGENT     // 链内断裂：篡改
-  if headSeq <  e.PublicationID:                 return TRUNCATED     // 尾部被删（前缀）
-  if headSeq == e.PublicationID && headDigest != e.ManifestDigest:  return DIVERGENT   // 同长度不同内容：篡改
-  return ATTESTED                                                      // 链完整 ∧ 链头与锚定头一致（或已更长，由更新的锚定条目覆盖）
+  if headSeq <  a.PublicationID:                 return TRUNCATED     // 尾部被删（前缀）
+  if headSeq == a.PublicationID && headDigest != a.ManifestDigest:  return DIVERGENT   // 同长度不同内容：篡改
+  if headSeq >  a.PublicationID:                 return PENDING_ANCHOR // durable 但未被见证（F1：绝不 attested）
+  return ATTESTED                                                      // 链完整 ∧ 链头与最新已确认锚定条目严格一致
 ```
 
 - `walkDecisionChain`：按 `seq` 升序读，逐条校验 `prev_digest == 前一条.digest`。**允许**首条的 `prev_digest` 指向已被**合法前缀压缩**掉的记录（故不能把「首条 prev_digest 无对应」判为断裂）——这是与「尾部删除」的判别支点（I6/T315）。
@@ -127,7 +130,7 @@ func (s *DecisionAttestSink) Emit(ctx, p) {
 
 ```
 decision_queue_dropped   = 持久化计数（仅「从未落盘」的丢失；合法前缀压缩不计入——I6）
-decision_log_state       = attested | divergent | truncated | no_anchor | not_enabled
+decision_log_state       = attested | divergent | truncated | pending_anchor | no_anchor | not_enabled
 decision_attested        = (decision_log_state == attested)
                            ∧ (该锚定条目已 anchored)          // ② P47 投递面
                            ∧ (decision_queue_dropped == 0)    // ③
@@ -135,7 +138,7 @@ decision_attested        = (decision_log_state == attested)
 ```
 
 - **`decision_attested` 的四个合取项缺一不可**（评审 M2）：缺 ① 就退化为「锚定条目存在」，而锚定条目每 tick 必写 ⇒ 判据近乎恒真。T302 断言其非空泛。
-- `decision_log_state` 的取值由 §3.3 的本地重算产出；`no_anchor` 表示该族尚无锚定条目（首 tick 之前）。
+- `decision_log_state` 的取值由 §3.3 的本地重算产出；`no_anchor` 表示该族尚无【已确认】锚定条目（首 tick 之前或全部条目仍在途）；`pending_anchor` 表示存在已确认前缀但本地日志已延伸至其外（durable 但未被见证——锚定派发失败或积压；**绝不 attested**，终审 MAJOR F1 修订：原「或已更长，由更新的锚定条目覆盖」的放宽被推翻——该假设恰在锚定追加失败且尾部静默时失效，Scope §3 ① 的严格等式胜出）。
 - 读面**只读**：`os.Stat` + 既有 load + 走一遍判定日志 + 读一次持久化计数；不落盘、不写 audit、不发网络、不派发（P47 I4 沿用）。
 
 ## 5. 不变量（I1~I11）

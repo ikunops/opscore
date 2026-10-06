@@ -58,6 +58,7 @@ package server
 //     is NOT assertable, and is NEVER reconstructed from audit rows.
 
 import (
+	"strings"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -114,6 +115,7 @@ const (
 	decisionLogStateDivergent  = "divergent"
 	decisionLogStateTruncated  = "truncated"
 	decisionLogStateNoAnchor   = "no_anchor"
+	decisionLogStatePendingAnchor = "pending_anchor"
 	decisionLogStateNotEnabled = "not_enabled"
 )
 
@@ -292,19 +294,28 @@ type decisionLossState struct {
 // readDecisionLoss returns the persisted loss count. A missing or unreadable
 // counter reads 0 — the counter is a completeness signal, and refusing to answer
 // would be worse than reporting the last durable value.
-func readDecisionLoss(dir string) int64 {
+func readDecisionLoss(dir string) (int64, error) {
 	data, err := os.ReadFile(decisionLossPath(dir))
 	if err != nil {
-		return 0
+		if os.IsNotExist(err) {
+			return 0, nil // never written: zero losses is the honest genesis
+		}
+		return 0, err
 	}
 	var st decisionLossState
 	if jerr := json.Unmarshal(data, &st); jerr != nil {
-		return 0
+		// Final review F3: a corrupted loss counter must NOT read as zero —
+		// zeroing it would launder real drops and re-light decision_attested.
+		// Fail-closed: the caller loses the attested claim until the operator
+		// intervenes (the file is deliberately unchained/unanchored — the one
+		// artifact without integrity discipline — so fail-closed is the only
+		// defense it has).
+		return 0, fmt.Errorf("decision loss counter is unreadable: %w", jerr)
 	}
 	if st.Dropped < 0 {
-		return 0
+		return 0, fmt.Errorf("decision loss counter is negative (%d)", st.Dropped)
 	}
-	return st.Dropped
+	return st.Dropped, nil
 }
 
 func writeDecisionLoss(dir string, n int64) error {
@@ -363,6 +374,10 @@ type DecisionAttestSink struct {
 	queue     []protection.DecisionProvenance
 	dropped   int64
 	persisted int64
+	// lossErr is sticky (final review F3): set when the persisted loss counter
+	// is unreadable/corrupt. Non-nil ⇒ the attested claim is withheld (the
+	// counter must not read as zero — that would launder real drops).
+	lossErr string
 }
 
 // NewDecisionAttestSink builds the sink over an existing ring and the export
@@ -370,13 +385,21 @@ type DecisionAttestSink struct {
 // HERE, so a restarted process continues the count instead of laundering the
 // previous process's losses into zero (T304).
 func NewDecisionAttestSink(ring *protection.RecordingProvenanceSink, dir string) *DecisionAttestSink {
-	dropped := readDecisionLoss(dir)
+	// F3: a corrupt/unreadable loss counter must not read as zero. The sink
+	// carries the sticky error; the first fillDecisionAttest surfaces it and
+	// withholds the attested claim until an operator resolves it.
+	dropped, lossErr := readDecisionLoss(dir)
+	sinkErr := ""
+	if lossErr != nil {
+		sinkErr = lossErr.Error()
+	}
 	return &DecisionAttestSink{
 		ring:      ring,
 		dir:       dir,
 		queue:     make([]protection.DecisionProvenance, 0, decisionQueueCap),
 		dropped:   dropped,
 		persisted: dropped,
+		lossErr:   sinkErr,
 	}
 }
 
@@ -752,27 +775,52 @@ func (s *HistoryExportScheduler) decisionLogStateAt(st *anchorState) string {
 	if st.window.Entries == 0 {
 		return decisionLogStateNoAnchor
 	}
-	e, ok := st.latest[st.window.MaxSeq]
-	if !ok {
-		return decisionLogStateDivergent
+	// F1 (final review MAJOR-1): the comparison is against the newest ANCHORED
+	// entry — an entry that exists but was never confirmed anchors nothing.
+	// The previous version compared against the newest entry regardless of its
+	// delivery state, so a record whose anchor dispatch FAILED (transient
+	// ENOSPC/permissions) and was never followed by new decisions read as
+	// `attested` forever — a false out-of-domain claim exactly in the
+	// forensic-critical silent-tail scenario (probe-reproduced).
+	anchoredPubID, anchoredDigest := int64(0), ""
+	haveAnchored := false
+	for _, ae := range st.latest {
+		if ae.State != anchorStateAnchored {
+			continue
+		}
+		if !haveAnchored || ae.PublicationID > anchoredPubID {
+			anchoredPubID, anchoredDigest = ae.PublicationID, ae.ManifestDigest
+			haveAnchored = true
+		}
+	}
+	if !haveAnchored {
+		return decisionLogStateNoAnchor
 	}
 	headSeq, headDigest, chainOK := walkDecisionChain(decisionLogPath(s.cfg.Dir))
 	if !chainOK {
 		// A broken link inside the chain is content tampering.
 		return decisionLogStateDivergent
 	}
-	if headSeq < e.PublicationID {
+	if headSeq < anchoredPubID {
 		// The head is a strict PREFIX of the anchored head: the tail was removed.
 		// A legal prefix compaction never lands here — it drops the oldest groups
 		// and leaves the head untouched (I6).
 		return decisionLogStateTruncated
 	}
-	if headSeq == e.PublicationID && headDigest != e.ManifestDigest {
+	if headSeq == anchoredPubID && headDigest != anchoredDigest {
 		// Same length, different content: the log was rewritten.
 		return decisionLogStateDivergent
 	}
-	// The chain is sound and its head is exactly the anchored head (or already
-	// longer, which the NEXT anchor entry covers).
+	if headSeq > anchoredPubID {
+		// Durable records BEYOND the witnessed point: their anchor dispatch has
+		// not been confirmed (transient failure — the sweep retries; or the
+		// dispatch permanently failed). Honest state: not attested, loudly
+		// named. The strict-equality rule (ADR-071 §3 ①) wins over the ADR-072
+		// relaxation — the relaxation's assumption (a newer anchor entry covers
+		// the gap) is exactly what failed here.
+		return decisionLogStatePendingAnchor
+	}
+	// The chain is sound and its head is exactly the anchored head.
 	return decisionLogStateAttested
 }
 
@@ -793,6 +841,16 @@ func (s *HistoryExportScheduler) fillDecisionAttest(row *anchorDeliveryStreamSta
 	if c.sink != nil {
 		dropped = c.sink.Dropped()
 	}
+	lossReadErr := ""
+	if c.sink != nil {
+		// F3: the sticky constructor-captured loss error — a corrupt counter
+		// must not read as zero (fail-open laundering). The persisted count is
+		// already INSIDE sink.dropped (the constructor loaded it), so no second
+		// read happens here: adding it again would double-count the losses.
+		if c.sink.lossErr != "" {
+			lossReadErr = c.sink.lossErr
+		}
+	}
 	row.DecisionQueueDropped = &dropped
 
 	anchoredHead := false
@@ -808,6 +866,10 @@ func (s *HistoryExportScheduler) fillDecisionAttest(row *anchorDeliveryStreamSta
 		anchoredHead &&
 		dropped == 0 &&
 		row.Error == "" &&
+		lossReadErr == "" &&
 		len(row.Conflicts) == 0
+	if lossReadErr != "" {
+		row.Error = strings.TrimSpace(row.Error + " " + lossReadErr)
+	}
 	row.DecisionAttested = &attested
 }
