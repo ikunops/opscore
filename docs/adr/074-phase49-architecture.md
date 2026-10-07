@@ -11,10 +11,10 @@
 | 文件 | 变更 | 内容 |
 |---|---|---|
 | `internal/controlplane/server/snapshot_anchor_realization.go` | **新增** | 兑现注册表（六行闭表）/ per-family 兑现索引 / 多态判别 / 与 P43 记账的区间匹配 / 状态面派生 |
-| `internal/controlplane/server/snapshot_anchor_realization_test.go` | **新增** | T317~T336 |
-| `internal/controlplane/server/history_export_scheduler.go` | **修改** | `witnessFamily`（`:1648-1665`）新增两个字段 `ArtifactDigest`（从账本记录取/重算摘要）与 `CompactionKind`；六族注册项（`:1670-1716`）各填 |
-| `internal/controlplane/server/mgmt_obs.go` | **修改** | 状态面新增 `anchor_realization` 组（**全 `omitempty`**，兑现面未启用时整组缺席 ⇒ 默认部署字节不变） |
+| `internal/controlplane/server/snapshot_anchor_realization_test.go` | **新增** | T317~T339 |
+| `internal/controlplane/server/history_export_scheduler.go` | **修改** | `witnessFamily`（`:1648-1665`）新增两个字段 `ArtifactDigest`（从账本记录取/重算摘要）与 `CompactionKind`；六族注册项（`:1670-1716`）各填；`Status()`（`:1520`）新增 `AnchorRealization` 组（全 `omitempty`，且与 `AnchorDelivery` 同受 `anchorEnabled()` 约束） |
 | `internal/controlplane/server/snapshot_anchor_delivery.go` | **修改** | **仅注释**（D11：`:90-92` 的「five-family」→「six-family」）；**代码零变更** |
+| `internal/controlplane/server/mgmt_obs.go` | **零 diff** | **实现时修正**：状态文档在 `history_export_scheduler.go:1520` 的 `Status()` 里装配，`mgmt_obs.go:814` 只是转发 ⇒ 该组加在文档真正被构造处，转发层零改动（第二轮评审 M3；原文误列此文件为「修改」） |
 | `snapshot_anchor.go` · `snapshot_witness_reconcile.go` · `snapshot_ledger.go` · `appendonly_log.go` · 冻结五文件 · `internal/protection/**` · 六族主账本实现 · `go.mod`/`go.sum` | **零 diff** | A2 承重承诺 |
 
 ## 2. 兑现注册表（六行闭表；第 6 行**委派**，见 §2.2）
@@ -56,29 +56,46 @@ type witnessFamily struct {
 
 - 该族的取数函数为 `nil`，本面对它报 **`anchor_realization_delegated`**（**族级取值，权威定义见 ADR-073 §3**），**绝不**报 `realized`/`unrealized`；
 - **闭表纪律**：注册表仍**恰好六行**（与 `witnessFamilyRegistry` 同构）——将来新增族时**必须**同时决定其兑现归属，不能静默漏判；T328 钉死「本面与 P48 面结论不冲突」。
+- **委派判定先于锚定侧 fail-closed gate**（I11，第二轮评审 M1）：`delegated` 在**加载锚定流之前**确定；委派族的锚定流加载失败/含冲突/含 unusable **都不改变**其取值，也**不**进入全局列表。锚定流仍被只读加载一次，`window`/`unusable` 仅作信息呈现。理由：本面已声明不对该族出判据 ⇒ 让一个「拒绝判定」的族去否决其余五族，是把委派变成隐性否决权。
 
 ## 3. 多态判别（A4/A5；本 Phase 的核心机制）
 
 ```
 realizeFamily(f witnessFamily, s *HistoryExportScheduler) familyRealization:
 
+  # ⓪ 委派判定必须最先（I11，第二轮评审 M1）：第六族的取值恒为 DELEGATED 且
+  #    不参与全局任何一步 ⇒ 本判定若排在锚定侧 fail-closed gate 之后，一条损坏的
+  #    判定锚定流就会把它变成 INDETERMINATE，并让一个本面明确拒绝判定的族
+  #    否决其余五族。
+  delegated := (f.ArtifactDigest == nil)
+  if delegated: verdict = DELEGATED          # 后续加载仅供信息（窗口/计数）
+
   # ① 锚定侧：加载（带 trust ⇒ unusable 可见，与 P46 的签名盲载不同）
   ast, err := loadAnchorStatePath(f.AnchorPath(dir), dir, s.trust)   // snapshot_anchor.go:480
-  if err != nil:                                    return INDETERMINATE(err)
+  if err != nil:                                    return INDETERMINATE(err)   # delegated ⇒ 保持 DELEGATED
+  if delegated:                                     return DELEGATED             # 冲突/unusable 不动摇本取值
   if len(ast.conflicts) > 0:                        return INDETERMINATE("conflicting anchor seq")
   if len(ast.unusable) > 0:                         return INDETERMINATE("anchor entry(ies) do not verify")
-  if f.ArtifactDigest == nil:                       return DELEGATED          # §2.2
 
-  # ② 账本侧：加载 + 建身份→摘要索引 + 取保留窗口 [Lmin, Lmax]
+  # ② 空锚定窗口无需读账本（I13，第二轮评审 M3）：ADR-073 §3 规定「锚定窗口为空
+  #    ⇒ anchor_nothing_assessed」。此判定必须在账本加载之前 —— 否则「无事可判」
+  #    的族会被一份它根本不需要的账本拖成 INDETERMINATE（无 KAK 的部署里
+  #    acceptance 账本 load 直接报错 ⇒ 整个兑现面永久 indeterminate）。
+  if len(ast.latest) == 0:                          return NOTHING_ASSESSED("anchor window is empty")
+
+  # ③ 账本侧：加载 + 建身份→摘要索引 + 取保留窗口 [Lmin, Lmax]
   lst, err := loadFamilyLedger(f)                   # 五族各自的既有 load
   if err != nil || lst.hasUnclassifiable || lst.hasConflict:
                                                     return INDETERMINATE(...)
+  # 本族自己的账本源未启用（I12，第二轮评审 M2）：没有窗口可比 ⇒ 每一条声明都
+  # 不可判（out_of_window，响亮），绝不因「源关掉了」而变成 unrealized。
+  if lst.unavailable:                               return NOTHING_ASSESSED(all rows = OUT_OF_WINDOW)
   idx, Lmin, Lmax := indexAndWindow(lst)
 
-  # ③ 记账侧：P43 的已完成压缩记录（区间表）
+  # ④ 记账侧：P43 的已完成压缩记录（区间表）
   acc := loadCompactionAccounting(s, f.CompactionKind)   # 未启用 ⇒ 空表
 
-  # ④ 逐条判决
+  # ⑤ 逐条判决
   for each usable anchor entry e in ast.latest (按 anchor_seq 升序):
       id, claim := f.identityAndClaim(e)
       if id <= 0:                                   INDETERMINATE("zero identity"); break
@@ -127,6 +144,8 @@ anchor_realization_claims := Σ_{f ∈ nonDelegatedFamilies} f.checked   # reali
 | 身份 > 账本上界 | `UNREALIZED` | 账本尾部被删而锚定条目仍在（P45 F2「无合法出口」同族：账本行先于锚定条目落盘，上界以上无合法来源） |
 | 身份在窗口内 ∧ 无该身份记录 | `UNREALIZED` | 窗口内缺席不可能由合法前缀压缩解释 |
 | 身份在窗口内 ∧ 摘要/内容字段不符 | `UNREALIZED` | 锚定条目的声明被它自己所声称的证据**否证** |
+| **本族账本源未启用**（load 因开关关闭而静默返回空态） | 全行 `OUT_OF_WINDOW` ⇒ 族级 `NOTHING_ASSESSED` | **没有窗口可比** ⇒ 不可判（I12）；**不是**尾部删除、**不是** `unrealized` |
+| **锚定窗口为空**（无任何可用锚定条目） | 族级 `NOTHING_ASSESSED`（**不读账本**） | ADR-073 §3「窗口为空 ⇒ `anchor_nothing_assessed`」（I13） |
 
 - **闭区间语义**：`from_seq ≤ id ≤ to_seq`（`destructionTarget`，`snapshot_destruction.go:109-111`；构造点 `:1391`）。
 - **只认 `completed`**：`intended` / `aborted` 的记录**不**记账（`snapshot_destruction.go:75-78`；状态机函数 `:797`/`:811` 的 `completeDestruction`，观察者完成回调 `:1400-1410`）。
@@ -179,6 +198,9 @@ anchor_realization = {
 | I8 | **fail-closed + 族间隔离**：锚定流或账本侧任一不可分类行 / 冲突 seq / load 失败 ⇒ 该族 `indeterminate`、整族不判、响亮报错，**其余族取值不受影响**（T324） |
 | I9 | **verification 族的摘要重算必须走 `reportDigest`（7 字段）**，不得用 `verificationEntryDigest`（11 字段）——两套规范序列化不同（T325） |
 | I10 | **闭表 + 委派显式**：兑现注册表恰六行；`protection_decision` 行委派（`nil` 取数 ⇒ `delegated`），本面对它**不产出** `realized`/`unrealized`；与 P48 面结论不冲突（T328） |
+| I11 | **委派先于一切 gate（第二轮评审 M1）**：委派判定在**锚定流加载之前**完成；委派族**恒为 `delegated`**，一条损坏的判定锚定流（不可分类行 / 冲突 / 验签失败）**不得**使它变 `indeterminate`，也**不得**使它进入 `anchor_realization_indeterminate_families` 或移动全局标量。委派族的锚定流仍被**只读加载一次**，其 `window`/`unusable` 仅作信息呈现（T337） |
+| I12 | **账本源未启用 ≠ 空窗口（第二轮评审 M2）**：某族**自己的**主账本来源未启用时，该族**没有**可比对的窗口 ⇒ 逐条 `out_of_window`（不可判、响亮）、族级 `nothing_assessed`；**绝不**因「源关掉了」而判 `unrealized`（ADR-073 A8-② 的直接落地）。判别支点是**显式询问该族的启用开关**，而不是把静默空态读成「窗口 (0,0)」（T338） |
+| I13 | **空锚定窗口无需读账本（第二轮评审 M3）**：`len(ast.latest) == 0` ⇒ 族级 `anchor_nothing_assessed`，**在账本加载之前**返回。ADR-073 §3 的「窗口为空 ⇒ nothing_assessed」由此不被账本侧 fail-closed 覆盖；否则无 KAK 部署（acceptance 账本 load 报错）会把兑现面永久钉成 `indeterminate`（T339） |
 
 ## 6. 实现步骤（每步跑门禁）
 
@@ -195,7 +217,11 @@ anchor_realization = {
 
 ## 7. 测试映射
 
-T317→I1；T318→I3；T319→§3.2（新增机制 vs P46/P47 沉默，含 A-3 持导出私钥分支）；T320→§3.1（摘要/内容字段不符）；T321→§3.1（尾部删除）；T322→I6（合法压缩不误报）；T323→I7（不可判响亮）；T324→I8；T325→I9；T326→I5；T327→§2.1（`ledger` 族空泛，如实登记）；T328→I10（委派，与 P48 不冲突）；T329→I8（unusable 不得变绿）；T330→I4；T331→I2；T332→I6（三态判别）；T333→§3.1（身份边界四态）；T334→§3.1（闭区间 + `completed` + `kind`）；T335→I8（畸形输入不 panic）；T336→MU1~MU6（MU1 摘「重算摘要比对」⇒ T319/T320 必红；MU2 把 `out_of_window` 并入 `unrealized` ⇒ T323/T332 必红；MU3 摘 fail-closed ⇒ T324 必红；MU4 用 `verificationEntryDigest` 替代重算 `reportDigest` ⇒ T325 必红；MU5 摘 `ledger` 族空泛声明 ⇒ T327 必红；MU6 让读面产生副作用 ⇒ T330 必红）。
+T317→I1；T318→I3；T319→§3.2（新增机制 vs P46/P47 沉默，含 A-3 持导出私钥分支）；T320→§3.1（摘要/内容字段不符）；T321→§3.1（尾部删除）；T322→I6（合法压缩不误报）；T323→I7（不可判响亮）；T324→I8；T325→I9；T326→I5；T327→§2.1（`ledger` 族空泛，如实登记）；T328→I10（委派，与 P48 不冲突）；T329→I8（unusable 不得变绿）；T330→I4；T331→I2；T332→I6（三态判别）；T333→§3.1（身份边界四态）；T334→§3.1（闭区间 + `completed` + `kind`）；T335→I8（畸形输入不 panic）；T336→MU1~MU9。
+
+**第二轮（实现轮对抗评审）新增**：T337→I11（委派族不因损坏的判定锚定流变 `indeterminate`，且不动摇其余五族）；T338→I12（本族账本源关闭 ⇒ 逐条 `out_of_window`、族级 `nothing_assessed`，**绝不** `unrealized`）；T339→I13（空锚定窗口不读账本，无 KAK 部署不得永久 `indeterminate`）；T336→MU7/MU8/MU9（三条变异各自对上 T337/T338/T339，sha256 还原）。
+
+**注（T335 修正）**：「主账本含非法 JSON」子用例原先在一个**没有任何锚定声明**的族上断言 `indeterminate` —— 按 I13 该族正确地是 `nothing_assessed`（账本根本不需要被读）。用例改为**先播下一条真实声明**再污染账本，断言语义（畸形账本 + 有声明可核对 ⇒ `indeterminate`）不变。
 
 ## 8. 容量与成本（诚实声明）
 
@@ -206,3 +232,19 @@ T317→I1；T318→I3；T319→§3.2（新增机制 vs P46/P47 沉默，含 A-3 
 - **依赖销毁面（A8-②）**：销毁面关闭时，下界以下一律 `out_of_window`；本 Phase **不**因此降级判据强度，只如实报"不可判"。
 - **空泛边界（A8-①）**：`ledger` 族对本 Phase 的主对手（持导出私钥者）**空泛**——如实声明并 T327 钉住；该族由 P38/P39 链 + P40 对账承担。
 - **上界（A8-④）**：兑现只证明"载体所声称的证据产物存在且摘要一致"，**不**证明证据产物的内容为真；**A-3 的持 VAK 私钥分支原样保留**（A7-⑧）。
+
+## 9. 评审闭合表（第二轮：实现轮对抗评审，3 项 major）
+
+> 第一轮评审（Scope/Architecture 文本）的 M1~M3 已在 ADR-073 §10 闭合。**第二轮**由独立评审者对**实现** `353286a` 做对抗检查，发现**三处同源缺陷**：三处都不是「读面画错」，而是**判定的先后顺序**让一类输入落到错误的分支上。三条都已修（同一提交）、各有回归用例、各有变异体（MU7/MU8/MU9），并全部做了 sha256 还原。
+
+| 发现 | 级别 | 闭合 |
+|---|---|---|
+| **M1** `protection_decision` 的委派判定排在锚定侧 fail-closed gate **之后**：一条损坏的判定锚定流（不可分类行 / 冲突 seq / 验签失败）⇒ 该族 `indeterminate` ⇒ 进入 `anchor_realization_indeterminate_families` ⇒ **全局标量被一个本面明确拒绝判定的族拖成 `indeterminate`**（ADR-073 §3 与 I10 都写「恒为 delegated」「不参与任何一步」；两处 ADR 与实现不一致） | major | 委派判定**上移到最前**（I11 / §2.2 / §3 伪码 ⓪）：`delegated` 在加载锚定流之前确定，加载失败/冲突/unusable 均不改变取值；锚定流仍只读加载一次，`window`/`unusable` 仅作信息呈现。**T337**（`delegated` 保持 + 不进两个列表 + 全局标量不变 + **其余五族逐字节不变**的隔离断言）；**MU7** 必红 |
+| **M2** 某族**自己的**账本源未启用时，`loadFamilyLedger` 收到的是**静默空态**（`loadDestructionState` 在 `!c.enabled()` 时 `return st, nil`）⇒ 零值被读成窗口 `(0,0)` ⇒ 每条锚定条目落进 `id > maxSeq` 分支 ⇒ **判 `unrealized`**。可达路径是一次完全正常的配置变更：先开着 `--export-destruction-log` 写下销毁锚定条目，重启时关掉该开关 —— 锚定流与销毁账本都还在盘上，只有开关变了，而读者会指控「尾部被删」 | major | **显式询问该族启用开关**后再决定「空 = 没有窗口可比」（I12）：新增第三轴 `familyLedgerView.unavailable`，未启用 ⇒ 逐条 `out_of_window`、族级 `nothing_assessed`、带响亮 reason，**绝不** `unrealized`（ADR-073 A8-② 的直接落地）。**T338**（同一 dir 上以 `DestructionLog=false` 重建调度器）；**MU8** 必红。**审计口径**：只有 destruction 族会静默空（其 load 有开关闸门）；key_lifecycle / verification / acceptance / chain-ledger 的 load **无条件读盘**（本轮逐文件核实），所以「关掉开关」不会隐藏盘上已有的日志 |
+| **M3** 账本加载排在**空锚定窗口**之前 ⇒ 一个**没有任何锚定声明**的族仍会去读账本，而账本侧的 fail-closed 会把族判成 `indeterminate`。可达性：无 `--key-authority-path` 的部署里 acceptance 账本 load 直接返回错误 ⇒ **整个兑现面永久 `indeterminate`**，尽管该部署从未锚定过任何 acceptance 声明。ADR-073 §3 明写「该族锚定窗口为空 ⇒ `anchor_nothing_assessed`」 | major | 新增「**空窗口不读账本**」早退（I13 / §3 伪码 ②），排在冲突/unusable gate **之后**（坏声明仍响亮）、账本加载**之前**。**T339**（无 KAK 部署：acceptance 为 `nothing_assessed`、不进 indeterminate 列表、全局标量非 `indeterminate`）；**MU9** 必红。**顺带修正 T335**「主账本含非法 JSON」子用例：原用例在**无声明**的族上断言 `indeterminate`（按 I13 应为 `nothing_assessed`），改为先播下真实声明再污染账本 |
+
+**另有两项轻量修正（不构成 major）**：
+- **ADR-074 §1 文件清单**把 `mgmt_obs.go` 列为「修改」，实现里它是**零 diff**（状态文档在 `history_export_scheduler.go` 的 `Status()` 装配，`mgmt_obs.go` 只转发）⇒ §1 已改正（实现轮提交信息亦如实声明该偏离）。
+- **T317 由「扫描 Phase 49 关键词」升级为「冻结面 + `go.mod`/`go.sum` 逐文件 sha256 钉死」**：原用例看不见一次与 Phase 49 无关的重写，而「零 diff」是关于**字节**的断言。冻结面永不合法变更，故哈希不匹配即违规。
+
+**未闭合 / 已知保留（如实登记）**：`ledger` 族对持导出私钥者**空泛**（同钥，A8-①）——本 Phase 不掩盖，T327 钉住；A-3 的**持 VAK/KAK 私钥**分支原样保留（A7-⑧）；逃逸「连锚定流带销毁账本一起删」⇒ 本地不可判（P42/P41 同族）。**评审未发现**判据取值、冻结面、注册表族数、路由、默认部署字节等方面的偏差，`internal/protection` 与 `go.mod`/`go.sum` 零 diff 均经独立核对。
