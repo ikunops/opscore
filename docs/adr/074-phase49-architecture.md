@@ -54,7 +54,7 @@ type witnessFamily struct {
 
 `protection_decision` 族的兑现**不由本面判定**：P48 的本地重算（ADR-072 §3.3，`snapshot_decision_attest.go:756-824` 的 `decisionLogStateAt`）产出的是**严格更强**的判据（重走链 + 链头比对），本面的朴素形式（"链头 seq 的记录摘要 == 锚定摘要"）是它的真子集。故：
 
-- 该族的取数函数为 `nil`，本面对它报 **`anchor_realization_delegated`**（第 6 个取值），**绝不**报 `realized`/`unrealized`；
+- 该族的取数函数为 `nil`，本面对它报 **`anchor_realization_delegated`**（**族级取值，权威定义见 ADR-073 §3**），**绝不**报 `realized`/`unrealized`；
 - **闭表纪律**：注册表仍**恰好六行**（与 `witnessFamilyRegistry` 同构）——将来新增族时**必须**同时决定其兑现归属，不能静默漏判；T328 钉死「本面与 P48 面结论不冲突」。
 
 ## 3. 多态判别（A4/A5；本 Phase 的核心机制）
@@ -97,10 +97,25 @@ realizeFamily(f witnessFamily, s *HistoryExportScheduler) familyRealization:
           else:                 row = REALIZED
       rows = append(rows, row)
 
-  if any row == INDETERMINATE:   family = INDETERMINATE
-  else if any row == UNREALIZED: family = UNREALIZED
-  else if len(rows) == 0:        family = NO_ANCHORS        # 空窗口：不判 realized
-  else:                          family = REALIZED
+  # 族级：全序首个命中（ADR-073 §3 为准）
+  if any row == INDETERMINATE:      family = INDETERMINATE
+  else if any row == UNREALIZED:    family = UNREALIZED
+  else if any row == REALIZED:      family = REALIZED       # 至少一行被真正核对且逐字节相等
+  else:                             family = NOTHING_ASSESSED
+                                    # 行全为 COMPACTED/OUT_OF_WINDOW，或 rows 为空：
+                                    # 本族没有任何一条声明被实际核对 ⇒ 绝不判 REALIZED
+```
+
+```
+# 全局：标量、全序首个命中（ADR-073 §3；**不是合取**）
+state = NOTHING_ASSESSED
+if     ∃ f ∈ nonDelegatedFamilies: f.verdict == INDETERMINATE:  state = INDETERMINATE
+else if ∃ f ∈ nonDelegatedFamilies: f.verdict == UNREALIZED:    state = UNREALIZED
+else if ∃ f ∈ nonDelegatedFamilies: f.verdict == REALIZED:      state = REALIZED
+# 否则 state 保持 NOTHING_ASSESSED（全部非委派族皆 NOTHING_ASSESSED）
+# protection_decision（delegated）不参与以上任何一步
+anchor_realized          := (state == REALIZED)              # 派生便捷量，不得另行定义
+anchor_realization_claims := Σ_{f ∈ nonDelegatedFamilies} f.checked   # realized ⇒ claims > 0
 ```
 
 ### 3.1 三态判别支点（A4，承重）
@@ -116,7 +131,7 @@ realizeFamily(f witnessFamily, s *HistoryExportScheduler) familyRealization:
 - **闭区间语义**：`from_seq ≤ id ≤ to_seq`（`destructionTarget`，`snapshot_destruction.go:109-111`；构造点 `:1391`）。
 - **只认 `completed`**：`intended` / `aborted` 的记录**不**记账（`snapshot_destruction.go:75-78`；状态机函数 `:797`/`:811` 的 `completeDestruction`，观察者完成回调 `:1400-1410`）。
 - **`kind` 必须相符**：`acc` 只收 `kind == f.CompactionKind` 的记录（`:731-738` 的 `destructionKinds` 闭集）。
-- **`NoAnchors`**：锚定窗口为空时**绝不**报 `realized`（空集不构成"全部兑现"）。
+- **`NOTHING_ASSESSED`**：锚定窗口为空、**或**所有行皆为 `COMPACTED`/`OUT_OF_WINDOW`（没有一条被真正核对）时**绝不**报 `REALIZED`（空集不构成「全部兑现」；ADR-073 §3 族级第 ④ 步）。
 
 ### 3.2 与 P46 / P47 / P43 的分工（不可混写）
 
@@ -131,18 +146,23 @@ realizeFamily(f witnessFamily, s *HistoryExportScheduler) familyRealization:
 
 ```
 anchor_realization = {
-  <family>: {
-    verdict,                    // realized | unrealized | indeterminate | no_anchors | delegated
-    checked, realized, compacted, out_of_window, unrealized,   // 计数
-    reason?,                    // indeterminate / out_of_window 的响亮原因
+  <family>: {                   // 六行，闭表（与 witnessFamilyRegistry 同构）
+    verdict,                    // realized | unrealized | indeterminate | nothing_assessed | delegated
+    checked, realized, compacted, out_of_window, unrealized, unusable,   // 计数
+    reason?,                    // indeterminate / nothing_assessed 的响亮原因
     window: { min_seq, max_seq, entries }   // 该族锚定窗口（沿用 P46 词汇）
   }, ...
-  anchor_realized: <bool>       // 全部「非委派且非空」的族皆 realized
+  anchor_realization_state,     // 标量，全序首个命中（ADR-073 §3）：
+                                // indeterminate | unrealized | realized | nothing_assessed
+  anchor_realized: <bool>,      // 派生：state == "realized"（不得另行定义）
+  anchor_realization_claims: <int>,                    // 非委派族 checked 之和；realized ⇒ > 0
+  anchor_realization_unrealized_families:    [<family>...],
+  anchor_realization_indeterminate_families: [<family>...]
 }
 ```
 
-- **`anchor_realized` 是全局合取**：任一**非委派**族为 `unrealized`/`indeterminate`/`no_anchors` ⇒ 假；`delegated` 族**不参与**该合取（§2.2）。
-- **不可判必须响亮**（A5）：`indeterminate` 与 `out_of_window` 的族**必须**带 `reason`，且计数同面给出——「不可判」绝不呈现为「没问题」。
+- **`anchor_realized` 不是合取**：它只是 `anchor_realization_state` 的**派生 bool**，而 `anchor_realization_state` 是**全序首个命中的标量**——定义**唯一**在 ADR-073 §3，本文件不得另立（评审 M1）。`delegated` 族**不参与**；`nothing_assessed` 族**既不使** state 变 `realized`（⇒ 空集不为真），**也不**使它变 `unrealized`（「没有声明」与「声明未被兑现」必须分开）。
+- **不可判必须响亮**（A5）：`indeterminate` 与 `nothing_assessed` 的族**必须**带 `reason`，且计数同面给出——「不可判」绝不呈现为「没问题」。
 - 读面**只读**：`os.Stat` + 既有 load + 一次销毁账本读；不落盘、不写 audit、不发网络、不派发、不压缩（T330）。
 
 ## 5. 不变量（I1~I10）
@@ -153,9 +173,9 @@ anchor_realization = {
 | I2 | **零新族 / 零新写入路径 / 零新路由 / 零新常驻组件**：注册表仍 6 族、分区表仍 6 流、`deliverySweepStreams()` 仍 4 条；既有枚举用例取值不变（T331） |
 | I3 | **默认部署零回归**：兑现面未启用 ⇒ 状态文档逐字节不变（T318） |
 | I4 | **零副作用**：读面不落盘、不写 audit、不发网络、不派发、不压缩（T330） |
-| I5 | **判据非空泛**：`realized` 必须由「**重算/取摘要后逐字节相等**」产出，**不得**由「没找到反例」产出；空窗口 ⇒ `no_anchors`，**不是** `realized`（T326） |
+| I5 | **判据非空泛**：`realized` 必须由「**重算/取摘要后逐字节相等**」产出，**不得**由「没找到反例」产出；族级 `nothing_assessed`（空窗口，或行全为 `compacted`/`out_of_window`）**不是** `realized`；全局 `anchor_realized` **蕴含** `anchor_realization_claims > 0`（T326） |
 | I6 | **两种「记录变少」严格分离**：合法前缀压缩（P43 记账 ⇒ `compacted`）vs 尾部删除/伪造（⇒ `unrealized`）；判别支点 = **身份是否落在账本窗口内 ∧ 是否有已完成的该族压缩记录覆盖**（T322/T332） |
-| I7 | **不可判绝不洗白**：`out_of_window` / `indeterminate` 绝不并入 `realized`；必须带原因与计数（T323/T324） |
+| I7 | **不可判绝不洗白**：`out_of_window` / `nothing_assessed` / `indeterminate` 绝不并入 `realized`；必须带原因与计数（T323/T324/T326） |
 | I8 | **fail-closed + 族间隔离**：锚定流或账本侧任一不可分类行 / 冲突 seq / load 失败 ⇒ 该族 `indeterminate`、整族不判、响亮报错，**其余族取值不受影响**（T324） |
 | I9 | **verification 族的摘要重算必须走 `reportDigest`（7 字段）**，不得用 `verificationEntryDigest`（11 字段）——两套规范序列化不同（T325） |
 | I10 | **闭表 + 委派显式**：兑现注册表恰六行；`protection_decision` 行委派（`nil` 取数 ⇒ `delegated`），本面对它**不产出** `realized`/`unrealized`；与 P48 面结论不冲突（T328） |

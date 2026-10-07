@@ -22,7 +22,12 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
    - acceptance：`:1098-1100` `AcceptanceSeq: e.EntrySeq` / `AcceptanceDigest: e.EntryDigest` / `AcceptanceRecordSeq: e.RecordSeq`
    - verification：`snapshot_verification.go:1330` `dg, derr := reportDigest(r)` → `:1337` `ReportDigest: dg`（`reportDigest` 定义 `:277-283`）
    - publication：`snapshot_anchor.go:1561-1572` `entryForAnchor` → `ManifestDigest = ledgerDigestOf(m)`
-2. **锚定条目的验签只回答「谁签的」，不回答「签的是什么」**：`verifyAnchorEntrySignature`（`snapshot_anchor.go:379-411`）只做 P37 决定序 + stream 绑定（`:395-401`）+ Ed25519 验签（`:407-409`）；`loadAnchorStatePath`（`:480-536`）只做分类 / 冲突（`:500-512`）/ 验签（`:522-535`）。**全仓对锚定条目摘要字段的消费只有「写入」没有「核对」**——本轮亲跑 `grep -rn "ReportDigest\|EventDigest\|DestructionDigest\|AcceptanceDigest" internal/controlplane/server/*.go | grep -v _test | grep -v snapshot_anchor.go`：只命中 `snapshot_verification.go:1337`（写入）与 `mgmt_obs.go:1178`（读的是**账本行**的 `EventDigest`，不是锚定条目的）。
+2. **锚定条目的验签只回答「谁签的」，不回答「签的是什么」**：`verifyAnchorEntrySignature`（`snapshot_anchor.go:379-411`）只做 P37 决定序 + stream 绑定（`:395-401`）+ Ed25519 验签（`:407-409`）；`loadAnchorStatePath`（`:480-536`）只做分类 / 冲突（`:500-512`）/ 验签（`:522-535`）。**全仓对锚定条目摘要字段的消费只有「写入」没有「核对」**。本轮亲跑两条命令，**逐行如实列出**（评审 M3 修正：原文只报了其中两行，属证据陈述不实）：
+
+- `grep -rn "ReportDigest\|EventDigest\|DestructionDigest\|AcceptanceDigest" internal/controlplane/server/*.go | grep -v _test | grep -v snapshot_anchor.go` ⇒ **16 行**。逐行归类：`snapshot_verification.go:1337` 是**锚定条目的写入**（`:1330` 的 `reportDigest(r)`）；`mgmt_obs.go:1178` 读的是 **`keyLifecycleEntry` 账本行**的 `EventDigest`；其余 **14 行**（`snapshot_key_lifecycle.go:109/110/127/142/157/158/357/358/368/380/704/723/725/729`）**全部是 `keyLifecycleEntry` 自己的账本字段**（结构体定义 / 规范序列化 / load 自校验 / 链头推进）——**与锚定条目无关**。
+- `grep -rn "\.ReportDigest\|\.DestructionDigest\|\.AcceptanceDigest" internal/controlplane/server/*.go | grep -v _test` ⇒ **恰 3 行**，全部在 `snapshot_anchor.go:193/196/201` 的 `anchorSignedFields`（**签名覆盖区的规范 payload 构造**）。**没有任何一处把它们与账本记录比对。**
+
+⇒ 结论（不因 M3 而变，但表述精确化）：锚定条目的 `ReportDigest`/`DestructionDigest`/`AcceptanceDigest` **全仓只被签名路径读、从无核对**；`ManifestDigest`/`EventDigest` 的读者只有事实 5/6 那两处，且都不是核对。
 3. **P46 的对账看不到主账本内容**：`snapshot_witness_reconcile.go:175` 的 `ledgerAbsent := !witnessFilePresent(f.LedgerPath(dir))` 与 `:384` 同为**存在性探针**；`:244-282` 的三段式窗口比对的是 `digestOfLocalAnchor(&e)`（**本地锚定条目**）与 `items[i].AnchorDigest`（**witness 投影**）。⇒ **P46 是「锚定条目 ↔ 域外副本」，不是「锚定条目 ↔ 证据产物」**。（与 P48 ADR-071 §2 评审 M1 逐字同源——P48 只把这条盲区在**判定族**上补了。）
 4. **P47 的投递面与内容无关**：`snapshot_anchor_delivery.go:93-148` 的分区表与 `:386` 的状态面（`:349` 的 `Converged` 字段）只处理 `state/attempts/conflicts/converged/swept_by`——一条内容为假的锚定条目，只要被派发成功，`converged` 照真。
 5. **P43 的销毁面对锚定条目只读 publication 族，且把它的声明当真**：`snapshot_destruction.go:1251-1266` 的 `knownPublications` 遍历 `as.latest`，`e.Kind != anchorKindPublication` 即跳过（`:1256-1258`），且 `out[id] = knownPublication{id: id, digest: e.ManifestDigest}`（`:1263`）——**锚定条目的摘要被采信为「曾存在过的出版物的摘要」，从未被核对**。
@@ -43,12 +48,24 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 |---|---|---|
 | **`anchor_realized`** | 该族锚定窗口内**每一条可用（验签通过）锚定条目**所声称的证据都被该族**主账本**中的一条记录兑现（身份相同 ∧ 该族声明的全部内容字段相同 ∧ 摘要按该族**规范摘要函数重算**后逐字节相等）；**或**其缺席被一条**已完成**的 P43 销毁记录记账（`kind` = 该族 compaction kind ∧ `from_seq ≤ 身份 ≤ to_seq`）；且该族非 indeterminate ∧ 无 unusable 条目 | **载体所声称锚定的证据真实存在**——此前给不出的判据（§2 悖论） |
 | **`anchor_unrealized`** | 存在一条可用锚定条目，其声称的证据在**主账本保留窗口内**找不到兑现（窗口内无该身份的记录 ∧ 无摘要相符的记录 ∧ 身份高于窗口上界），且不被任何已完成的销毁记录记账 | 锚定条目是**无凭据的断言**：载体说某证据存在，而它不存在、也没人记账。**P46/P47/P43 对此全绿** |
-| **`anchor_realization_indeterminate`** | 该族锚定流含不可分类行 / 冲突 seq（`loadAnchorStatePath:500-512`），或该族主账本 load 失败 / 含不可分类行 / 冲突 seq | **fail-closed**：该族**整条不判**、响亮报错、**绝不**报 `anchor_realized`；**族间隔离**（其余族不受影响） |
+| **`anchor_realization_indeterminate`** | 该族锚定流含不可分类行 / 冲突 seq（`loadAnchorStatePath:500-512`）/ **含验签不通过的条目（unusable）**，或该族主账本 load 失败 / 含不可分类行 / 冲突 seq | **fail-closed**：该族**整条不判**、响亮报错、**绝不**报 `anchor_realized`；**族间隔离**（其余族不受影响）。**unusable 条目必须有落点**（评审 M2）：不得因「不可用就不看」而变绿 |
 | **`anchor_compacted`** | 条目身份**低于**主账本保留下界，且被一条已完成的该族销毁记录覆盖 | 前缀被**合法**裁掉（P43 记账）——**不是** unrealized |
 | **`anchor_out_of_window`** | 条目身份**低于**主账本保留下界，且**无**销毁记录覆盖（销毁面未启用 / 未记账） | **不可判**，如实报出（沿用 P46 `:245-248` 的「no assertion, no waiver, silence」纪律），**绝不**算 realized 也**绝不**算 unrealized |
+| **`anchor_nothing_assessed`**（族级） | 该族**没有任何一行**被判为 realized，且也无 unrealized/indeterminate（行全为 `anchor_compacted`/`anchor_out_of_window`，**或**该族锚定窗口为空） | **本族在本次读中没有一条声明被实际核对**——如实报出，**绝不**报 realized（空集不构成「全部兑现」） |
+| **`anchor_realization_delegated`**（族级） | 该族 = `protection_decision`（P48 哈希链，无签名；其兑现判据由 P48 本地重算产出，本 Phase 不重复，T328） | 本面对该族**不产出** `anchor_realized`/`anchor_unrealized`；**闭表纪律**：注册表恰六行，新增族必须同时决定兑现归属，不得静默漏判 |
 | `family_intact` / `family_incomplete` / `family_ledger_deleted` / `family_ledger_truncated` / `family_divergent` | **逐字复用 P46** | 不变 |
 | `pending` / `anchored` / `unanchored` / `pending_retryable` / `converged` / `swept_by` | **逐字复用 P47** | 不变 |
 | `accounted` / `unaccounted_disappearance` / `destruction_*` | **逐字复用 P43** | 不变（本 Phase 只**读**销毁记录做记账匹配） |
+
+**族级与全局取值的权威定义（Scope 为准；Architecture 不得另立，评审 M1/M2 闭合）**：
+
+- **行级**（每条锚定条目，5 值）：`realized` / `compacted` / `out_of_window` / `unrealized` / `indeterminate`。
+- **族级**（每族一个值，**全序首个命中**）：① 任一行 `indeterminate` ⇒ `indeterminate`；② 否则任一行 `unrealized` ⇒ `unrealized`；③ 否则**至少一行** `realized` ⇒ `realized`；④ 否则 ⇒ `anchor_nothing_assessed`。`protection_decision` 族恒为 `anchor_realization_delegated`。
+- **全局** `anchor_realization_state`（**标量**，全序首个命中，**不是合取**）：① 任一**非委派**族 `indeterminate` ⇒ `indeterminate`；② 否则任一非委派族 `unrealized` ⇒ `unrealized`；③ 否则任一非委派族 `realized` ⇒ `realized`；④ 否则（全部非委派族皆 `anchor_nothing_assessed`）⇒ `nothing_assessed`。**`delegated` 族不参与以上任何一步。**
+- `anchor_realized`（bool）**只是派生便捷量**：`anchor_realized := (anchor_realization_state == "realized")`——**不得另行定义**。⇒「空集为真」在本定义下**不可能**（第 ④ 步给出 `nothing_assessed`，而不是 `realized`）。
+- **命名边界（消歧）**：**行级/族级**取值不加 `anchor_` 前缀（`realized` / `unrealized` / `indeterminate` / `compacted` / `out_of_window` / `nothing_assessed` / `delegated`）；带 `anchor_` 前缀的 `anchor_realized` / `anchor_realization_state` / `anchor_realization_claims` 是**全局字段**。上表 `anchor_realized` 一行的条件是**该族**的 realized 条件；**全局**语义以本段第 ③④ 条为准。
+- `anchor_realization_claims`（int）= 各非委派族 `checked` 之和 = **本次读实际核对了多少条声明**——非空泛性的见证量；`anchor_realized == true` **蕴含** `claims > 0`。
+- 三态判别、区间记账匹配、fail-closed 与零副作用的机制细节见 **ADR-074 §3**。
 
 **核心红例（此前给不出的端到端判据）**：持导出私钥者向 `verification-anchor.jsonl` 追加一条 `kind=verification` / `Overall=attested` / `ReportDigest=<任意>` 的锚定条目（导出钥签名合法）并照常派发 ⇒ 今天：P37 验签 OK、P46 `family_intact`、P47 `converged`、P43/P42 面无异常 —— **全绿**；本 Phase 后：`anchor_unrealized` ∧ `anchor_realized == false`，**同一用例显式断言 P46 仍报 `family_intact` ∧ P47 仍报 `converged`**（证明这是新增机制，不是复用）。**这条同时闭合 A-3 的「持导出私钥」分支**（该对手造不出 VAK 签名的验证账本行来兑现它）。
 
@@ -102,7 +119,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | T323 | **不可判响亮（A5）**：销毁面**关闭** + 前缀缺席 ⇒ `anchor_out_of_window`（**不是** unrealized、**不是** realized），读面同面给出计数与原因 |
 | T324 | **fail-closed 与族间隔离（A3/A5）**：锚定流含不可分类行 / 冲突 seq，或主账本 load 失败 / 含不可分类行 / 冲突 seq ⇒ 该族 `anchor_realization_indeterminate`、整条不判、响亮报错，**其余族取值不受影响**，**绝不**报 realized |
 | T325 | **各族摘要重算正确性（A1）**：lifecycle/destruction/acceptance 的锚定摘要 == 账本行摘要（直拷路径）；**verification 必须从账本行重算 `reportDigest`（7 字段）**并等于锚定条目的 `ReportDigest`，且**不**等于 `verificationEntryDigest`（11 字段）——两套规范序列化的判别 |
-| T326 | **`anchor_realized` 成立（非空泛）**：正常 tick + 各族兑现完整 ⇒ true；且**至少一条**条目被判为「重算摘要逐字节相等」（判据来源是**重算比对**，不是「没找到反例」） |
+| T326 | **`anchor_realized` 成立（非空泛）与空集不为真（评审 M1）**：(a) 正常 tick + **至少一族**有锚定条目且全部兑现 ⇒ `anchor_realization_state == "realized"` ∧ `anchor_realized == true` ∧ `anchor_realization_claims > 0` ∧ **至少一条**条目被判为「重算摘要逐字节相等」（判据来源是**重算比对**，不是「没找到反例」）；(b) 全部非委派族的锚定窗口皆为空（或行全为 compacted/out_of_window）⇒ `state == "nothing_assessed"` ∧ `anchor_realized == false` ∧ `claims == 0`——**空集绝不判真** |
 | T327 | **`ledger` 族空泛声明（A8-①）**：同钥构造（导出钥伪造账本行 + 锚定条目）⇒ 本面报 realized ⇒ **用例断言并登记该空泛性**（不夸大） |
 | T328 | **`protection_decision` 族不重复（§3 表）**：该族兑现判据由 P48 本地重算产出，本 Phase 不重复；用例断言两面结论不冲突 |
 | T329 | **unusable 条目（A3）**：锚定流中验签失败的条目 ⇒ 计入 unusable、该族**不**报 realized（不得因「不可用就不看」而变绿） |
@@ -148,6 +165,10 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 
 ⇒ **判断**：存在且**仅存在一个**符合 R210 尺子的候选（①）。②被「不解决 A-3 且更重」降序；③④⑤⑥⑦被同一把尺子击倒；⑧属既有维度加固。
 
-## 10. 评审闭合表（第一轮）
+## 10. 评审闭合表（第一轮，3 项 major）
 
-（首轮起草，待独立评审回填。）
+| 发现 | 级别 | 闭合 |
+|---|---|---|
+| **M1** 全局 `anchor_realized` 语义自相矛盾（074 的 JSON 注释写「非委派且非空」，紧接的正文写「任一非委派族 `no_anchors` ⇒ 假」）；两种读法在「某族本次 tick 无锚定条目」下结论相反，而 T326 要求「各族兑现完整 ⇒ true」，按正文读法多数部署不可达 | major | ① 全局取值由**合取**改为**标量 `anchor_realization_state`（全序首个命中）**，`anchor_realized` 降为**派生 bool**，定义**唯一**在 **ADR-073 §3**；② 删去 `no_anchors` 族级取值，改为 **`anchor_nothing_assessed`**（族级第 ④ 步）——空集**既不**判真、**也不**判 unrealized；③ **T326 重写**为 (a) 至少一族有声明且全兑现 ⇒ `state == "realized"` ∧ `anchor_realized` ∧ `claims > 0`、(b) 全部非委派族无声明 ⇒ `state == "nothing_assessed"` ∧ `anchor_realized == false` ∧ `claims == 0`——可达、非空泛、且「空集为真」不可能 |
+| **M2** Scope 与 Architecture 的判据集合不一致：074 单方面引入 073 从未定义的 `anchor_realization_delegated`、`no_anchors` 与全局合取；且 073 的 `anchor_realization_indeterminate` 行未给 unusable 条目落点 | major | ① 两个族级取值（`anchor_nothing_assessed` 取代 `no_anchors`；`anchor_realization_delegated`）**写入 073 §3 闭表**，并在 073 §3 新增「**族级与全局取值的权威定义**」段（含命名边界消歧）；② 073 的 `anchor_realization_indeterminate` 行条件**显式加入 unusable 条目**；③ 074 全文改为**引用** 073 §3（§2.2 / §3 伪码 / §4 状态面 / I5 / I7 同步），不再另立任何取值 |
+| **M3** 073 §2 事实 2 的「本轮亲跑」证据陈述与实况不符（声称只命中 2 行，实跑 16 行） | major | 该段**重写**为两条命令的**逐行如实归类**：主命令 **16 行** = 1 行锚定条目写入（`snapshot_verification.go:1337`）+ 1 行读**账本行**字段（`mgmt_obs.go:1178`）+ **14 行** `keyLifecycleEntry` 自有账本字段（`snapshot_key_lifecycle.go:109/110/127/142/157/158/357/358/368/380/704/723/725/729`）；补一条精确命令 `grep -rn "\.ReportDigest\|\.DestructionDigest\|\.AcceptanceDigest" internal/controlplane/server/*.go | grep -v _test` ⇒ **恰 3 行**，全在 `snapshot_anchor.go:193/196/201` 的 `anchorSignedFields`（**签名覆盖区的 payload 构造**），**无一处与账本记录比对**。结论不变、表述精确化 |
