@@ -160,7 +160,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | 候选 | 裁定 | 依据 |
 |---|---|---|
 | ① **锚定兑现**（本 Phase） | **采纳** | 真实缺口（§2 事实 1~9 逐行核实；A-3 是登记在册、四个 Phase 无人认领的通道）；新判据 `anchor_realized`/`anchor_unrealized` 对**锚定条目 ↔ 主账本**此前给不出（§2 悖论）；机制**零新族、零新写入路径**，纯读派生；对 4/6 族非空泛（§3 表），1 族空泛**已显式声明**，1 族已由 P48 覆盖 |
-| ② VAK 旋转/吊销（ADR-063 §8-9） | **不淘汰，但本轮不选** | 「when」维度在**另一把密钥**上的延伸：需独立威胁模型与 KAK 授权的第二账本，工程量 ≥1 Phase；且**不解决 A-3**（能吊销 VAK 者仍可伪造锚定条目）⇒ 排序在 ① 之后（D10 已登记） |
+| ② VAK 旋转/吊销（ADR-063 §8-9） | **由 P50 认领（ADR-075 §3）** | 原裁定「**不淘汰，但本轮不选**……排序在 ① 之后」已陈旧：① 已由本 Phase 完成，排序理由失效。P50（Verifier Authority Lifecycle）采纳该方向——把 P44 第二把签名身份（VAK）的**签发者 × 签发时刻**拿去在 P41 生命周期账本里兑现（`verifier_authorized` / `verifier_authority_violated` / `verifier_authority_unbounded`）；机制**零新账本、零新证据族、零新路由**（复用 P41 的 `loadKeyLifecycleState`/`authorizationFor`/`authorizeByLifecycle`，只扩张写入面主体集），故原估「需独立第二账本、工程量 ≥1 Phase」不成立。它**不闭合** A-3 的持导出私钥分支（那已由兑现面闭合），只闭合 VAK 的「when」缺口 |
 | ③ pre-export drop 记账（ADR-060 §9 Q3） | **淘汰** | 判据已存在（`runtime_dropped`/`file_dropped`/`Truncated`，`mgmt_obs.go:265-283`）⇒ 不产生此前给不出的判据，只是**接入**（R210 击倒；D9 已登记） |
 | ④ 呈现/运维面整合 | **淘汰（仍）** | 不产生新判据（R210；同 P47/P48 裁定） |
 | ⑤ HA 多副本 | **淘汰（仍）** | 「一致性不是证据性」（ADR-054 §1.1） |

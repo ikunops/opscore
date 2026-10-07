@@ -272,11 +272,21 @@ func verifyKeyLifecycleEntrySignature(e *keyLifecycleEntry, trust *exportTrustSt
 // ---------------------------------------------------------------------------
 
 type keyLifecycleConfig struct {
-	dir          string
-	capacity     int
-	ka           *keyAuthority
-	signingTrust *exportTrustStore // P37 trust set: WHO may ever be given a window
-	streamID     string            // P40 derived identity of this export directory
+	dir      string
+	capacity int
+	ka       *keyAuthority
+	// signingTrust / verifierTrust are together the SUBJECT set of this ledger
+	// (Phase 50 A2, ADR-075 §3/A6): WHO may ever be given a window is the union
+	// of P37's manifest signing anchor and P44's verifier anchor, and the two
+	// sets must never intersect — a key_id in both would make the DOMAIN of its
+	// rows undecidable (which anchor authorized it?), so the write face refuses
+	// it and the read face reports `indeterminate` (A6).
+	signingTrust  *exportTrustStore // P37 trust set: manifest signing identities
+	verifierTrust *exportTrustStore // P44 trust set: verification-report signers
+	// Phase 50 keeps the ledger SCHEMA unchanged: an event carries no role field,
+	// so its domain is resolved from these anchors, never stored in the row
+	// (A8-⑧ registers the resulting cost).
+	streamID string // P40 derived identity of this export directory
 	// observe (Phase 43) is the destruction hook this log's prefix compaction
 	// installs. nil ⇒ the log compacts exactly as it did in Phase 42.
 	observe compactionObserver
@@ -643,14 +653,32 @@ func appendKeyLifecycleEvent(c keyLifecycleConfig, req keyLifecycleRequest, at t
 	default:
 		return zero, fmt.Errorf("key lifecycle: unknown event_type %q", req.EventType)
 	}
-	// WHO is still decided by Phase 37: we never open a ledger entry for a key
-	// that is not in the signing trust set.
-	if c.signingTrust == nil || len(c.signingTrust.keys) == 0 {
-		return zero, errors.New("key lifecycle: no signing trust anchor configured — cannot bind a key identity")
+	// WHO is still decided by Phase 37 and Phase 44: we never open a ledger entry
+	// for a key that is not in one of the two signing anchors, and a key that sits
+	// in BOTH has no decidable domain at all (Phase 50 A2/A6, ADR-075 §3/I10).
+	if (c.signingTrust == nil || len(c.signingTrust.keys) == 0) &&
+		(c.verifierTrust == nil || len(c.verifierTrust.keys) == 0) {
+		return zero, errors.New("key lifecycle: neither the signing trust anchor nor the verifier trust anchor is configured — cannot bind a key identity")
 	}
-	pub, known := c.signingTrust.keys[req.KeyID]
-	if !known {
-		return zero, fmt.Errorf("key lifecycle: key_id %q is not in the signing trust set", req.KeyID)
+	var pub ed25519.PublicKey
+	inSigning, inVerifier := false, false
+	if c.signingTrust != nil {
+		pub, inSigning = c.signingTrust.keys[req.KeyID]
+	}
+	var vpub ed25519.PublicKey
+	if c.verifierTrust != nil {
+		vpub, inVerifier = c.verifierTrust.keys[req.KeyID]
+	}
+	if inSigning && inVerifier {
+		return zero, fmt.Errorf("key lifecycle: key_id %q is in BOTH the signing trust anchor and the verifier trust anchor — its domain is undecidable, so no window may be opened for it", req.KeyID)
+	}
+	switch {
+	case inSigning:
+		// pub already bound above.
+	case inVerifier:
+		pub = vpub
+	default:
+		return zero, fmt.Errorf("key lifecycle: key_id %q is in neither the signing trust anchor nor the verifier trust anchor", req.KeyID)
 	}
 	switch req.EventType {
 	case lifecycleEventActivated:
@@ -850,6 +878,27 @@ func keyLifecycleSummary(c keyLifecycleConfig) keyLifecycleStatusSummary {
 	}
 	sortStrings(keyIDs)
 	for _, k := range keyIDs {
+		// Phase 50 (ADR-075 §5 A3/A8-⑦/⑨): this roll-up enumerates SIGNING
+		// subjects only. A key that sits in the verifier trust anchor is not a
+		// manifest signing subject, so it must never appear in `authorizations`
+		// and must never become `active_key_id` (A8-⑨ keeps the verifier side's
+		// "currently in position" strictly inside its own group). On every input
+		// reachable before Phase 50 the verifier anchor could not score a single
+		// ledger row, so this condition is the identity transform (T351 pins it).
+		if c.verifierTrust != nil {
+			if _, inVerifier := c.verifierTrust.keys[k]; inVerifier {
+				continue
+			}
+		}
+		// The `∈ signingTrust` half of the ADR-075 §5-A3 condition is applied only
+		// when a signing anchor is configured at all: a directory whose signing
+		// anchor was later removed must keep reading exactly as it did before
+		// (A3's byte-identity promise), never blank out because a set went empty.
+		if c.signingTrust != nil && len(c.signingTrust.keys) > 0 {
+			if _, inSigning := c.signingTrust.keys[k]; !inSigning {
+				continue
+			}
+		}
 		a := st.authorizationFor(k)
 		out.Authorities = append(out.Authorities, a)
 		if a.Source == lifecycleSourceLedger && a.NotAfter == "" {

@@ -196,6 +196,13 @@ type HistoryExportStatus struct {
 	// byte-identical to Phase 44). Kept as its own alignment group so every
 	// pre-existing line of this struct stays byte-identical.
 	InputIntegrity *inputIntegrityStatusSummary `json:"input_integrity,omitempty"`
+	// Phase 50 (ADR-075 §3 / ADR-076 §4): the verifier-authority group. nil (and
+	// therefore absent) unless a verifier identity is configured, so a default
+	// deployment's status document stays byte-identical to Phase 49 (I3). It is
+	// placed BEFORE the anchor groups so `anchor_delivery` remains the last
+	// top-level key (T276's append-only discipline is a P47 assertion this Phase
+	// must not break).
+	VerifierAuthority *verifierAuthorityStatusSummary `json:"verifier_authority,omitempty"`
 	// Phase 49 (ADR-073 §3 / ADR-074 §4): the anchor-realization group. nil (and
 	// therefore absent) unless anchoring is enabled, so a default deployment's
 	// status document stays byte-identical (T318). It is placed BEFORE the Phase
@@ -643,8 +650,13 @@ func (s *HistoryExportScheduler) keyLifecycleConfig() keyLifecycleConfig {
 		capacity:     s.cfg.KeyLifecycleCapacity,
 		ka:           s.keyAuthority,
 		signingTrust: s.trust,
-		streamID:     s.lifecycleStreamID(),
-		observe:      s.destructionObserver(destructionKindKeyLifecycleCompaction),
+		// Phase 50 (A2): the verifier anchor joins the ledger's SUBJECT set. The
+		// ledger schema does not change in any byte: only WHO may be given a window
+		// widens, and the two anchors must never intersect (guarded at the write
+		// face and re-checked at the read face, A6).
+		verifierTrust: s.verifierTrust,
+		streamID:      s.lifecycleStreamID(),
+		observe:       s.destructionObserver(destructionKindKeyLifecycleCompaction),
 	}
 }
 
@@ -1601,6 +1613,13 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 	}
 	if s.trust != nil {
 		st.TrustedKeys = len(s.trust.keys)
+	}
+	// Phase 50 (ADR-076 §4): the verifier-authority face, read-derived in the same
+	// position as every other family summary. A deployment with no VAK leaves the
+	// group nil, so its status document is byte-identical (I3/T341).
+	if s.verifierConfigured() {
+		va := s.VerifierAuthorityStatus()
+		st.VerifierAuthority = &va
 	}
 	if s.signer != nil {
 		st.SignerKeyID = s.signer.keyID
