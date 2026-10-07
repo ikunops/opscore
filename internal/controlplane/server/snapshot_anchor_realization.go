@@ -217,7 +217,20 @@ type familyLedgerView struct {
 	entries           int
 	hasUnclassifiable bool
 	hasConflict       bool
-	reason            string
+	// unavailable is a THIRD axis (review M2): the family's own ledger source is
+	// not enabled, so NO window exists and no identity can be compared. It is
+	// deliberately distinct from "the ledger is empty": an empty ledger whose
+	// write path IS enabled means every claimed identity was removed from the tail
+	// (a real accusation), while an unreadable source means we simply do not know
+	// (unjudgeable — `out_of_window`, loud, never `unrealized`). Only the
+	// destruction family can reach this state: its load returns a silent empty
+	// state when the face is off (snapshot_destruction.go loadDestructionState),
+	// whereas the lifecycle / verification / acceptance / chain-ledger loads read
+	// their files unconditionally, so a log that survived a config change is still
+	// judged. ADR-073 A8-② requires exactly this: a disabled destruction face must
+	// never turn an unjudgeable prefix into a forgery claim.
+	unavailable bool
+	reason      string
 }
 
 // loadFamilyLedger runs the family's EXISTING load (no new reader, no new
@@ -257,6 +270,19 @@ func loadFamilyLedger(f witnessFamily, s *HistoryExportScheduler) (*familyLedger
 		}
 		v.minSeq, v.maxSeq, v.entries = st.window.MinSeq, st.window.MaxSeq, st.window.Entries
 	case witnessFamilyDestruction:
+		// Review M2: the destruction load returns a silent, error-free EMPTY state
+		// when the face is not enabled (snapshot_destruction.go: `if !c.enabled()
+		// { return st, nil }`). Zeros then read as window (0,0), which would send
+		// every destruction anchor entry into the `id > maxSeq` branch — i.e. a
+		// perfectly ordinary deployment that turned `--export-destruction-log` off
+		// after destruction anchors had been written would be accused of tail
+		// deletion. The anchors and the log both survive on disk; only the switch
+		// changed. So ASK the switch first and report unjudgeable rather than empty.
+		if !s.destructionConfig().enabled() {
+			v.unavailable = true
+			v.reason = "the destruction ledger is not enabled, so no destruction claim can be checked against it: the anchors' identities are unjudgeable here (not a deletion claim)"
+			return v, nil
+		}
 		st, err := loadDestructionState(s.destructionConfig())
 		if err != nil {
 			return nil, err
@@ -455,12 +481,31 @@ type familyRealization struct {
 func realizeFamily(f witnessFamily, s *HistoryExportScheduler, acc *realizationAccounting) familyRealization {
 	res := familyRealization{name: f.Name}
 
+	// ⓪ Delegation FIRST (ADR-073 §3 / ADR-074 I10; review M1). The sixth family's
+	// verdict is `delegated` unconditionally and it participates in NO step of the
+	// global computation — so this check must PRECEDE the anchor-side fail-closed
+	// gates. Otherwise a corrupt decision ANCHOR stream (unreadable line, conflict,
+	// or an entry that no longer verifies) would make the delegated family
+	// `indeterminate`, drag `anchor_realization_state` to `indeterminate`, and let a
+	// family this face refuses to judge veto the five it does judge. Its realization
+	// is judged by a strictly stronger local recompute elsewhere (ADR-074 §2.2).
+	delegated := f.ArtifactDigest == nil
+	if delegated {
+		res.verdict = realizationFamilyDelegated
+		res.reason = "the realization of this family is judged by the strictly stronger local recompute (ADR-074 §2.2); this face makes no realized/unrealized claim about it"
+	}
+
 	// ① Anchor side — loaded WITH the trust anchor, so entries that do not
 	// verify are VISIBLE as unusable (unlike P46's signature-blind load). A
 	// forged-but-unsigned claim must never be judged as if it were sound, and it
-	// must never be silently skipped either (T329).
+	// must never be silently skipped either (T329). For the delegated family the
+	// load is informational only: a failure cannot change the pinned verdict.
 	ast, err := loadAnchorStatePath(f.AnchorPath(s.cfg.Dir), s.cfg.Dir, s.trust)
 	if err != nil {
+		if delegated {
+			res.reason = "the family's anchor stream cannot be evaluated (this face does not judge it): " + err.Error()
+			return res
+		}
 		res.verdict = realizationFamilyIndeterminate
 		res.reason = "the family's anchor stream cannot be evaluated: " + err.Error()
 		return res
@@ -468,6 +513,11 @@ func realizeFamily(f witnessFamily, s *HistoryExportScheduler, acc *realizationA
 	w := ast.window
 	res.window = &w
 	res.unusable = len(ast.unusable)
+	if delegated {
+		// Window and unusable count are reported as context; no row claim is made
+		// and conflicts/unusable entries do NOT make the family indeterminate.
+		return res
+	}
 	if len(ast.conflicts) > 0 {
 		res.verdict = realizationFamilyIndeterminate
 		res.reason = fmt.Sprintf("the anchor stream holds %d conflicting anchor_seq(s) %v; the family is not judged", len(ast.conflicts), ast.conflicts)
@@ -479,15 +529,21 @@ func realizeFamily(f witnessFamily, s *HistoryExportScheduler, acc *realizationA
 		return res
 	}
 
-	// ② Delegation (ADR-074 §2.2). The sixth family's realization is judged by a
-	// strictly stronger local recompute elsewhere; this face makes NO
-	// realized/unrealized claim about it.
-	if f.ArtifactDigest == nil {
-		res.verdict = realizationFamilyDelegated
+	// ③ An EMPTY anchor window needs no ledger at all (review M3 / ADR-073 §3: a
+	// family whose anchor window is empty is `anchor_nothing_assessed`). This must
+	// come BEFORE the ledger load, otherwise a family with nothing to judge can be
+	// dragged to `indeterminate` by a ledger it never needed — and, worse, a
+	// deployment that simply has no key authority (so the acceptance ledger cannot
+	// be verified and its load returns an error) would read `indeterminate`
+	// forever, even though it never anchored a single acceptance claim. The bad
+	// CLAIM cases above stay loud; the empty case is silence, not failure.
+	if len(ast.latest) == 0 {
+		res.verdict = realizationFamilyNothingAssessed
+		res.reason = "the family's anchor window is empty: no anchor entry claimed anything to check"
 		return res
 	}
 
-	// ③ Ledger side — the family's existing load, fail-closed on either axis.
+	// ④ Ledger side — the family's existing load, fail-closed on either axis.
 	lst, lerr := loadFamilyLedger(f, s)
 	if lerr != nil {
 		res.verdict = realizationFamilyIndeterminate
@@ -499,15 +555,26 @@ func realizeFamily(f witnessFamily, s *HistoryExportScheduler, acc *realizationA
 		res.reason = lst.reason
 		return res
 	}
+	// Review M2: the family's ledger source is not enabled. There is no window to
+	// compare against, so every claim is UNJUDGEABLE — out_of_window, loud, and
+	// never `unrealized` (ADR-073 A8-②: an unreadable source must not be turned
+	// into a forgery claim). This precedes the accounting check on purpose: with
+	// no ledger there is nothing for the accounting to rescue.
+	if lst.unavailable {
+		res.outOfWindow = len(ast.latest)
+		res.verdict = realizationFamilyNothingAssessed
+		res.reason = lst.reason
+		return res
+	}
 
-	// ④ Accounting side — the shared, already-loaded destruction index.
+	// ⑤ Accounting side — the shared, already-loaded destruction index.
 	if acc != nil && acc.err != nil && f.CompactionKind != "" {
 		res.verdict = realizationFamilyIndeterminate
 		res.reason = acc.err.Error()
 		return res
 	}
 
-	// ⑤ Per-entry judgement, ascending anchor_seq (a total order, so the verdict
+	// ⑥ Per-entry judgement, ascending anchor_seq (a total order, so the verdict
 	// does not depend on map iteration).
 	for _, seq := range ast.seqs() {
 		e := ast.latest[seq]
@@ -558,7 +625,7 @@ func realizeFamily(f witnessFamily, s *HistoryExportScheduler, acc *realizationA
 		}
 	}
 
-	// ⑥ Family-level first-hit total order (ADR-073 §3): indeterminate >
+	// ⑦ Family-level first-hit total order (ADR-073 §3): indeterminate >
 	// unrealized > realized > nothing_assessed. An empty row set — or a row set
 	// that was never actually checked — is NEVER `realized` (the empty set is not
 	// "everything checks out").

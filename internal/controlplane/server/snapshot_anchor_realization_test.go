@@ -165,11 +165,32 @@ func TestP49T317FrozenFaceUnchanged(t *testing.T) {
 		"internal/controlplane/server/history_export_coverage.go",
 		"internal/controlplane/server/history_export_manifest.go",
 	}
+	// The frozen face is pinned BY CONTENT, not by vocabulary (review M3): the
+	// marker scan below cannot see an unrelated rewrite, and "zero diff" is a
+	// claim about BYTES. These are the sha256 of the files at the Phase 49 base
+	// (45a580e); a frozen file is frozen forever, so a mismatch is a violation
+	// and never a legitimate update.
+	frozenSHA256 := map[string]string{
+		"internal/controlplane/server/appendonly_log.go":             "f4ae703323c3c9c49f5209f2b70f287dacc8ad61cb8ff84c1c1c9aa93fcb81ee",
+		"internal/controlplane/server/snapshot_anchor.go":            "eca582354359fde49c3e2b1f6e664551dbcd31ff300a310938ea2429acdebc63",
+		"internal/controlplane/server/snapshot_witness_reconcile.go": "4313822e3bdfb3b2bace3eed1643469be23611097ea728e17412c4b39200f9b2",
+		"internal/controlplane/server/snapshot_signature.go":         "17d9ced5dff8b31be576a9473e5175083ce03e60f21b3cfbd12f78960d406d23",
+		"internal/controlplane/server/snapshot_chain.go":             "736c29b9b6ce114ca0efeb4068586b42c32af832dad20b699aadea8c7c9a47b2",
+		"internal/controlplane/server/snapshot_ledger.go":            "e9efe6fd1a7013639f0539cfb2a2940957edb9201173df005b39f2a80f50d325",
+		"internal/controlplane/server/history_export_coverage.go":    "478f0ad9bd9f6189f04f198b90f2493c138ad1678a0c2aaed6364d89fe133999",
+		"internal/controlplane/server/history_export_manifest.go":    "86d56214e4e69a8a33b3f4293fa72e2a3c69148e300ee1f1f8f980b335892588",
+		"go.mod": "6dfc9eea3dcba0f32b4ef8229b1a9a912dddf6db1891ed3b6623538f987e6b32",
+		"go.sum": "48a94c452c1c0b794722b90652f70a8bd6ea4a3a82f86b50b31bb0683bd9cd27",
+	}
 	markers := []string{"phase 49", "anchor_realization", "realizefamily", "artifactdigest", "compactionkind"}
 	for _, rel := range frozenFiles {
 		src, err := os.ReadFile(filepath.Join(root, rel))
 		if err != nil {
 			t.Fatalf("frozen file %s unreadable: %v", rel, err)
+		}
+		sum := sha256.Sum256(src)
+		if got := hex.EncodeToString(sum[:]); got != frozenSHA256[rel] {
+			t.Fatalf("T317/I1 VIOLATION: frozen file %s changed:\n got %s\nwant %s", rel, got, frozenSHA256[rel])
 		}
 		low := strings.ToLower(string(src))
 		for _, m := range markers {
@@ -195,14 +216,15 @@ func TestP49T317FrozenFaceUnchanged(t *testing.T) {
 			t.Fatalf("T317: internal/protection/%s must be zero-diff for Phase 49", e.Name())
 		}
 	}
-	// go.mod / go.sum: no new requirement, no Phase 49 vocabulary.
+	// go.mod / go.sum: byte-identical to the Phase 49 base (no new requirement).
 	for _, rel := range []string{"go.mod", "go.sum"} {
 		src, rerr := os.ReadFile(filepath.Join(root, rel))
 		if rerr != nil {
 			t.Fatalf("%s unreadable: %v", rel, rerr)
 		}
-		if strings.Contains(strings.ToLower(string(src)), "phase 49") {
-			t.Fatalf("T317: %s must be untouched by Phase 49", rel)
+		sum := sha256.Sum256(src)
+		if got := hex.EncodeToString(sum[:]); got != frozenSHA256[rel] {
+			t.Fatalf("T317: %s must be byte-identical to the Phase 49 base:\n got %s\nwant %s", rel, got, frozenSHA256[rel])
 		}
 	}
 	// The vocabulary itself is pinned to ADR-073 §3's words, so a silent rename
@@ -1144,13 +1166,17 @@ func TestP49T335MalformedInputsDoNotPanic(t *testing.T) {
 	})
 
 	t.Run("invalid json in a main ledger", func(t *testing.T) {
-		f := newP49Fixture(t, nil)
+		// M3: the ledger is only read while there is a claim to check against it.
+		// Seed a REAL claim first, or the family is correctly just
+		// `nothing_assessed` (the case T339 pins) and the corruption is never
+		// observed because nothing needed observing.
+		f, _ := p49VerificationWorld(t)
 		if err := appendLogLine(verificationLogPath(f.dir), []byte("][ ")); err != nil {
 			t.Fatal(err)
 		}
 		row := p49Row(t, f.realization(), witnessFamilyVerification)
 		if row.Verdict != realizationFamilyIndeterminate {
-			t.Fatalf("T335: an unreadable main ledger must read indeterminate, got %+v", row)
+			t.Fatalf("T335: an unreadable main ledger must read indeterminate when the family has a claim to check, got %+v", row)
 		}
 	})
 
@@ -1194,19 +1220,21 @@ func TestP49T335MalformedInputsDoNotPanic(t *testing.T) {
 // its own tests were run, the tests turned RED in every case, and the file was
 // restored and re-hashed against the PRE-mutation value:
 //
-//	snapshot_anchor_realization.go  sha256 9ce1e8612241793d3b95335512999ad72b9e28eb17d11eca44cc7087367d2408
-//	                                (mutated -> RED -> restored -> same sha256; MU1/MU2/MU3/MU4/MU6)
+//	snapshot_anchor_realization.go  sha256 6a59a5f1d3b7b32681eca8573fa80d765a5e94d39d3479388a2870a20d8a1e5a
+//	                                (mutated -> RED -> restored -> same sha256; MU1/MU2/MU3/MU4/MU6/MU7/MU8/MU9)
 //	history_export_scheduler.go     sha256 b2b67121f4400f7dd95805fdd1b08c8b9e05b505706bf03fc5af5b2f46994bcb
 //	                                (mutated -> RED -> restored -> same sha256; MU5)
 //
-// Command per mutation: `go test -run '<the named tests>' -timeout 10m ./internal/controlplane/server/`
+// Command per mutation: `go test -count=1 -run '<the named tests>' -timeout 20m ./internal/controlplane/server/`
 //
-//	MU1  drop the recomputed-digest comparison (`dg != claim` -> always false)
+//	MU1  drop the recomputed-digest comparison (`false && dg != claim`, the field
+//	     comparison kept so the mutant still compiles)
 //	     => RED: TestP49T319ForgedVerificationAnchorUnrealized,
 //	             TestP49T320SameIdentityWrongDigest
-//	MU2  fold out_of_window into unrealized
+//	MU2  fold out_of_window into unrealized (`res.outOfWindow++` -> `res.unrealized++`)
 //	     => RED: TestP49T323OutOfWindowIsLoud, TestP49T332ThreeWayDiscrimination
-//	MU3  drop fail-closed (swallow the anchor/ledger load error)
+//	MU3  drop fail-closed (return the zero verdict instead of indeterminate on a
+//	     family's anchor-stream load error)
 //	     => RED: TestP49T324FailClosedAndFamilyIsolation
 //	MU4  use verificationEntryDigest (11 fields) instead of the recomputed
 //	     reportDigest (7 fields)
@@ -1214,8 +1242,26 @@ func TestP49T335MalformedInputsDoNotPanic(t *testing.T) {
 //	MU5  remove the ledger family's vacuity declaration (ArtifactDigest -> nil,
 //	     i.e. delegate it so the vacuity is no longer stated)
 //	     => RED: TestP49T327LedgerFamilyIsVacuous
-//	MU6  give the read face a side effect (write a file inside the export dir)
+//	MU6  give the read face a side effect (write a file inside the export dir;
+//	     the two imports are added so the mutant compiles)
 //	     => RED: TestP49T330ZeroSideEffects
+//
+// The three mutations below close the GAPS the first adversarial review found —
+// each one is the defect CLASS the review reported, so the matrix and the review
+// are pinned to the same mechanisms:
+//
+//	MU7  stop honouring the delegation (`delegated := false`): the sixth family is
+//	     then judged like the others and a corrupt delegated anchor stream makes it
+//	     indeterminate
+//	     => RED: TestP49T337DelegatedFamilyNeverIndeterminate
+//	MU8  drop the "the family's own ledger source is disabled" guard, so a silent
+//	     empty destruction load reads as an empty window (window 0,0) and every
+//	     anchor becomes a tail-deletion claim
+//	     => RED: TestP49T338DisabledDestructionLedgerIsUnjudgeable
+//	MU9  drop the "an empty anchor window needs no ledger" early return, so a
+//	     family with nothing to check is dragged to indeterminate by a ledger it
+//	     never needed (permanent indeterminate in any no-KAK deployment)
+//	     => RED: TestP49T339EmptyAnchorWindowNeedsNoLedger
 //
 // The campaign itself is NOT a Go test (it mutates the code under test). This
 // function is the structural guard that keeps the matrix from rotting: every
@@ -1266,6 +1312,30 @@ func TestP49T336MutationMatrixDocumented(t *testing.T) {
 	if !declared {
 		t.Fatal("MU5: the ledger family vanished from the registry")
 	}
+	// MU7 guard: the delegation is DATA-DRIVEN — the sixth family's ArtifactDigest
+	// is nil in the registry. That is the fact the delegation-FIRST ordering rests
+	// on (T337 pins the ordering itself behaviourally).
+	sawDelegated := false
+	for _, fam := range witnessFamilyRegistry() {
+		if fam.Name != witnessFamilyProtectionDecision {
+			continue
+		}
+		if fam.ArtifactDigest != nil {
+			t.Fatal("MU7: the sixth family must be registered as DELEGATED (ArtifactDigest nil)")
+		}
+		sawDelegated = true
+	}
+	if !sawDelegated {
+		t.Fatal("MU7: the sixth family vanished from the registry")
+	}
+	// MU8/MU9 guards: the three "we cannot say" family values must stay distinct
+	// words. Collapsing them is exactly how an unjudgeable or a disabled-source
+	// family would get laundered into a deletion claim (T338) or a failure (T339).
+	if realizationFamilyNothingAssessed == realizationFamilyUnrealized ||
+		realizationFamilyNothingAssessed == realizationFamilyIndeterminate ||
+		realizationRowOutOfWindow == realizationFamilyNothingAssessed {
+		t.Fatal("MU8/MU9: the 'cannot say' vocabulary collapsed")
+	}
 	// MU1 guard: the comparison is the ONLY thing that can turn a matching
 	// identity into a verdict — with a wrong claim the row must not be realized.
 	f := newP49Fixture(t, nil)
@@ -1288,5 +1358,175 @@ func TestP49T336MutationMatrixDocumented(t *testing.T) {
 	// MU6 guard: the face is read-only — asserted end-to-end by T330.
 	if f.sched.cfg.Dir == "" {
 		t.Fatal("MU6: the read face must not need a writable directory at all")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T337 — the DELEGATED family is never indeterminate, and never vetoes the five
+// families this face does judge (review M1)
+// ---------------------------------------------------------------------------
+//
+// ADR-073 §3 and ADR-074 I10 say the sixth family is `delegated` UNCONDITIONALLY
+// and takes part in no step of the global computation. That ordering is
+// load-bearing: if the delegation test ran AFTER the anchor-side fail-closed
+// gates, a corrupt decision ANCHOR stream would make the delegated family
+// `indeterminate`, and the global scalar would be dragged to `indeterminate` by a
+// family this face has explicitly refused to judge. The corruption below is the
+// cheapest possible: one unclassifiable line in the decision anchor stream.
+func TestP49T337DelegatedFamilyNeverIndeterminate(t *testing.T) {
+	f := newP48Fixture(t, nil)
+	f.emit(3)
+	f.tick()
+
+	base := f.sched.Status().AnchorRealization
+	if base == nil {
+		t.Fatal("T337: the realization group must be present while anchoring is on")
+	}
+	if base.ProtectionDecision.Verdict != realizationFamilyDelegated {
+		t.Fatalf("T337: the sixth family must read delegated on an intact stream, got %+v", base.ProtectionDecision)
+	}
+	baseState := base.State
+	// Snapshot the five families this face DOES judge, so the corruption below can
+	// be shown to leave them untouched (the p48 fixture's own global state is not
+	// assumed to be any particular value — the claim under test is ISOLATION).
+	baseRows := map[string]string{}
+	for _, name := range p49NonDelegated() {
+		baseRows[name] = p49RowJSON(t, *base, name)
+	}
+
+	// Corrupt the DECISION ANCHOR STREAM (not the decision log): a line the anchor
+	// classifier cannot read.
+	if err := appendLogLine(decisionAnchorPath(f.dir), []byte("this is not an anchor entry")); err != nil {
+		t.Fatal(err)
+	}
+
+	sum := f.sched.AnchorRealizationStatus()
+	if got := sum.ProtectionDecision.Verdict; got != realizationFamilyDelegated {
+		t.Fatalf("T337/M1: a corrupt DELEGATED anchor stream must not move the verdict off delegated, got %q", got)
+	}
+	for _, name := range sum.IndeterminateFamilies {
+		if name == witnessFamilyProtectionDecision {
+			t.Fatal("T337/M1: the delegated family must never enter the indeterminate list")
+		}
+	}
+	for _, name := range sum.UnrealizedFamilies {
+		if name == witnessFamilyProtectionDecision {
+			t.Fatal("T337/M1: the delegated family must never enter the unrealized list")
+		}
+	}
+	if sum.State != baseState {
+		t.Fatalf("T337/M1: the delegated family must not move the global scalar: %q -> %q", baseState, sum.State)
+	}
+	for _, name := range p49NonDelegated() {
+		if got := p49RowJSON(t, sum, name); got != baseRows[name] {
+			t.Fatalf("T337/M1: family %q must be UNAFFECTED by a corrupt DELEGATED anchor stream:\n got %s\nwant %s", name, got, baseRows[name])
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T338 — a family whose OWN ledger source is disabled is UNJUDGEABLE, never a
+// deletion claim (review M2 / ADR-073 A8-②)
+// ---------------------------------------------------------------------------
+//
+// The destruction load returns a silent, error-free EMPTY state when the face is
+// off. Read literally, zeros mean "window (0,0)", so every anchor claim becomes
+// "above the upper bound" — i.e. tail deletion — and an ordinary config change
+// (turn `--export-destruction-log` off after anchors were written) would be
+// reported as a FORGERY. ADR-073 A8-② forbids exactly that: with no accounting,
+// an absent prefix is `out_of_window` (unjudgeable, loud), never `unrealized`.
+func TestP49T338DisabledDestructionLedgerIsUnjudgeable(t *testing.T) {
+	f := newP49Fixture(t, func(cfg *HistoryExportConfig) { cfg.LedgerCapacity = 2 })
+	f.driveAllFamilies()
+
+	// Fixture sanity: the destruction family really has anchor claims to check,
+	// and they are judgeable while the face is on.
+	if n := p49AnchorCount(t, destructionAnchorPath(f.dir)); n == 0 {
+		t.Fatal("T338 fixture: want at least one destruction anchor entry")
+	}
+	if row := p49Row(t, f.realization(), witnessFamilyDestruction); row.Verdict == realizationFamilyNothingAssessed {
+		t.Fatalf("T338 fixture: the destruction family must be judgeable with the face on, got %+v", row)
+	}
+
+	// A supported config change: the operator turns the destruction face off. The
+	// anchor stream and the destruction log both SURVIVE on disk; only the switch
+	// changed. (AcceptanceLog must be off too: P45's construction guard G4 refuses
+	// an acceptance ledger without a destruction ledger.)
+	cfg := f.cfg
+	cfg.DestructionLog = false
+	cfg.AcceptanceLog = false
+	sched2, err := NewHistoryExportScheduler(cfg)
+	if err != nil {
+		t.Fatalf("T338: rebuilding the scheduler on the same dir must be legal: %v", err)
+	}
+
+	sum := sched2.AnchorRealizationStatus()
+	row := sum.Destruction
+	if row.Verdict == realizationFamilyUnrealized || row.Unrealized != 0 {
+		t.Fatalf("T338/A8-2: a disabled destruction ledger must never turn its anchors into a deletion claim, got %+v", row)
+	}
+	if row.OutOfWindow == 0 {
+		t.Fatalf("T338/A5: claims that cannot be judged must be counted as unjudgeable, got %+v", row)
+	}
+	if row.Compacted != 0 {
+		t.Fatalf("T338: nothing was accounted for, so nothing may read compacted, got %+v", row)
+	}
+	if row.Reason == "" {
+		t.Fatal("T338/A5: unjudgeable must be loud on the same face")
+	}
+	if row.Verdict != realizationFamilyNothingAssessed {
+		t.Fatalf("T338: an unjudgeable family has checked nothing, so it is nothing_assessed, got %+v", row)
+	}
+	if sum.State == realizationStateUnrealized {
+		t.Fatal("T338/A8-2: the global scalar must not read unrealized because a face is switched off")
+	}
+	if sum.AnchorRealized && sum.Claims <= 0 {
+		t.Fatal("T338/I5: anchor_realized still implies claims > 0")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T339 — an EMPTY anchor window needs no ledger: a family with nothing to judge
+// reads nothing_assessed, not indeterminate (review M3 / ADR-073 §3)
+// ---------------------------------------------------------------------------
+//
+// The ledger load runs fail-closed, which is right for a family that HAS claims.
+// But the load must not be reached when there is nothing to check: a deployment
+// with no key authority cannot VERIFY the acceptance ledger (its load returns an
+// error), so ordering the ledger load before the empty-window test made the whole
+// realization face read `indeterminate` forever — in a deployment that never
+// anchored a single acceptance claim. ADR-073 §3 says an empty anchor window is
+// `anchor_nothing_assessed`; the empty case is silence, not failure.
+func TestP49T339EmptyAnchorWindowNeedsNoLedger(t *testing.T) {
+	f := newP48Fixture(t, nil) // anchoring on, no key authority at all
+	f.emit(3)
+	f.tick()
+
+	sum := f.sched.AnchorRealizationStatus()
+
+	// The acceptance ledger cannot be verified here (no KAK) — but nothing was
+	// ever anchored for that family, so the family is not "unjudgeable", it is
+	// simply empty.
+	acc := sum.Acceptance
+	if acc.Verdict == realizationFamilyIndeterminate {
+		t.Fatalf("T339/M3: a family with no anchor claims must not be dragged to indeterminate by a ledger it never needed, got %+v", acc)
+	}
+	if acc.Verdict != realizationFamilyNothingAssessed {
+		t.Fatalf("T339/M3: an empty anchor window is nothing_assessed (ADR-073 §3), got %+v", acc)
+	}
+	if acc.Reason == "" {
+		t.Fatal("T339/A5: an empty window still owes a reason")
+	}
+	for _, name := range sum.IndeterminateFamilies {
+		if name == witnessFamilyAcceptance {
+			t.Fatal("T339/M3: an empty-window family must not enter the indeterminate list")
+		}
+	}
+	if sum.State == realizationStateIndeterminate {
+		t.Fatalf("T339/M3: a deployment with no key authority must not read indeterminate on this face, got %q (%v)", sum.State, sum.IndeterminateFamilies)
+	}
+	// Silence is not a green light either: nothing was checked for that family.
+	if acc.Checked != 0 || acc.Realized != 0 || acc.Unrealized != 0 {
+		t.Fatalf("T339: an empty window makes no claim at all, got %+v", acc)
 	}
 }
