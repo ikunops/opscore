@@ -70,6 +70,20 @@ const (
 	verifierAuthorityUnbounded       = "unbounded"
 	verifierAuthorityIndeterminate   = "indeterminate"
 	verifierAuthorityNothingAssessed = "nothing_assessed"
+	// Phase 51 (ADR-077 §3 / ADR-078 §3.2) — the SIXTH row-level value. It is
+	// defined by the DOMAIN-FOLDED result, never by the subject-level domain, so
+	// a MIGRATED subject (which holds a `role=verifier` row) never takes it and
+	// the two faces can never contradict each other (review M2):
+	//
+	//   domain_mismatch — "this interval is not of this domain at all": the
+	//                     subject HAS ledger rows, and NOT ONE of them is
+	//                     verifier-domain. Nothing about a time is asserted, so
+	//                     it must never read `authorized` (that is the bypass
+	//                     this Phase closes) and must never read `violated` (it
+	//                     is not an over-reach, it is a mismatch), and it must
+	//                     never fold into `unbounded` (the domain IS assertable;
+	//                     it just is not this one).
+	verifierAuthorityDomainMismatch = "domain_mismatch"
 )
 
 // verifierAuthorityKeyStatus is ONE signer's row of the `verifier_authority`
@@ -83,15 +97,20 @@ type verifierAuthorityKeyStatus struct {
 	// are deliberately two fields: I6's non-vacuity is `checked`, and a row that
 	// is `unbounded` must show `checked == 0` rather than an empty claim of
 	// authority.
-	Entries          int                `json:"entries,omitempty"`
-	Checked          int                `json:"checked,omitempty"`
-	Authorized       int                `json:"authorized,omitempty"`
-	BeforeActivation int                `json:"before_activation,omitempty"`
-	AfterRotation    int                `json:"after_rotation,omitempty"`
-	AfterRevocation  int                `json:"after_revocation,omitempty"`
-	Indeterminate    int                `json:"indeterminate,omitempty"`
-	Validity         *signatureValidity `json:"validity,omitempty"`
-	Reason           string             `json:"reason,omitempty"`
+	Entries          int `json:"entries,omitempty"`
+	Checked          int `json:"checked,omitempty"`
+	Authorized       int `json:"authorized,omitempty"`
+	BeforeActivation int `json:"before_activation,omitempty"`
+	AfterRotation    int `json:"after_rotation,omitempty"`
+	AfterRevocation  int `json:"after_revocation,omitempty"`
+	Indeterminate    int `json:"indeterminate,omitempty"`
+	// DomainMismatch (Phase 51): the records of this signer whose interval — if
+	// any — does not belong to the VERIFIER domain at all. It is its own counter
+	// and its own verdict; it is never folded into `authorized`, `violated` or
+	// `unbounded` (A7/I5).
+	DomainMismatch int                `json:"domain_mismatch,omitempty"`
+	Validity       *signatureValidity `json:"validity,omitempty"`
+	Reason         string             `json:"reason,omitempty"`
 }
 
 // verifierAuthorityStatusSummary is the `verifier_authority` group. The whole
@@ -104,8 +123,9 @@ type verifierAuthorityStatusSummary struct {
 	Keys map[string]verifierAuthorityKeyStatus `json:"keys,omitempty"`
 
 	// State is the GLOBAL scalar (ADR-075 §3 — the ONLY authoritative
-	// definition): indeterminate > violated > authorized > nothing_assessed,
-	// first hit. It is deliberately NOT a conjunction.
+	// definition; extended by ADR-078 §4): indeterminate > violated >
+	// domain_mismatch > authorized > nothing_assessed, first hit. It is
+	// deliberately NOT a conjunction.
 	State string `json:"verifier_authority_state"`
 	// Authorized is a DERIVED convenience value — `State == "authorized"` and
 	// nothing else (an empty set can never be "everything is in position").
@@ -118,10 +138,14 @@ type verifierAuthorityStatusSummary struct {
 	Entries int `json:"verifier_authority_entries"`
 	// Violations is Σ (before_activation + after_rotation + after_revocation).
 	Violations int `json:"verifier_authority_violations"`
+	// DomainMismatches is Σ domain_mismatch (Phase 51): observed records whose
+	// subject's in-ledger authorizations all belong to ANOTHER domain.
+	DomainMismatches int `json:"verifier_authority_domain_mismatches"`
 
-	UnboundedKeys     []string `json:"verifier_authority_unbounded_keys,omitempty"`
-	ViolatingKeys     []string `json:"verifier_authority_violating_keys,omitempty"`
-	IndeterminateKeys []string `json:"verifier_authority_indeterminate_keys,omitempty"`
+	UnboundedKeys      []string `json:"verifier_authority_unbounded_keys,omitempty"`
+	ViolatingKeys      []string `json:"verifier_authority_violating_keys,omitempty"`
+	IndeterminateKeys  []string `json:"verifier_authority_indeterminate_keys,omitempty"`
+	DomainMismatchKeys []string `json:"verifier_authority_domain_mismatch_keys,omitempty"`
 	// Reason carries the FACE-level fail-closed cause (domain ambiguity, a
 	// ledger that cannot be evaluated). It never silences a row's own reason.
 	Reason string `json:"reason,omitempty"`
@@ -211,7 +235,8 @@ func (s *HistoryExportScheduler) VerifierAuthorityStatus() verifierAuthorityStat
 	// ④ The lifecycle ledger. "Cannot be read" is fail-closed (indeterminate);
 	// "read fine but proves no window for this key" is `unbounded` (I4). These
 	// are different statements and are never collapsed.
-	ls, lerr := loadKeyLifecycleState(s.keyLifecycleConfig())
+	klc := s.keyLifecycleConfig()
+	ls, lerr := loadKeyLifecycleState(klc)
 	if lerr != nil {
 		out.State = verifierAuthorityIndeterminate
 		out.Reason = "the key lifecycle ledger cannot be evaluated: " + lerr.Error()
@@ -245,11 +270,12 @@ func (s *HistoryExportScheduler) VerifierAuthorityStatus() verifierAuthorityStat
 
 	out.Keys = make(map[string]verifierAuthorityKeyStatus, len(signers))
 	for _, kid := range signers {
-		row := judgeVerifierAuthoritySigner(kid, bySigner[kid], ls)
+		row := judgeVerifierAuthoritySigner(klc, kid, bySigner[kid], ls)
 		out.Keys[kid] = row
 		out.Entries += row.Entries
 		out.Claims += row.Checked
 		out.Violations += row.BeforeActivation + row.AfterRotation + row.AfterRevocation
+		out.DomainMismatches += row.DomainMismatch
 		switch row.Verdict {
 		case verifierAuthorityIndeterminate:
 			out.IndeterminateKeys = append(out.IndeterminateKeys, kid)
@@ -257,17 +283,23 @@ func (s *HistoryExportScheduler) VerifierAuthorityStatus() verifierAuthorityStat
 			out.ViolatingKeys = append(out.ViolatingKeys, kid)
 		case verifierAuthorityUnbounded:
 			out.UnboundedKeys = append(out.UnboundedKeys, kid)
+		case verifierAuthorityDomainMismatch:
+			out.DomainMismatchKeys = append(out.DomainMismatchKeys, kid)
 		}
 	}
 
-	// ⑥ The global scalar: first hit of the total order (ADR-075 §3). Not a
-	// conjunction — one indeterminate row makes the face indeterminate, and a
-	// violated row outranks any number of authorized ones.
+	// ⑥ The global scalar: first hit of the total order (ADR-075 §3, extended by
+	// ADR-078 §4). Not a conjunction — one indeterminate row makes the face
+	// indeterminate, a violated row outranks any number of authorized ones, and a
+	// domain mismatch outranks an authorization (a mismatched interval must never
+	// be presented as a case where "everything is in position").
 	switch {
 	case len(out.IndeterminateKeys) > 0:
 		out.State = verifierAuthorityIndeterminate
 	case len(out.ViolatingKeys) > 0:
 		out.State = verifierAuthorityViolated
+	case len(out.DomainMismatchKeys) > 0:
+		out.State = verifierAuthorityDomainMismatch
 	default:
 		for _, row := range out.Keys {
 			if row.Verdict == verifierAuthorityAuthorized {
@@ -287,11 +319,15 @@ func (s *HistoryExportScheduler) VerifierAuthorityStatus() verifierAuthorityStat
 
 // judgeVerifierAuthoritySigner judges ONE signer from counters (I12) and only
 // then decides the row verdict by the total order
-// indeterminate > violated > authorized > unbounded > nothing_assessed.
+// indeterminate > violated > domain_mismatch > authorized > unbounded >
+// nothing_assessed.
 //
 // `keyID` is ALWAYS `Signature.KeyID` (I11) — the caller grouped the entries by
 // that field. The entries passed here are all usable records of that signer.
-func judgeVerifierAuthoritySigner(keyID string, entries []verificationLogEntry, ls *keyLifecycleState) verifierAuthorityKeyStatus {
+// `c` is the lifecycle config the ledger was loaded with; it is needed for the
+// ONE A4-2 fallback (a pre-Phase-51 row has no domain of its own), and for
+// nothing else.
+func judgeVerifierAuthoritySigner(c keyLifecycleConfig, keyID string, entries []verificationLogEntry, ls *keyLifecycleState) verifierAuthorityKeyStatus {
 	row := verifierAuthorityKeyStatus{Entries: len(entries)}
 	if keyID == "" {
 		// A usable record must carry a signing key id (a malformed signature block
@@ -300,6 +336,37 @@ func judgeVerifierAuthoritySigner(keyID string, entries []verificationLogEntry, 
 		row.Indeterminate = len(entries)
 		row.Verdict = verifierAuthorityIndeterminate
 		row.Reason = "a usable verification entry carries no signing key id"
+		return row
+	}
+
+	// ⑤.0 The DOMAIN of the interval this signer would be judged on (Phase 51,
+	// ADR-078 §3). Two fail-closed / distinct outcomes, and NEITHER may be
+	// skipped, because both would otherwise be answered by a time comparison on
+	// an interval that was never issued to this domain — the bypass this Phase
+	// closes (ADR-077 §2 probe 3):
+	//
+	//   · the subject's rows contradict each other about their domain
+	//     (`conflict`) ⇒ no domain can be named, so nothing is judged;
+	//   · domain-folding by the VERIFIER domain leaves ZERO rows while the
+	//     subject HAS rows ⇒ every in-ledger authorization of this subject
+	//     belongs to another domain ⇒ `domain_mismatch`.
+	//
+	// The second test is deliberately stated as "the folded count is zero", NOT
+	// as "the subject-level domain is signing": a MIGRATED subject (which holds a
+	// `role=verifier` row) keeps a non-zero folded count and is judged normally,
+	// so the two faces can never return opposite verdicts for it (review M2).
+	if d := domainOf(ls, keyID); d.Domain == lifecycleDomainConflict {
+		row.Indeterminate = len(entries)
+		row.Verdict = verifierAuthorityIndeterminate
+		row.Reason = "the signer's lifecycle rows declare two domains inside one event group, or carry a role outside {signing, verifier} — the domain of its authorization is undecidable, so no interval is checked"
+		return row
+	}
+	a, domainRows := authorizationForDomain(c, ls, keyID, lifecycleDomainVerifier)
+	row.Validity = validityOf(a)
+	if domainRows == 0 && ls != nil && len(ls.byKey[keyID]) > 0 {
+		row.DomainMismatch = len(entries)
+		row.Verdict = verifierAuthorityDomainMismatch
+		row.Reason = "every authorization on record for this signer belongs to ANOTHER domain (not one in-ledger row was issued to the verification domain) — the interval is assertable and it is simply not this one, so it is neither an authority nor an over-reach"
 		return row
 	}
 
@@ -321,8 +388,8 @@ func judgeVerifierAuthoritySigner(keyID string, entries []verificationLogEntry, 
 	}
 
 	// Reuse P41 VERBATIM (I2): resolution and comparison are not re-derived here.
-	a := ls.authorizationFor(keyID)
-	row.Validity = validityOf(a)
+	// `a` above is the interval over the VERIFIER-domain rows only (A4-1 for a
+	// row that carries its domain, A4-2 for a pre-Phase-51 row).
 	intervalAssertable := a.Source == lifecycleSourceLedger && a.Complete
 
 	if intervalAssertable {

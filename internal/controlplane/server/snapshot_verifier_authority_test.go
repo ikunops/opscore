@@ -316,6 +316,9 @@ func TestP50T340FrozenFaceAndLedgerBytes(t *testing.T) {
 	// P41 ledger byte equivalence: an already-recorded row still hashes to the
 	// digest it stores, and its JSON key set is unchanged — the Phase widened WHO
 	// may be given a window, not what a window looks like (A2: zero schema change).
+	// Phase 51 (ADR-077 §4 A8-⑦③a, ADR-078 §6 步 7(a)): the one DECLARED addition
+	// is the trailing `role` domain carrier, so the row's key set is now 12 —
+	// every other key, and the digest algorithm, are untouched.
 	f := newP50Fixture(t, nil)
 	f.activateVAK(p50T0)
 	data, err := os.ReadFile(keyLifecycleLogPath(f.dir))
@@ -346,7 +349,7 @@ func TestP50T340FrozenFaceAndLedgerBytes(t *testing.T) {
 		got = append(got, k)
 	}
 	sort.Strings(got)
-	want := []string{"authority_key_id", "event_digest", "event_seq", "event_type", "key_id", "not_before", "pubkey_fingerprint", "recorded_at", "signature", "stream_id", "v"}
+	want := []string{"authority_key_id", "event_digest", "event_seq", "event_type", "key_id", "not_before", "pubkey_fingerprint", "recorded_at", "role", "signature", "stream_id", "v"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("T340/A2: the lifecycle row's field set changed:\n got %v\nwant %v", got, want)
 	}
@@ -414,10 +417,16 @@ func TestP50T341DefaultDeploymentOmitsTheGroup(t *testing.T) {
 // p50BaselineStatusKeys is the EXACT top-level key sequence a default deployment
 // (attestation + lifecycle on, VAK off, anchoring off) produced before Phase 50.
 // It is the byte-shape the new group must not disturb (I3/T341).
+//
+// Phase 51 (ADR-077 §4 A8-⑦③b/c, ADR-078 §6 步 7(d)): the lifecycle ledger's
+// domain group shares the `key_lifecycle` enable gate, so an ENABLED ledger adds
+// exactly one key here, immediately after the group it derives from. A
+// deployment with the ledger DISABLED still has both groups absent, and the
+// sequence below is therefore the enabled baseline.
 func p50BaselineStatusKeys() []string {
 	return []string{
 		"enabled", "running", "last_run_at", "last_exported_at",
-		"key_lifecycle", "verification",
+		"key_lifecycle", "key_lifecycle_domains", "verification",
 		"signing_enabled", "signer_key_id", "trusted_keys",
 		"skip_count", "published", "failed", "dir", "interval", "formats", "retain",
 	}

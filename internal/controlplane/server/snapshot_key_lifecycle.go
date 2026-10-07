@@ -109,6 +109,15 @@ type keyLifecycleEntry struct {
 	PrevEventDigest   string          `json:"prev_event_digest,omitempty"` // empty for genesis — the ONLY legal empty prev
 	EventDigest       string          `json:"event_digest"`                // sha256(canonicalLifecyclePayload)
 	Signature         *signatureBlock `json:"signature,omitempty"`         // KAK signature; P37 block reused verbatim
+	// Phase 51 (ADR-077 §4 A1 / ADR-078 §2): the DOMAIN this window was issued
+	// to. It is a DERIVED fact — `signing` or `verifier`, computed by the write
+	// face from the anchor membership it already resolved — never a caller
+	// declaration (`keyLifecycleRequest` gains no field, I9/T376). It sits LAST
+	// and is `omitempty`, so a row written before Phase 51 (Role == "") hashes
+	// BYTE-FOR-BYTE to the same canonical payload and the same event_digest as
+	// before (T363). An empty value therefore means "written before Phase 51",
+	// and never "a third domain".
+	Role string `json:"role,omitempty"`
 }
 
 // keyLifecycleSigned is the exact structure canonicalLifecyclePayload
@@ -125,6 +134,11 @@ type keyLifecycleSigned struct {
 	AuthorityKeyID    string `json:"authority_key_id"`
 	StreamID          string `json:"stream_id"`
 	PrevEventDigest   string `json:"prev_event_digest,omitempty"`
+	// Role is the P51 domain carrier. It is LAST + `omitempty` on purpose: the
+	// canonical payload of a pre-P51 row is unchanged to the byte (ADR-077 §2
+	// probe 4 / T363), while a P51 row additionally commits to its domain under
+	// the KAK signature (A2/A9).
+	Role string `json:"role,omitempty"`
 }
 
 func keyLifecycleSignedFields(e *keyLifecycleEntry) keyLifecycleSigned {
@@ -140,6 +154,7 @@ func keyLifecycleSignedFields(e *keyLifecycleEntry) keyLifecycleSigned {
 		AuthorityKeyID:    e.AuthorityKeyID,
 		StreamID:          e.StreamID,
 		PrevEventDigest:   e.PrevEventDigest,
+		Role:              e.Role,
 	}
 }
 
@@ -281,12 +296,18 @@ type keyLifecycleConfig struct {
 	// sets must never intersect — a key_id in both would make the DOMAIN of its
 	// rows undecidable (which anchor authorized it?), so the write face refuses
 	// it and the read face reports `indeterminate` (A6).
+	// Phase 51 (ADR-077 §4 A1/A9): a row written from now on CARRIES its domain
+	// (`role`), derived at the write face from the very anchor membership tested
+	// above and committed under the KAK signature — so the two trust stores below
+	// are no longer the only place a row's domain can come from. They remain
+	// load-bearing for exactly one thing (A4-2, registered as the historical
+	// residue A8-②): a row written BEFORE Phase 51 has no `role`, and its domain
+	// can only be resolved by the consumer's own pre-Phase-51 rule — the P41
+	// roll-up reads `∉ 当前 verifierTrust`, the P50 authority face reads "in the
+	// verifier anchor" (which is where its whole observation set came from).
 	signingTrust  *exportTrustStore // P37 trust set: manifest signing identities
 	verifierTrust *exportTrustStore // P44 trust set: verification-report signers
-	// Phase 50 keeps the ledger SCHEMA unchanged: an event carries no role field,
-	// so its domain is resolved from these anchors, never stored in the row
-	// (A8-⑧ registers the resulting cost).
-	streamID string // P40 derived identity of this export directory
+	streamID      string            // P40 derived identity of this export directory
 	// observe (Phase 43) is the destruction hook this log's prefix compaction
 	// installs. nil ⇒ the log compacts exactly as it did in Phase 42.
 	observe compactionObserver
@@ -749,6 +770,11 @@ func appendKeyLifecycleEvent(c keyLifecycleConfig, req keyLifecycleRequest, at t
 		AuthorityKeyID:    c.ka.signer.keyID,
 		StreamID:          c.streamID,
 		PrevEventDigest:   prevDigest,
+		// Phase 51 (A1/A2): land the domain the two locals above ALREADY decided.
+		// The admission switch is untouched (I10) — this is a projection of its
+		// outcome, signed by the KAK along with the rest of the payload, so the
+		// domain is an AUTHORIZED fact, not a self-asserted one (A9).
+		Role: lifecycleRoleOf(inSigning, inVerifier),
 	}
 	dg, derr := lifecycleEventDigest(&e)
 	if derr != nil {
@@ -858,9 +884,22 @@ func keyLifecycleSummary(c keyLifecycleConfig) keyLifecycleStatusSummary {
 	if !c.enabled() {
 		return out
 	}
+	st, err := loadKeyLifecycleState(c)
+	return keyLifecycleSummaryFromState(c, st, err)
+}
+
+// keyLifecycleSummaryFromState is keyLifecycleSummary over an ALREADY loaded
+// ledger. Phase 51 needs the same load twice (this group and
+// `key_lifecycle_domains`), and the cost note in ADR-078 §8 permits exactly ONE
+// read of the ledger per status document — so the caller loads once and the two
+// faces are built from the same state. Pure and read-only either way.
+func keyLifecycleSummaryFromState(c keyLifecycleConfig, st *keyLifecycleState, err error) keyLifecycleStatusSummary {
+	out := keyLifecycleStatusSummary{}
+	if !c.enabled() {
+		return out
+	}
 	out.Enabled = true
 	out.Writable = c.writable()
-	st, err := loadKeyLifecycleState(c)
 	if err != nil {
 		out.Error = err.Error()
 		return out
@@ -878,28 +917,32 @@ func keyLifecycleSummary(c keyLifecycleConfig) keyLifecycleStatusSummary {
 	}
 	sortStrings(keyIDs)
 	for _, k := range keyIDs {
-		// Phase 50 (ADR-075 §4 A3/A8-⑦/⑨): a key that sits in the VERIFIER trust
-		// anchor is not a manifest signing subject, so it must never appear in
-		// `authorizations` and must never become `active_key_id` (A8-⑨ keeps the
-		// verifier side's "currently in position" strictly inside its own group).
-		// This is the ONLY filter the Phase adds, and it is the identity transform
-		// on every ledger reachable before Phase 50 (no pre-50 write path could
-		// score a verifier row); T351 pins it.
+		// Phase 51 (ADR-077 §4 A4, ADR-078 §3): which rows this roll-up folds is
+		// now decided by DOMAIN, and the decision has TWO rules — they must not
+		// be merged (ADR-077 §11 blocker B1 / §11.1 M5):
 		//
-		// There is deliberately NO `∈ signingTrust` half. It has no counterpart in
-		// the pre-Phase-50 code — the old loop read every key in `st.byKey` — and
-		// it is NOT the identity: on an ordinary decommission (a trust-FILE edit
-		// between two runs over one directory, same ledger, same signer) the
-		// decommissioned key still owns its rows, so filtering it here would
-		// change `authorizations` and `active_key_id`, breaking A3/I1/§8-⑦. This
-		// roll-up is therefore a pure function of the LEDGER, never of the current
-		// trust file (T362 pins the decommission case).
-		if c.verifierTrust != nil {
-			if _, inVerifier := c.verifierTrust.keys[k]; inVerifier {
-				continue
-			}
+		//   A4-1 (a row that CARRIES `role`): its domain comes from the row
+		//        itself, never from any live trust file. That is what makes a
+		//        RETIRED verifier stay out of `authorizations` (T367).
+		//   A4-2 (a row with NO `role`, i.e. written before Phase 51): it keeps
+		//        the EXACT rule this roll-up used in Phase 50 — `k ∈ 当前
+		//        verifierTrust ⇒ 不列`. That branch still reads the current trust
+		//        file, which is why this roll-up is NOT a pure function of the
+		//        ledger: the residue is registered as A8-②/T371, and T362
+		//        (decommission) / T351 (verifier subject) both stay green because
+		//        each is reading the rule it always read.
+		//
+		// A signing subject that is in NEITHER situation (a key with no ledger
+		// rows at all) never reaches here: `st.byKey` only holds keys with rows.
+		a, n := authorizationForDomain(c, st, k, lifecycleDomainSigning)
+		if n == 0 {
+			// Every row of this subject belongs to another domain (or, for a
+			// pre-Phase-51 row, the Phase 50 filter excludes it). A verifier
+			// anchor subject is not a manifest signing subject: it must never
+			// appear in `authorizations` and must never become `active_key_id`
+			// (ADR-075 A8-⑨).
+			continue
 		}
-		a := st.authorizationFor(k)
 		out.Authorities = append(out.Authorities, a)
 		if a.Source == lifecycleSourceLedger && a.NotAfter == "" {
 			out.ActiveKeyID = k

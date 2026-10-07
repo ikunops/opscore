@@ -174,6 +174,12 @@ type HistoryExportStatus struct {
 	// Phase 41: key lifecycle roll-up. nil (and therefore absent) unless a key
 	// authority trust anchor is configured.
 	KeyLifecycle *keyLifecycleStatusSummary `json:"key_lifecycle,omitempty"`
+	// Phase 51 (ADR-077 §3 / ADR-078 §4): the lifecycle-SUBJECT-DOMAIN group. It
+	// shares the lifecycle ledger's enable gate EXACTLY — the same `key_lifecycle`
+	// condition — so the two groups are always present together or absent together
+	// (I3/T364), and a deployment with no lifecycle ledger stays byte-identical.
+	// Placed immediately after the group it belongs with.
+	KeyLifecycleDomains *lifecycleDomainStatusSummary `json:"key_lifecycle_domains,omitempty"`
 	// Phase 42: verification attestation roll-up. nil (and therefore absent)
 	// unless attestation is enabled.
 	Verification *verificationStatusSummary `json:"verification,omitempty"`
@@ -1572,8 +1578,16 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 	}
 	// Phase 41: omitted entirely when the key authority is not configured, so
 	// the status document stays byte-identical to Phase 40 (ADR-055 §10).
-	if kl := keyLifecycleSummary(s.keyLifecycleConfig()); kl.Enabled {
-		st.KeyLifecycle = &kl
+	// Phase 51 (ADR-078 §8): the ledger is read ONCE here and BOTH read-derived
+	// lifecycle groups are built from that one state.
+	if klc := s.keyLifecycleConfig(); klc.enabled() {
+		klSt, klErr := loadKeyLifecycleState(klc)
+		if kl := keyLifecycleSummaryFromState(klc, klSt, klErr); kl.Enabled {
+			st.KeyLifecycle = &kl
+		}
+		if dl := keyLifecycleDomainSummaryFromState(klc, klSt, klErr); dl.Enabled {
+			st.KeyLifecycleDomains = &dl
+		}
 	}
 	// Phase 42: likewise omitted unless attestation is enabled, so a default
 	// deployment's status document is byte-identical to Phase 41.
