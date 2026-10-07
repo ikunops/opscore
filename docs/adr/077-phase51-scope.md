@@ -64,7 +64,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 
 ## 3. 决策（Scope）
 
-新增**生命周期主体域面**——**不新增密钥类型、不新增账本、不新增证据族、不新增写入路径、不新增路由、不新增常驻组件、不新增 API 参数**；把**写入面已经算出来、却被丢弃的域判定**（事实 3）落进事件，并新增一个**读派生面**把「这个窗口是发给谁的」变成可断言判据，同时把 P41 状态面与 P50 授权面**从「查当前 trust 文件」改为「读账本里的域」**。
+新增**生命周期主体域面**——**不新增密钥类型、不新增账本、不新增证据族、不新增写入路径、不新增路由、不新增常驻组件、不新增 API 参数**；把**写入面已经算出来、却被丢弃的域判定**（事实 3）落进事件，并新增一个**读派生面**把「这个窗口是发给谁的」变成可断言判据，同时把 P41 状态面与 P50 授权面**在携带 `role` 的行上**从「查当前 trust 文件」改为「读账本里的域」（**无 `role` 的历史行**由 A4-2 沿用各自 P50 时代的规则——那是本 Phase **唯一**保留的 trust 文件依赖，A8-② 登记）。
 
 **核心产出**：
 
@@ -162,7 +162,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 
 ## 6. 与既有 Phase 的关系
 
-不降级任何判据。P41 的区间解析与比较**被复用**但**不改语义**（A3/A5：新函数按域切分，旧函数零改动）；P50 的五个行级取值与全局全序**被复用**，只在**明确签名域**这一新输入上新增 `domain_mismatch`；A6 的域歧义复检**保持不变**（它继续覆盖「同时」在两会的情形，本 Phase 覆盖「顺序」迁移，两者非重叠、非替代）。P51 的工程量集中在三处：**写入面把已算出的域落进事件**（末尾 `omitempty` 字段，旧行零字节变化）、**读面的域断言（新面）**、**两个既有面从「查 live trust 文件」改为「读账本内的域」**。**P51 补的是它们共同的前提**：P41 说「这把密钥当时有权」、P50 说「这个观察者在签报告时在位」——**两条都默认「这条区间授权的是**这个**域」**，而这一点此前无人断言（事实 1~8）。
+不降级任何判据。P41 的区间解析与比较**被复用**但**不改语义**（A3/A5：新函数按域切分，旧函数零改动）；P50 的五个行级取值与全局全序**被复用**，只在**明确签名域**这一新输入上新增 `domain_mismatch`；A6 的域歧义复检**保持不变**（它继续覆盖「同时」在两会的情形，本 Phase 覆盖「顺序」迁移，两者非重叠、非替代）。P51 的工程量集中在三处：**写入面把已算出的域落进事件**（末尾 `omitempty` 字段，旧行零字节变化）、**读面的域断言（新面）**、**两个既有面在携带 `role` 的行上改从账本取域**（A4-1；**无 `role` 的历史行**按 A4-2 沿用 P50 的规则，是本 Phase **唯一**保留的 trust 文件依赖）。**P51 补的是它们共同的前提**：P41 说「这把密钥当时有权」、P50 说「这个观察者在签报告时在位」——**两条都默认「这条区间授权的是**这个**域」**，而这一点此前无人断言（事实 1~8）。
 
 ## 7. 顺路清偿登记债（本 Phase 内）
 
@@ -171,7 +171,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | # | 债务 | 处置 |
 |---|---|---|
 | D16 | `docs/adr/075-phase50-scope.md:92`（A8-⑧(b)）声称「key_id 在两个锚之间迁移 ⇒ 本 Phase 以 **A6 的域歧义 fail-closed** 兜底」 | **证伪并改写**：A6 只查**当前**两锚的交集（`snapshot_verifier_authority.go:140`/`:180`），**顺序**迁移两锚从不相交 ⇒ A6 恒定沉默（probe 2 亲跑）。改写为「**由 P51 认领**（ADR-077 §3：`lifecycle_domain_migrated` + 行内 `role`）」 |
-| D17 | `internal/controlplane/server/snapshot_key_lifecycle.go:886-896` 的注释声称该 roll-up「is therefore a pure function of the LEDGER, never of the current trust file」，而 `:897-901` 的过滤读的正是**当前** trust 文件 | 实现轮**改代码**（按行内 `role` 过滤 ⇒ 注释为真）；同时改写 `docs/adr/076-phase50-architecture.md:208`（§9 Q2 以「验证者 key 根本写不进去」论证恒等，而同一 ADR §1③ 恰恰**扩张**了写入面 ⇒ 该论证在 HEAD 上自相矛盾） |
+| D17 | `internal/controlplane/server/snapshot_key_lifecycle.go:886-896` 的注释声称该 roll-up「is therefore a pure function of the LEDGER, never of the current trust file」，而 `:897-901` 的过滤读的正是**当前** trust 文件 | 实现轮**把该注释改写为「不夸大」，而不是「改为为真」**——**「注释为真」是不可兑现的诉求**（A4-2 对无 `role` 的历史行**仍**读当前 trust 文件 ⇒ 该 roll-up 在实现后**依然不是**当前 trust 文件的纯函数）。改写后的措辞必须同时说清两条规则：「**携带 `role` 的行**：域只来自账本（A4-1）；**无 `role` 的历史行**：沿用 P50 的配置式规则（A4-2）⇒ 本 roll-up **不是**当前 trust 文件的纯函数，该依赖登记为 A8-② 的历史残差」。⇒ **本笔债按「残差如实登记」清偿，不按「清零」清偿**（与 P41 T177 / P42 `verification_absent` / P48 A8-④ 同族）。同时改写 `docs/adr/076-phase50-architecture.md:208`（§9 Q2 以「验证者 key 根本写不进去」论证恒等，而同一 ADR §1③ 恰恰**扩张**了写入面 ⇒ 该论证在 HEAD 上自相矛盾） |
 | D18 | `docs/adr/075-phase50-scope.md:91`（A8-⑦）与 `docs/adr/076-phase50-architecture.md:163`（I1）把「`authorizations` 仍只列签名主体」记为「T351 钉死」 | **改写为不夸大**：T351 全程用同一份配置（`snapshot_verifier_authority_test.go:977-1040`），T362 的 fixture **未配 VAK**（`:1629-1648`）⇒ 两条用例都够不到「验证者退役 / 迁移」输入；该承诺的可达性由 P51 的 T367/T368 补上 |
 | D19 | `docs/adr/063-phase44-scope.md:128` 末句仍把「**销毁授权域的重审**」登记为「仍未认领」 | **裁定并改写**：ADR-077 §9 ② 判定**淘汰**（该域的对象是 KAK **自身**的授权——销毁记录的签发者是 KAK，`snapshot_destruction.go:312`/`:647`，而 KAK 是授权的根，**任何**为它开窗口的动作都是自证 ⇒ 空泛，被 R210 击倒；另设 DAK 已由 ADR-061 §1.3 三点论证否决）⇒ 不再悬挂为候选 |
 
@@ -185,7 +185,7 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 
 | 候选 | 裁定 | 依据 |
 |---|---|---|
-| ① **生命周期主体域**（本 Phase） | **采纳** | 真实缺口（§2 事实 1~8 逐行核实 + probe 1/2/3 亲跑复现；ADR-075 A8-⑧ 登记在册且**其自称的兜底被 probe 2 证伪**，其拒绝理由被 probe 4 推翻）；新判据 `domain` / `lifecycle_domain_state` / `domain_mismatch` 对「这条区间发给谁」此前**根本给不出**（事实 1 写入面判了域却丢弃、事实 2 读面只能猜、事实 4/5 P50 面不区域且 A6 抓不住顺序迁移）；它是 P41（when）与 P50（in-authority）两条承重判据的**共同前提**；机制**零新账本、零新族、零新路由、零新 API 参数、零新密钥类型**，复用 P41 的全部读取原语与 P50 的全序纪律，工程量小而确定（P41/P50 的先例：写入面落一个派生字段 + 一个新面 + 两个既有面改取数源 + 红例 + 字节等价自证 = 恰好一个 Phase） |
+| ① **生命周期主体域**（本 Phase） | **采纳** | 真实缺口（§2 事实 1~8 逐行核实 + probe 1/2/3 亲跑复现；ADR-075 A8-⑧ 登记在册且**其自称的兜底被 probe 2 证伪**，其拒绝理由被 probe 4 推翻）；新判据 `domain` / `lifecycle_domain_state` / `domain_mismatch` 对「这条区间发给谁」此前**根本给不出**（事实 1 写入面判了域却丢弃、事实 2 读面只能猜、事实 4/5 P50 面不区域且 A6 抓不住顺序迁移）；它是 P41（when）与 P50（in-authority）两条承重判据的**共同前提**；机制**零新账本、零新族、零新路由、零新 API 参数、零新密钥类型**，复用 P41 的全部读取原语与 P50 的全序纪律，工程量小而确定（P41/P50 的先例：写入面落一个派生字段 + 一个新面 + 两个既有面**在携带 `role` 的行上**改取数源（无 `role` 的历史行按 A4-2 沿用旧规则）+ 红例 + 字节等价自证 = 恰好一个 Phase） |
 | ② **销毁授权域重审**（ADR-063 Q1 的另一半，P50 §9 ② 遗留） | **淘汰** | 该域的对象是 **KAK 自身**的授权：销毁记录的签发者与验证者都是 KAK（`snapshot_destruction.go:312` 原文「not in the trusted KAK set」、`:647` `e.AuthorityKeyID = c.ka.signer.keyID`），而 KAK 是**授权的根**（P41 的 KAK 面即「谁可以给窗口」）。**为根开窗口 = 自证**（KAK 签自己的窗口）⇒ 判据空泛，被 R210 击倒；唯一让它非自证的路是**另设 DAK**，而 ADR-061 §1.3 已以三点论证否决（「DAK 防的对手已具备等价破坏力」/「不产生新维度判据，只是把门槛再抬一级」/「不配占一个密钥位」）⇒ 重开需新证据，本轮**无**新证据（D19 登记） |
 | ③ 呈现/运维面整合 | **淘汰（仍）** | 不产生此前给不出的判据（R210；同 P47/P48/P49/P50 §9 裁定） |
 | ④ HA 多副本 | **淘汰（仍）** | 「一致性不是证据性」（ADR-054 §1.1） |
@@ -217,3 +217,9 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
 | **M2** 「迁移主体」的 `domain` 在 Scope（`domain` 取最后一条 `role` 行 + `migrated` 只作面级列表）与 Architecture（`domainOf` 返回独立的 `MIGRATED` 状态）被定义成不同东西；而 P50 面的 `domain_mismatch` 触发条件写作字面 `d == SIGNING` ⇒ 同一输入两个相反判决；且 ADR-078 §4 的 `subjects.domain` 值域（`signing|verifier|undeclared|conflict`）与 `MIGRATED` 自相矛盾；T368 不覆盖该分歧 | major | ① **值域钉死为恰四个**：`domain ∈ {signing, verifier, undeclared, conflict}`；**`migrated` 是独立的主体级 bool** + 面级 `lifecycle_domain_migrated_keys`，**不是**第五个取值（§3 表与权威定义同步）。② 主体的 `domain` = **最后一条** `role` 行的值（Scope 口径，Architecture 不得另立）。③ **`domain_mismatch` 的触发改为「按验证域折叠」定义**（在册有行 ∧ 无无 `role` 行 ∧ 无 `role=verifier` 行 ∧ 至少一条 `role=signing` 行 ⇒ 在册授权**全部**属另一个域）⇒ **迁移主体（有 `role=verifier` 行）不走该取值**，两个面不再可能相反。④ ADR-078 §3/§4 同步。 |
 | **M3** `declared` 判据自相矛盾：ADR-078 §4 原文「`declared` 蕴含 `undeclared_events == 0`」，而 T366 要求的构造（签名行 + 验证者行 + 一条无 `role` 旧行）必须 `state == "declared"` ∧ `undeclared_events == 1`；且 Scope 条件 ③「且无 `undeclared` 行」未界定是全局还是主体内 | major | ① **删除该蕴含式**，非空泛锚点改为 **`declared` ⟹ `declared_events > 0`**（§3 表 + ADR-078 §4 同步）。② **面级条件 ③ 去掉「无 `undeclared` 行」**，改为「至少一个主体 `domain ∈ {signing, verifier}` ∧ 无 `conflict` 主体」⇒ **存在无 `role` 的行不降级 `declared`**（否则任何存有历史行的账本永远拿不到 `declared`）。③ **T373(a) 加「`declared` ∧ `undeclared_events == 1` 同时成立」**，把该口径机器化。④ **§10 新增 Q6** 记录口径与其理由。 |
 | **M4** 行为变更声明自称「穷举」，却漏掉一条本 Phase **必然**打红的既有冻结面断言：`snapshot_verifier_authority_test.go:349-351`（T340）把**持久化生命周期行的 JSON 键集**钉死为**恰 11 个键**（不含 `role`），而它写的行经**写入面**产生（`:320` `f.activateVAK(p50T0)`）⇒ 新行落 `role` 后 T340 必红；§1 文件清单与 §6 实现步骤只安排了更新 `p50BaselineStatusKeys()`（`:417`，服务 T341） | major | ① **A8-⑦③ 补全为三条既有钉死断言 + 一处基线**：**(a)** `:349-351`（行键集 11 ⇒ **12**）；**(b)** `:386-388`（无 VAK 顶层键序列 == 基线）；**(c)** `:404-405`（有 VAK 时 == 基线 + `["verifier_authority"]`，**含顺序**）；**(d)** 基线本身 `:417`。② ADR-078 §1 文件清单与 §6 实现步骤 7 同步（列出四条具体断言而非笼统的「更新基线」）。③ 明写：**漏掉任何一条都是「未声明的行为变更」**。 |
+
+### 11.1 第二轮评审（1 项 major）
+
+| 发现 | 级别 | 闭合 |
+|---|---|---|
+| **M5** 本 ADR 的**改法描述**与本 ADR 的 **A4-2** 直接矛盾，且把 **D17** 写成**不可能兑现**的债：§3 开头（`:67`）与 §6（`:165`）都说两个既有面「从查当前 trust 文件改为读账本里的域」（无限定），而 A4-2（`:117`/`:120`）明确规定 P41 状态面**对无 `role` 的行继续**按 `∉ 当前 verifierTrust` 判定；⇒ `snapshot_key_lifecycle.go:886-896` 那句「a pure function of the LEDGER, never of the current trust file」在实现后**仍然是假的**，而 D17 的处置却写着「按行内 `role` 过滤 ⇒ **注释为真**」⇒ 实现者按哪一处做都能说另一处错 | major | ① `:67` 与 `:165` 的无限定语句加上限定：**「在携带 `role` 的行上」**，并明写**无 `role` 的历史行由 A4-2 沿用各自 P50 时代的规则，是本 Phase 唯一保留的 trust 文件依赖（A8-② 登记）**。② **D17 的处置改写为「按残差如实登记清偿，不按清零清偿」**：注释要改成**如实描述两条规则**（携带 `role` 的行 ⇒ 域只来自账本；无 `role` 的历史行 ⇒ 沿用 P50 的配置式规则 ⇒ 本 roll-up **不是**当前 trust 文件的纯函数），并**删除「⇒ 注释为真」这个不可兑现的诉求**；与 P41 T177 / P42 `verification_absent` / P48 A8-④「启用前不可断言」同族登记。③ ADR-078 §3 伪码标题与 §6 步骤 3 同步（步骤 3 明写「无 `role` 的行**照搬 `:897-901` 的原规则**，该分支继续读 trust 文件」）。④ §9 ① 的工程量描述同步限定。 |

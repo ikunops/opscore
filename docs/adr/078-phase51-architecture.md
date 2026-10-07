@@ -87,7 +87,7 @@ domainSummary(c keyLifecycleConfig) domainStatusSummary:
         else                                    ⇒ "undeclared"     # 全 UNDECLARED 或空账本
     lifecycle_domain_declared := (state == "declared")   # 派生便捷量，不得另行定义
 
-# ---- P41 状态面（改取数源，D17；A4-2 ⇒ 对无 role 的输入逐字等于 P50）----
+# ---- P41 状态面（**两条规则**，A4-1 + A4-2；D17 的注释按「不夸大」改写，不按「改为为真」）----
 keyLifecycleSummary:  for k in st.byKey (升序):
     if _, n := authorizationForDomain(c, st, k, DOMAIN_SIGNING); n == 0:  continue
     # 有 role 的行按账本（A4-1）；无 role 的行按 P50 的 :897-901 规则（A4-2）
@@ -176,7 +176,7 @@ key_lifecycle_domains = {
 
 1. `keyLifecycleEntry` / `keyLifecycleSigned` / `keyLifecycleSignedFields` 末尾加 `Role`（`omitempty`）+ 写入面落值（`:664` 的两个局部变量）→ T363/T365
 2. 新文件：`domainOf` + `authorizationForDomain`（浅拷贝后调 P41 的 `authorizationFor`）→ T366/T370/T371
-3. **P41 状态面的过滤改取数源**（`:897-901` ⇒ 行内 `role`）→ **先红后绿**：T367（先造 P51 后的验证者行 + 轮换 trust 文件，断言退役主体**不**出现）+ T379
+3. **P41 状态面的过滤改为两条规则**：**有 `role` 的行** ⇒ 行内 `role`（A4-1）；**无 `role` 的行** ⇒ **照搬 `:897-901` 的原规则**（A4-2 —— **该分支继续读 trust 文件**，并在 D17 的注释里如实写明）→ **先红后绿**：T367（先造 P51 后的验证者行 + 轮换 trust 文件，断言退役主体**不**出现）+ T379/T371(T351/T362 双双保持)
 4. **P50 授权面改按验证域折叠 + `domain_mismatch`** → T369/T380（T342/T343/T344/T347/T353/T354/T361 必须原样通过）
 5. 迁移与冲突归类（`migrated` / `conflict` + 面级全序）→ T368/T370/T372/T373
 6. 新组 `key_lifecycle_domains`（§4，全 `omitempty`）+ 零副作用 → T364/T374/T375
@@ -215,3 +215,9 @@ T363→I1（冻结面 + 账本字节等价 + `go.mod`/`go.sum`）；T364→I3（
 | **M2** `migrated` 在 Scope（面级列表）与 Architecture（`domainOf` 返回 `MIGRATED` 状态）之间定义分歧；P50 面触发写作 `d == SIGNING` ⇒ 迁移主体两个面给出相反判决；§4 的 `subjects.domain` 值域与 `MIGRATED` 自相矛盾 | major | ① `domainOf` 返回 **`{domain, migrated}`**，`domain` 值域**恰四个**（`SIGNING | VERIFIER | UNDECLARED | CONFLICT`），`migrated` 是**独立 bool**，§4 schema 写明 `migrated` **不是**第五个取值。② §3 的 `domain_mismatch` 触发**改为「按验证域折叠后 `n == 0`」**，**不**引用主体级 `domain` ⇒ 迁移主体（有 `role=verifier` 行）走常规判定，两面的判决不可能相反。③ §3.2 与 §3.1 同步该口径。 |
 | **M3** §4 原文「`declared` 蕴含 `undeclared_events == 0`」与 T366 要求的 `declared ∧ undeclared_events == 1` 不可能同时成立；面级条件 ③ 的「无 `undeclared` 行」未界定作用域 | major | ① **删除该蕴含式**；非空泛锚点改为 **`declared` ⟹ `declared_events > 0`**，并明写 `declared` 与 `undeclared_events > 0` **可以并存**（否则任何存有历史行的账本永远拿不到 `declared`）。② §3 面级伪码的条件 ③ 去掉「无 UNDECLARED 行」。③ §9 Q5 的「穷举声明」同步。④ ADR-077 §3 权威定义 / T373(a) / §10 Q6 同源闭合。 |
 | **M4** 行为变更声明漏掉一条必然打红的既有冻结面断言：`snapshot_verifier_authority_test.go:349-351`（T340）把**持久化生命周期行的 JSON 键集**钉死为**恰 11 键**，而行经写入面产生（`:320`）⇒ 新行落 `role` 后 T340 必红；§1 与 §6 只安排了 `p50BaselineStatusKeys()` | major | ① §1 **新增一行**：`snapshot_verifier_authority_test.go` **修改**（四条钉死断言逐条列出）。② §6 步骤 7 由「更新基线」改为**四条具体断言**（`:349-351` 11⇒12 / `:386-388` / `:404-405` 含顺序 / `:417`）。③ §8 行为变更声明③补全并写「漏掉任何一条都是未声明的行为变更」。 |
+
+### 10.1 第二轮评审（1 项 major —— 与 ADR-077 §11.1 同源）
+
+| 发现 | 级别 | 闭合（Architecture 侧） |
+|---|---|---|
+| **M5** （见 ADR-077 §11.1）本轮修法（A4-2/I13）与 §6 步骤 3 及 §3 伪码标题的「改取数源」措辞矛盾，且使 D17 的「注释为真」不可兑现：按 A4-2，P41 状态面对无 `role` 的行**继续读 trust 文件** ⇒ `snapshot_key_lifecycle.go:886-896` 的纯函数声明实现后**仍为假** | major | ① §6 步骤 3 由「过滤改取数源（`:897-901` ⇒ 行内 `role`）」改为**两条规则**：有 `role` ⇒ 行内 `role`（A4-1）；无 `role` ⇒ **照搬 `:897-901` 的原规则**（A4-2），并明写**该分支继续读 trust 文件**。② §3 伪码的 P41 段标题同步为「两条规则」，并把「D17 的注释按**不夸大**改写」写进该处。③ 与 I13、A4-2、ADR-077 §7 D17 的「按残差登记清偿」口径一致（三处措辞已统一）。 |
