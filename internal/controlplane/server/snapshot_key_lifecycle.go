@@ -878,24 +878,24 @@ func keyLifecycleSummary(c keyLifecycleConfig) keyLifecycleStatusSummary {
 	}
 	sortStrings(keyIDs)
 	for _, k := range keyIDs {
-		// Phase 50 (ADR-075 §5 A3/A8-⑦/⑨): this roll-up enumerates SIGNING
-		// subjects only. A key that sits in the verifier trust anchor is not a
-		// manifest signing subject, so it must never appear in `authorizations`
-		// and must never become `active_key_id` (A8-⑨ keeps the verifier side's
-		// "currently in position" strictly inside its own group). On every input
-		// reachable before Phase 50 the verifier anchor could not score a single
-		// ledger row, so this condition is the identity transform (T351 pins it).
+		// Phase 50 (ADR-075 §4 A3/A8-⑦/⑨): a key that sits in the VERIFIER trust
+		// anchor is not a manifest signing subject, so it must never appear in
+		// `authorizations` and must never become `active_key_id` (A8-⑨ keeps the
+		// verifier side's "currently in position" strictly inside its own group).
+		// This is the ONLY filter the Phase adds, and it is the identity transform
+		// on every ledger reachable before Phase 50 (no pre-50 write path could
+		// score a verifier row); T351 pins it.
+		//
+		// There is deliberately NO `∈ signingTrust` half. It has no counterpart in
+		// the pre-Phase-50 code — the old loop read every key in `st.byKey` — and
+		// it is NOT the identity: on an ordinary decommission (a trust-FILE edit
+		// between two runs over one directory, same ledger, same signer) the
+		// decommissioned key still owns its rows, so filtering it here would
+		// change `authorizations` and `active_key_id`, breaking A3/I1/§8-⑦. This
+		// roll-up is therefore a pure function of the LEDGER, never of the current
+		// trust file (T362 pins the decommission case).
 		if c.verifierTrust != nil {
 			if _, inVerifier := c.verifierTrust.keys[k]; inVerifier {
-				continue
-			}
-		}
-		// The `∈ signingTrust` half of the ADR-075 §5-A3 condition is applied only
-		// when a signing anchor is configured at all: a directory whose signing
-		// anchor was later removed must keep reading exactly as it did before
-		// (A3's byte-identity promise), never blank out because a set went empty.
-		if c.signingTrust != nil && len(c.signingTrust.keys) > 0 {
-			if _, inSigning := c.signingTrust.keys[k]; !inSigning {
 				continue
 			}
 		}

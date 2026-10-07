@@ -12,7 +12,7 @@
 |---|---|---|
 | `internal/controlplane/server/snapshot_verifier_authority.go` | **新增** | 验证者授权面：验证账本 × 生命周期账本的交汇 / **签发者身份绑定（§2 脚注，M1）** / 逐签发者区间核对（复用 `authorizationFor` + `authorizeByLifecycle` 语义）/ **行级全序裁决（M2）** / 域歧义复检 / 多态判别 / 状态面派生 |
 | `internal/controlplane/server/snapshot_verifier_authority_test.go` | **新增** | T340~T361（22 例） |
-| `internal/controlplane/server/snapshot_key_lifecycle.go` | **修改** | ① `keyLifecycleConfig`（`:274-283`）新增 `verifierTrust *exportTrustStore`；② `appendKeyLifecycleEvent`（`:636`）主体判据由「`∈ signingTrust`」改为「`∈ signingTrust ∪ verifierTrust` ∧ **不得同时在两者中**」（`:648-654`）；③ `keyLifecycleSummary`（`:828-860`）的枚举改为「在签名锚中 ∧ 不在验证者锚中」；④ `:278` 注释与 `:649`/`:652` 拒绝文案更新（D15）。**账本结构 / 规范序列化 / 既有判定零变更** |
+| `internal/controlplane/server/snapshot_key_lifecycle.go` | **修改** | ① `keyLifecycleConfig`（`:274-283`）新增 `verifierTrust *exportTrustStore`；② `appendKeyLifecycleEvent`（`:636`）主体判据由「`∈ signingTrust`」改为「`∈ signingTrust ∪ verifierTrust` ∧ **不得同时在两者中**」（`:648-654`）；③ `keyLifecycleSummary` 的枚举**只加一个**过滤——「不在验证者锚中」（`∉ verifierTrust`）；**不加**「在签名锚中」那半边（终审 M3：它对**退役**输入不是恒等——旧代码遍历 `st.byKey`、无 trust 过滤，而 trust 文件会变，见 ADR-075 §4 A3 / T362）⇒ 枚举仍是**账本的纯函数，永不依赖当前 trust 文件**；④ `:278` 注释与 `:649`/`:652` 拒绝文案更新（D15）。**账本结构 / 规范序列化 / 既有判定零变更** |
 | `internal/controlplane/server/history_export_scheduler.go` | **修改** | ① `keyLifecycleConfig()`（`:637-651`）填 `verifierTrust: s.verifierTrust`；② `Status()`（`:1526`）新增 `VerifierAuthority` 组（全 `omitempty`，与 `KeyLifecycle`（`:1564`）同受「verifier 已配置」约束） |
 | `snapshot_verification.go` · `snapshot_anchor.go` · `snapshot_witness_reconcile.go` · `snapshot_ledger.go` · `history_export_manifest.go` · `snapshot_signature.go` · `snapshot_chain.go` · `history_export_coverage.go` · `appendonly_log.go` · `snapshot_anchor_realization.go` · 冻结五文件 · `internal/protection/**` · `go.mod`/`go.sum` | **零 diff** | A3 承重承诺（**特别**：P42 报告零字节变更 A7-③；P44 判定零变更 A7-②；P41 `authorizeByLifecycle` 唯一调用点 `history_export_manifest.go:596-597` 不动） |
 
@@ -160,7 +160,7 @@ verifier_authority = {
 
 | # | 不变量 |
 |---|---|
-| I1 | 冻结面零 diff（含 `snapshot_verification.go`/`snapshot_anchor.go`/`snapshot_witness_reconcile.go`/`snapshot_ledger.go`/`history_export_manifest.go`/`appendonly_log.go`/`snapshot_anchor_realization.go`）；`internal/protection` 零 diff；`go.mod`/`go.sum` 零改动；P35~P49 判据取值零回归（T340/T351/T352） |
+| I1 | 冻结面零 diff（含 `snapshot_verification.go`/`snapshot_anchor.go`/`snapshot_witness_reconcile.go`/`snapshot_ledger.go`/`history_export_manifest.go`/`appendonly_log.go`/`snapshot_anchor_realization.go`）；`internal/protection` 零 diff；`go.mod`/`go.sum` 零改动；P35~P49 判据取值零回归（T340/T351/T352/T362） |
 | I2 | **P41 语义逐字沿用**：`authorizationFor` / `authorizeByLifecycle` / `validityOf` 三函数**零改动**，边界比较严格沿用「`<` not_before、`≥` not_after、`revoked > rotated_out`、解析失败 ⇒ `time_unparseable`」（T353/T354） |
 | I3 | **未配置验证者 ⇒ 零回归**：新组整组缺席，状态文档逐字节不变（T341） |
 | I4 | **「不可用」≠「不可判」（承重）**：生命周期账本 **load 失败/不可验** ⇒ `indeterminate`（fail-closed）；账本**可读但证明不了该 key 的区间** ⇒ `unbounded`（不可判）。**两者绝不合并**——前者是「证据坏了」，后者是「证据不支持任何断言」（T345/T346） |
@@ -183,11 +183,11 @@ verifier_authority = {
 6. 状态面组（§4，全 `omitempty`）+ 零副作用 → T341/T355
 7. 非折叠与双面同时可见（I5）→ T348
 8. 删除保护复用 P49（跨面）→ T359
-9. 跨维/冻结/字节等价 T340 + 畸形输入 T358 + 零新增族/路由 T356 + 变异 MU1~MU10（红→绿，sha256 还原）+ 三道门禁 + mktree 提交 → T357
+9. 跨维/冻结/字节等价 T340 + 畸形输入 T358 + 零新增族/路由 T356 + 变异 MU1~MU11（红→绿，sha256 还原）+ 三道门禁 + mktree 提交 → T357
 
 ## 7. 测试映射
 
-T340→I1（冻结面 + **P41 账本字节等价** + `go.mod`/`go.sum`）；T341→I3；T342→§3.1/§3.2（新增机制 vs P42/P44/P49 沉默，含 ADR-054 §2.2 悖论的 VAK 复本）；T343→A5（轮换不折叠）；T344→§3.1（激活前）；T345→I4/I7（不可判响亮）；T346→I8（fail-closed + 域歧义）；T347→I6/I9（非空泛 + 空集不为真）；T348→I5（两轨不折叠）；T349→I10（主体集扩张与守卫）；T350→§3.1（状态机复用）；T351→I1（P41 面零回归）；T352→I1（P44 面零回归 + 报告零字节）；T353→I2（边界比较语义）；T354→I2（R41-7 第四词）；T355→§4（零副作用）；T356→I1（零新增族/路由）；T357→MU1~MU10；T358→I8（畸形输入不 panic）；T359→§3.2（删除保护**复用** P49，不重复实现）；**T360→I11**（身份绑定：错配 ⇒ indeterminate，**绝不**核对 `e.KeyID` 那把 key）；**T361→I12**（行级全序首个命中：同 key 混合不得被覆盖）。
+T340→I1（冻结面 + **P41 账本字节等价** + `go.mod`/`go.sum`）；T341→I3；T342→§3.1/§3.2（新增机制 vs P42/P44/P49 沉默，含 ADR-054 §2.2 悖论的 VAK 复本）；T343→A5（轮换不折叠）；T344→§3.1（激活前）；T345→I4/I7（不可判响亮）；T346→I8（fail-closed + 域歧义）；T347→I6/I9（非空泛 + 空集不为真）；T348→I5（两轨不折叠）；T349→I10（主体集扩张与守卫）；T350→§3.1（状态机复用）；T351→I1（P41 面零回归 · **验证者侧**）；**T362→I1（P41 面零回归 · 签名锚漂移恒等：加回 `∈ signingTrust` 半边即必红）**；T352→I1（P44 面零回归 + 报告零字节）；T353→I2（边界比较语义）；T354→I2（R41-7 第四词）；T355→§4（零副作用）；T356→I1（零新增族/路由）；T357→MU1~MU11；T358→I8（畸形输入不 panic）；T359→§3.2（删除保护**复用** P49，不重复实现）；**T360→I11**（身份绑定：错配 ⇒ indeterminate，**绝不**核对 `e.KeyID` 那把 key）；**T361→I12**（行级全序首个命中：同 key 混合不得被覆盖）。
 
 ## 8. 容量与成本（诚实声明）
 
@@ -205,14 +205,15 @@ T340→I1（冻结面 + **P41 账本字节等价** + `go.mod`/`go.sum`）；T341
 | 预判质疑 | 级别 | 自答 |
 |---|---|---|
 | **Q1「I4 为什么要把『账本读不到』与『证明不了区间』分成两个取值？会不会把同一件事说成两种？」** | blocker-if-true | 两者**可同时可达且含义相反**：把一个目录的 `signing-key-log.jsonl` 截断 ⇒ load **成功**但 `verifiable=false`（fail-closed 到 `indeterminate`）；把 KAK 配置去掉 ⇒ load **失败**（同样 `indeterminate`）；而「该 key 从未被记账」⇒ load 成功且**完全可验**，只是**没有**这个 key 的事件 ⇒ `authorizationFor` 返回 `unbounded`（`:439-444` 的原文「Asserting a window for it would invent history」）。⇒ 前两者是「证据坏了」（响亮），后者是「证据不支持断言」（不可判），把后者报成 `indeterminate` 会让**每一个只授权过 manifest 密钥的部署**误报损坏；把前者报成 `unbounded` 会掩盖损坏。T345/T346 判别，MU2/MU3 钉死。 |
-| **Q2「`keyLifecycleSummary` 的过滤会不会改变 P41 既有输出？」** | major | 过滤条件是「在签名锚中 ∧ 不在验证者锚中」。**今天**，验证者 key 在 `appendKeyLifecycleEvent`（`:648-654`）**根本写不进去** ⇒ 该条件对今天的一切输入是**恒等变换** ⇒ 既有输出逐字节不变（T351 先红后绿：先造一条验证者事件，断言 `authorizations`/`active_key_id` **仍是**改造前的值）。 |
+| **Q2「`keyLifecycleSummary` 的过滤会不会改变 P41 既有输出？」** | major | 过滤条件**只有**「不在验证者锚中」（`∉ verifierTrust`）——**没有**「在签名锚中」半边（终审 M3：那半边对**退役**输入不是恒等，会把一把仍持有账本行、但从 trust 文件退役的签名 key 从取值里删掉；ADR-075 §4 A3 是承重承诺，故不采用）。**今天**，验证者 key 在 `appendKeyLifecycleEvent`（`:648-654`）**根本写不进去** ⇒ 这唯一的过滤对今天的一切输入是**恒等变换** ⇒ 既有输出逐字节不变（T351 先红后绿：先造一条验证者事件，断言 `authorizations`/`active_key_id` **仍是**改造前的值；T362 钉死签名锚漂移下的恒等）。 |
 | **Q3「新加 `verifierTrust` 字段会不会改变 6 族的启用门 / 分区表？」** | major | 不会：`verifierTrust` 只进 `keyLifecycleConfig`（一个纯结构体），族注册表（`witnessFamilyRegistry`）、启用门（`witnessFamilyEnabled`）、派发分区表（`anchorDeliveryStreams`）**零改动**（T356 断言四条既有枚举用例取值不变）。 |
 | **Q4「T342 的判别力在哪里？会不会是自说自话的用例？」** | major | 判别支点是**同一用例内两条记录取值相反**（`t ≥ T` ⇒ `after_revocation`；`t < T` ⇒ `authorized`）+ **三个不变**（P42 报告字节、P44 判定、P49 该族取值）。若实现退化成「看一眼有没有 revoked 事件」（与时间无关），两条记录会同值 ⇒ 必红；若把判据塞进 P42 报告 ⇒ T352 必红。MU1/MU4 各自钉住这两条退化路径。 |
 | **Q5「本 Phase 会不会把 `unbounded` 变成『大多数部署永远拿不到这一维』，从而没有价值？」** | note | **会**，且已在 A8-② 显式声明：没有 KAK 的部署拿不到这一维。价值集中在**启用了生命周期账本、且发生过轮换/吊销**的部署 —— 那正是 ADR-054 §2.2 悖论真实发生的场景。**不夸大**：本 Phase 不声称覆盖面，只声称「此前给不出的那条判据现在给得出」。 |
 
-## 10. 评审闭合表（首轮，2 项 major —— 与 ADR-075 §11 同源）
+## 10. 评审闭合表（首轮 2 项 major + 终审 1 项 major —— 与 ADR-075 §11 同源）
 
 | 发现 | 级别 | 闭合（Architecture 侧） |
 |---|---|---|
 | **M1** 新判据的「签发者」锚在 `verificationLogEntry.KeyID`——一个**未与签名绑定**的自证字段上：P44 验签只用 `sb.KeyID`（`snapshot_verification.go:775`），入队点 `:692` 前后无绑定检查（本家族其余三位都有：`snapshot_acceptance.go:251`/`snapshot_destruction.go:315`/`snapshot_key_lifecycle.go:257`）⇒ 持已吊销 VAK-A 私钥者可构造 `key_id = <区间内另一把 key>` + `signature.key_id = A` 的行（`e.KeyID` 只被签名**覆盖**、可任填 `:318`/`:333`），`sigVerdictOK` 并进入 `st.entries` ⇒ 本面去核对那把「区间内」的 key ⇒ 报 `authorized`，真实签发者的区间外事实被掩盖 | major | ① §2 表把「签发者」改为 **`Signature.KeyID`** 并加**脚注**给出完整证据链（含亲跑 `grep -rn "disagrees"` 的逐行归类与写入路径同源事实 `:729`/`:1084`）；② §3 ⑤ 新增 **①.0 身份绑定**步骤：错配 ⇒ 该行 `indeterminate`，**绝不**去核对 `e.KeyID` 那把 key；③ §3.1 新增判别支点行；④ §4 增加面级 `reason`（含「身份错配」）；⑤ §5 新增 **I11**；⑥ §6 步骤 4 前置身份绑定；⑦ §7 映射 T360；⑧ §8 新增**行为变更声明**（并限定范围：错配行的 P44 判定**不变**，不夸大为 P44 缺口闭合）；⑨ ADR-075 同步 §2 事实 8 / §3 表 / §4 A9 / T360 / MU9。**评审建议的修法原样采纳。** |
 | **M2** §3 ⑤ 把行级判决写成**顺序赋值**（`row = VIOLATED if …` / `row = AUTHORIZED if …` / `row = NOTHING_ASSESSED if checked == 0`），按字面执行是 **fail-open**：循环内先置的 `INDETERMINATE` 会被后置赋值覆盖（全部不可解析 ⇒ 退化为 `nothing_assessed`，丢失 T354；一条合法 + 一条不可解析 ⇒ 退化为 `authorized`，直接违反 I7） | major | ① §3 ⑤ 重写为**先计数、后裁决**：循环内只累加计数，循环结束后按**全序首个命中**裁决（`indeterminate > violated > authorized > unbounded > nothing_assessed`），第 ⑤ 步标注**按构造不可达**（防御性兜底）；② 在伪码注释中明写「在循环里写 `row` 就是顺序赋值，方向是 fail-open」；③ §3.1 新增「同 key 混合」判别支点行；④ §5 新增 **I12**（并明写「**禁止**用顺序赋值产出」）；⑤ §4 的 `checked` 定义收紧为「区间可断言 ∧ 时刻可解析」的条数（`unbounded`/`indeterminate` 行不贡献 `claims`）；⑥ §6 步骤 4 标注「先计数后裁决」、§7 映射 T361、MU10；⑦ §9 补 MU10 的判别力说明；⑧ ADR-075 同步 §3 行级全序定义 / T354 / T361 / MU10。 |
+| **终审 M3** `keyLifecycleSummary` 的枚举被改成「在签名锚中 ∧ 不在验证者锚中」，但**前半（`∈ signingTrust`）不是恒等**：旧代码遍历 `st.byKey`、无 trust 过滤，而 trust 文件会变 ⇒ 普通退役（同目录同账本同签名者、被退役 key 仍持有账本行）下 `authorizations`/`active_key_id` 取值改变，违反 I1/A3/§8-⑦；原实现对**空锚**开了例外，非空情形仍回归，T351（只写验证者事件）抓不到 | major | ① §1 ③ 与 §8 Q2 同步为「**只加** `∉ verifierTrust` 一个过滤」；② §5 I1 的映射补 **T362**；③ §7 映射 T362→I1、§9 MU1~MU11；④ §5 I10 的「主体集边界」**不变**（写入面仍按 xor 判据，与本读面过滤无关）。**不走**「声明为行为变更」那条路（A3 承重）。 |

@@ -1598,3 +1598,97 @@ func TestP50T361RowVerdictIsATotalOrderNotSequentialAssignment(t *testing.T) {
 		t.Fatalf("claims must equal the checked sum: %d", sum.Claims)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T362 — the Phase-50 roll-up filter must be the IDENTITY on the SIGNING side
+// (ADR-075 §4 A3 / ADR-076 §5 I1 / §8-⑦). A manifest key decommissioned by a
+// trust-FILE edit — same directory, same ledger, same signer — must keep
+// reading exactly as it did on the run before the edit. The pre-Phase-50
+// `keyLifecycleSummary` had NO trust filter (it enumerated every key in
+// `st.byKey`), so the roll-up is a pure function of the ledger, never of the
+// current trust file. T351 only ever writes a VERIFIER-subject event, so it
+// pins the `∉ verifierTrust` half and never exercises the `∈ signingTrust`
+// half; this case pins the latter.
+// ---------------------------------------------------------------------------
+
+func TestP50T362Phase41RollupSurvivesManifestKeyDecommission(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "snapshots")
+	keyDir := filepath.Join(root, "keys")
+	for _, d := range []string{dir, keyDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	signPriv, signPub, _, _ := genKeyPair(t, keyDir, "signer")
+	kakPriv, kakPub, _, _ := genKeyPair(t, keyDir, "kak")
+	_, extraPub, _, extraPubKey := genKeyPair(t, keyDir, "extra")
+
+	st := &fakeExportStore{res: protection.TransitionReadResult{Transitions: sampleTransitions(), ExportedAt: p50T0, MinSeq: 1, MaxSeq: 3}}
+	build := func(trust []string) *HistoryExportScheduler {
+		s, err := NewHistoryExportScheduler(HistoryExportConfig{
+			Store:                  st,
+			Dir:                    dir,
+			Interval:               time.Hour,
+			Formats:                []string{"json"},
+			SignKeyPath:            signPriv,
+			TrustKeyPaths:          trust,
+			KeyAuthorityPath:       kakPriv,
+			KeyAuthorityTrustPaths: []string{kakPub},
+			Clock:                  func() time.Time { return p50T1 },
+		})
+		if err != nil {
+			t.Fatalf("scheduler: %v", err)
+		}
+		return s
+	}
+
+	// Run 1: the operator trusts TWO manifest signing keys and opens a window for
+	// the second one.
+	s1 := build([]string{signPub, extraPub})
+	extraID := keyIDForPublicKey(extraPubKey)
+	if _, err := s1.AppendKeyLifecycleEvent(keyLifecycleRequest{
+		EventType: lifecycleEventActivated, KeyID: extraID, NotBefore: klTS(p50T0),
+	}); err != nil {
+		t.Fatalf("activate the second manifest key: %v", err)
+	}
+	sum1 := keyLifecycleSummary(s1.keyLifecycleConfig())
+	if len(sum1.Authorities) != 1 || sum1.Authorities[0].KeyID != extraID {
+		t.Fatalf("precondition: run 1 must list the second manifest key, got %+v", sum1.Authorities)
+	}
+	if sum1.ActiveKeyID != extraID {
+		t.Fatalf("precondition: run 1's active_key_id must be %q, got %q", extraID, sum1.ActiveKeyID)
+	}
+
+	// Run 2: the operator decommissions that key — SAME directory, SAME ledger,
+	// SAME signer; only the trust FILE changed (an ordinary decommission). The
+	// ledger still owns the key's row and is still verifiable.
+	s2 := build([]string{signPub})
+	loaded, err := loadKeyLifecycleState(s2.keyLifecycleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.byKey) != 1 {
+		t.Fatalf("precondition: the ledger must still own the decommissioned key's row, got %d key(s)", len(loaded.byKey))
+	}
+	// MU11 discriminator: the decommissioned key is genuinely GONE from the
+	// signing anchor while still owning its row — so re-adding the `∈ signingTrust`
+	// half of the filter (the pre-fix mutant) blanks the roll-up here. This makes
+	// the case red under the mutant and green under the fix.
+	if c := s2.keyLifecycleConfig(); c.signingTrust != nil {
+		if _, stillTrusted := c.signingTrust.keys[extraID]; stillTrusted {
+			t.Fatalf("precondition: the trust-file edit must remove %s from the signing anchor", extraID)
+		}
+	}
+	sum2 := keyLifecycleSummary(s2.keyLifecycleConfig())
+
+	// A3/I1/§8-⑦: both runs read the same ledger and must agree.
+	if len(sum2.Authorities) != len(sum1.Authorities) ||
+		(len(sum2.Authorities) == 1 && sum2.Authorities[0].KeyID != extraID) {
+		t.Fatalf("decommissioning a manifest key (trust-file edit, same dir, same ledger) changed `authorizations` from %+v to %+v",
+			sum1.Authorities, sum2.Authorities)
+	}
+	if sum2.ActiveKeyID != sum1.ActiveKeyID {
+		t.Fatalf("decommissioning a manifest key changed `active_key_id` from %q to %q", sum1.ActiveKeyID, sum2.ActiveKeyID)
+	}
+}
