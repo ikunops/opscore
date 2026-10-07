@@ -154,7 +154,7 @@ key_lifecycle_domains = {
 - **P50 面的新增计数**：`verifier_authority` 组内每行新增 `domain_mismatch`（int，omitempty）；全局新增 `verifier_authority_domain_mismatches`（int）；**全局标量 `verifier_authority_state` 在新输入上可取 `domain_mismatch`**（全序 `indeterminate > violated > domain_mismatch > authorized > nothing_assessed`）。
 - 读面**只读**：既有 load + `os.Stat`；不落盘、不写 audit、不发网络、不派发、不压缩（T375）。
 
-## 5. 不变量（I1~I12）
+## 5. 不变量（I1~I13）
 
 | # | 不变量 |
 |---|---|
