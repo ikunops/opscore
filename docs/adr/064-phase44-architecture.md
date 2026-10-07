@@ -121,11 +121,11 @@ verifyVerificationEntrySignatureIn(e, trust, foreign)         // 新实体：
 | 编号 | 通道 | 对手 | P44 后 | 处置 |
 |---|---|---|---|---|
 | A-1 | 伪造验证**报告**（本地账本末端追加/整体重写） | 持导出私钥 | `verification_unauthorized` ⇒ 账本不可信 ⇒ 无断言（T227/T228） | **闭合**——本 Phase 增量 |
-| **A-3** | 伪造验证**锚定条目**（`kind=verification`，`Overall=attested` + 任意 `ReportDigest`） | 持写权限 + 导出私钥 | **原样保留，未闭合**：条目字段在签名区（`snapshot_anchor.go:109-111`、`:146-148`），导出钥签发即合法（`anchorVerificationReport` 同款 `:1163-1172`），本地对 anchor log 的验签走 manifest 信任锚（`loadAnchorState(s.cfg.Dir, s.trust)`，`:1053`），`dispatchAnchorPath`（`:919-936`）照常发往见证端；锚定对账 A7-11 冻结（ADR-057 §4 A7-11）⇒ **本地与域外均不可检测** | **不修（Scope §8-7 / 已知代价 7）**：修法一=锚定条目 VAK 会签，但见证端今日不验签（`anchorRequest` 携带 `Sig` 无验证方），且五族锚定共用导出钥传输层，单族改签撕裂传输模型；修法二=实现 A7-11 对账——两条都超本 Phase，**列 Phase 45 候选（与 C2 并案评估）** |
+| **A-3** | 伪造验证**锚定条目**（`kind=verification`，`Overall=attested` + 任意 `ReportDigest`） | 持写权限 + 导出私钥 | **原样保留，未闭合**：条目字段在签名区（`snapshot_anchor.go:109-111`、`:146-148`），导出钥签发即合法（`anchorVerificationReport` 同款 `:1163-1172`），本地对 anchor log 的验签走 manifest 信任锚（`loadAnchorState(s.cfg.Dir, s.trust)`，`:1053`），`dispatchAnchorPath`（`:919-936`）照常发往见证端；锚定对账 A7-11 冻结（ADR-057 §4 A7-11）⇒ **本地与域外均不可检测** | **登记已对齐（P49，ADR-073 §7 D8）**：**持导出私钥分支由 P49 兑现面闭合**（`anchor_unrealized`，ADR-073 §3——该对手造不出 VAK 签名的验证账本行来兑现它）；**持 VAK 私钥分支原样保留**（ADR-073 §4 A7-⑧：能伪造证据产物本身者必然能兑现它）。原处置「列 Phase 45 候选」已陈旧：P45 选了 C2，P46/P47/P48 全文对 A-3 零命中 |
 | A-2 | 连账本一起删 | 任意写权限 | `verification_absent`（P42 原样） | 不变 |
 | — | 控制进程/主机（VAK 在线同进程） | 主机级攻击者 | 可伪造 VAK 签名 / 更换 trust 配置重启 | 拓扑代价（Scope 已知代价 1），代码断言不了 |
 
-**结论（不美化）**：P44 闭合 A-1、不闭合 A-3——「报告不能伪造了，但『存在过一份报告』的域外痕迹仍可伪造」。这与 P43 逃逸 A-2（持 KAK 者末端追加）同构：每轮收缩一层、登记一层。
+**结论（不美化）**：P44 闭合 A-1、不闭合 A-3——「报告不能伪造了，但『存在过一份报告』的域外痕迹仍可伪造」。这与 P43 逃逸 A-2（持 KAK 者末端追加）同构：每轮收缩一层、登记一层。**（P49 补记，ADR-073 §7 D8）**：A-3 的**持导出私钥**分支已由 P49 兑现面闭合（`anchor_unrealized`）；**持 VAK 私钥**分支原样保留。
 
 ---
 

@@ -196,6 +196,12 @@ type HistoryExportStatus struct {
 	// byte-identical to Phase 44). Kept as its own alignment group so every
 	// pre-existing line of this struct stays byte-identical.
 	InputIntegrity *inputIntegrityStatusSummary `json:"input_integrity,omitempty"`
+	// Phase 49 (ADR-073 §3 / ADR-074 §4): the anchor-realization group. nil (and
+	// therefore absent) unless anchoring is enabled, so a default deployment's
+	// status document stays byte-identical (T318). It is placed BEFORE the Phase
+	// 47 group so `anchor_delivery` remains the last top-level key (T276's
+	// append-only discipline is a P47 assertion this Phase must not break).
+	AnchorRealization *anchorRealizationStatusSummary `json:"anchor_realization,omitempty"`
 	// Phase 47: anchor delivery roll-up. nil (and therefore absent) unless
 	// anchoring is enabled (ADR-069 A1 — the LAST alignment group, so a default
 	// deployment's status document stays byte-identical). Every field is
@@ -1587,6 +1593,11 @@ func (s *HistoryExportScheduler) Status() HistoryExportStatus {
 	if s.anchorEnabled() {
 		ad := s.AnchorDeliveryStatus()
 		st.AnchorDelivery = &ad
+		// Phase 49 (ADR-074 §4): the realization face is computed in the same
+		// position, from the same read-only stance. Anchoring off leaves the group
+		// nil, so the default deployment's document is byte-identical (T318).
+		ar := s.AnchorRealizationStatus()
+		st.AnchorRealization = &ar
 	}
 	if s.trust != nil {
 		st.TrustedKeys = len(s.trust.keys)
@@ -1662,6 +1673,24 @@ type witnessFamily struct {
 	// signature-blind (trust=nil), because the projection cannot be verified
 	// and the digest is a locally DERIVED value, not a stored one.
 	LocalDigest func(dir string, seq int64) (string, bool)
+
+	// Phase 49 (ADR-073 A1 / ADR-074 §2) — the realization face's two per-family
+	// facts. Both are READ-ONLY declarations about existing load paths; neither
+	// adds a writer, a route or a resident component.
+	//
+	// ArtifactDigest returns the family's ARTIFACT digest for one ledger record,
+	// i.e. the value the anchor entry's claim must equal. rec is the family's own
+	// record type (ledgerEntry / keyLifecycleEntry / *destructionGroup /
+	// verificationLogEntry / acceptanceEntry) as produced by that family's
+	// existing load. nil ⇒ the family's realization is DELEGATED to a strictly
+	// stronger local recompute (ADR-074 §2.2) — the face then reports
+	// `delegated` and never `realized`/`unrealized`.
+	ArtifactDigest func(rec any) (string, error)
+	// CompactionKind is the Phase 43 destruction kind that accounts for a LEGAL
+	// prefix drop of THIS family's main ledger (ADR-074 §2.1). "" ⇒ no accounting
+	// exists, so an identity below the ledger window can never read `compacted`
+	// (it reads `out_of_window` — unjudgeable, never a forgery claim).
+	CompactionKind string
 }
 
 // witnessFamilyRegistry is the static SIX-family table (ADR-068 §2; the sixth
@@ -1670,34 +1699,49 @@ type witnessFamily struct {
 func witnessFamilyRegistry() []witnessFamily {
 	return []witnessFamily{
 		{
-			Name:        witnessFamilyLedger,
-			LedgerPath:  func(dir string) string { return filepath.Join(dir, chainLedgerFile) },
-			AnchorPath:  anchorLogPath,
-			LocalDigest: witnessAnchorDigestFunc(anchorLogPath),
+			Name:           witnessFamilyLedger,
+			LedgerPath:     func(dir string) string { return filepath.Join(dir, chainLedgerFile) },
+			AnchorPath:     anchorLogPath,
+			LocalDigest:    witnessAnchorDigestFunc(anchorLogPath),
+			ArtifactDigest: realizationLedgerArtifactDigest,
+			// ADR-074 §2.1: the chain ledger's prefix is accounted for by the
+			// Phase 43 `ledger_compaction` record the compaction observer writes
+			// (history_export_scheduler.go recordLedgerEntry).
+			CompactionKind: destructionKindLedgerCompaction,
 		},
 		{
-			Name:        witnessFamilyKeyLifecycle,
-			LedgerPath:  keyLifecycleLogPath,
-			AnchorPath:  keyLifecycleAnchorPath,
-			LocalDigest: witnessAnchorDigestFunc(keyLifecycleAnchorPath),
+			Name:           witnessFamilyKeyLifecycle,
+			LedgerPath:     keyLifecycleLogPath,
+			AnchorPath:     keyLifecycleAnchorPath,
+			LocalDigest:    witnessAnchorDigestFunc(keyLifecycleAnchorPath),
+			ArtifactDigest: realizationKeyLifecycleArtifactDigest,
+			CompactionKind: destructionKindKeyLifecycleCompaction,
 		},
 		{
-			Name:        witnessFamilyDestruction,
-			LedgerPath:  destructionLogPath,
-			AnchorPath:  destructionAnchorPath,
-			LocalDigest: witnessAnchorDigestFunc(destructionAnchorPath),
+			Name:           witnessFamilyDestruction,
+			LedgerPath:     destructionLogPath,
+			AnchorPath:     destructionAnchorPath,
+			LocalDigest:    witnessAnchorDigestFunc(destructionAnchorPath),
+			ArtifactDigest: realizationDestructionArtifactDigest,
+			// The destruction log bounds ITSELF (ADR-061 I5), so its own prefix
+			// drop is accounted by a `self_compaction` record.
+			CompactionKind: destructionKindSelfCompaction,
 		},
 		{
-			Name:        witnessFamilyVerification,
-			LedgerPath:  verificationLogPath,
-			AnchorPath:  verificationAnchorPath,
-			LocalDigest: witnessAnchorDigestFunc(verificationAnchorPath),
+			Name:           witnessFamilyVerification,
+			LedgerPath:     verificationLogPath,
+			AnchorPath:     verificationAnchorPath,
+			LocalDigest:    witnessAnchorDigestFunc(verificationAnchorPath),
+			ArtifactDigest: realizationVerificationArtifactDigest,
+			CompactionKind: destructionKindVerificationCompaction,
 		},
 		{
-			Name:        witnessFamilyAcceptance,
-			LedgerPath:  acceptanceLogPath,
-			AnchorPath:  acceptanceAnchorPath,
-			LocalDigest: witnessAnchorDigestFunc(acceptanceAnchorPath),
+			Name:           witnessFamilyAcceptance,
+			LedgerPath:     acceptanceLogPath,
+			AnchorPath:     acceptanceAnchorPath,
+			LocalDigest:    witnessAnchorDigestFunc(acceptanceAnchorPath),
+			ArtifactDigest: realizationAcceptanceArtifactDigest,
+			CompactionKind: destructionKindAcceptanceCompaction,
 		},
 		// Phase 48 (ADR-072 §2(a)): the SIXTH family. Its main ledger is the hash
 		// chain of decision records and its anchor stream carries the chain head
@@ -1710,6 +1754,21 @@ func witnessFamilyRegistry() []witnessFamily {
 			LedgerPath:  decisionLogPath,
 			AnchorPath:  decisionAnchorPath,
 			LocalDigest: witnessAnchorDigestFunc(decisionAnchorPath),
+			// Phase 49 (ADR-074 §2.2, the LOAD-BEARING delegation): ArtifactDigest
+			// stays nil. P48's local recompute (decisionLogStateAt: re-walk the
+			// chain, compare the head) is a STRICTLY STRONGER judgement than this
+			// face's naive "chain-head record digest == anchored digest", so the
+			// family is DELEGATED and this face reports `delegated` — never
+			// `realized`/`unrealized`. The registry stays exactly SIX rows (the
+			// closed-table discipline of ADR-073 §3): a future family must decide
+			// its realization ownership here, so no family can be silently
+			// unjudged.
+			ArtifactDigest: nil,
+			// "" — P48 declared a nil observer for the decision log's prefix
+			// compaction (snapshot_decision_attest.go §3.4): bounded retention of a
+			// chain whose HEAD is unchanged is not a destruction, so no accounting
+			// exists and an identity below the window reads `out_of_window`.
+			CompactionKind: "",
 		},
 	}
 }

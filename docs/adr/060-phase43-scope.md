@@ -220,7 +220,7 @@ P38 链 `prev_manifest_digest` 引用了一个不存在的前驱 / P39 ledger �
 
 - **Q1 锚定是否强制？** 我：**不强制**，复用 `--export-anchor-*` ⇒ **judge 采纳**。代价：未启用 ⇒ 逃逸 A-1 本地不可检测。
 - **Q2 `policy` 是否升级为授权判定？** 我：**否** ⇒ **judge 采纳**（正确的 scope 收窄：P43 只判「是否被记账」，不判「是否被允许」）。
-- **Q3 pre-export drop 是否纳入？** 我：**否** ⇒ **judge 采纳**，列 Phase 45。
+- **Q3 pre-export drop 是否纳入？** 我：**否** ⇒ **judge 采纳**。**（P49 补记，ADR-073 §7 D9）登记已对齐：原「列 Phase 45」已陈旧（P45 选了 C2，P45~P48 对本项零命中）⇒ 至今未做，且本轮仍不认领**——其判据**已存在**（`runtime_dropped`/`file_dropped`/`Truncated` 见 `mgmt_obs.go:265-283`），剩余的是**接入**而非新判据 ⇒ 被 R210 尺子击倒（不产生此前给不出的判据）。不再悬挂为「候选」。
 
 ---
 

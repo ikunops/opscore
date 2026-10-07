@@ -87,9 +87,14 @@ var (
 	verificationDispatchMu sync.Mutex
 )
 
-// anchorDeliveryStreams is the static five-family table (ADR-070 §2). It is the
-// single source of truth for both the partition test (T277) and the read face's
-// `swept_by` column.
+// anchorDeliveryStreams is the static six-family table (ADR-070 §2; the sixth
+// family added by ADR-072 §2). It is the single source of truth for both the
+// partition test (T277) and the read face's `swept_by` column.
+//
+// Phase 49 (ADR-073 §7 D11) — COMMENT ONLY: the table has held SIX rows since
+// Phase 48, while this sentence still said "five-family". The correction is a
+// comment edit, not a code change: the stream count, the sweep partition and
+// every response byte are untouched (T331 asserts the count stays six).
 func anchorDeliveryStreams() []anchorDeliveryStream {
 	return []anchorDeliveryStream{
 		{

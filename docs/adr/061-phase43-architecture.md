@@ -290,7 +290,7 @@ func compactLogPrefixGroupsObserved(path string, keepGroups int, classify groupC
 3. 只覆盖启用之后发生的销毁；历史空洞永远是 `indeterminate`，P43 不追溯。
 4. `destruction_unconfirmed` 会长期滞留（无自动收敛）。
 5. **【原第 5 条替换】C1 残差按对手分层**：对持导出私钥者，P43 已闭合（T217）；对持 KAK 者，残差原样保留（第 1 条）。
-6. pre-export 丢失（ring/file drop）不在本平面，记录从未进入证据链 ⇒ P43 无法记账（Q3，列 Phase 45）。
+6. pre-export 丢失（ring/file drop）不在本平面，记录从未进入证据链 ⇒ P43 无法记账。**（P49 补记，ADR-073 §7 D9）登记已对齐：原「Q3，列 Phase 45」已陈旧（P45 选了 C2，P45~P48 对本项零命中）⇒ 至今未做，且本轮仍不认领**——其判据已存在（`runtime_dropped`/`file_dropped`/`Truncated`，`mgmt_obs.go:265-283`），剩余的是接入而非新判据 ⇒ 被 R210 尺子击倒。不再悬挂为「候选」。
 7. **targets 摘要不可得时退化为 id 匹配**（§4.2）：此时「记账的那一项」与「消失的那一项」只靠 id 关联，强度低于 id+digest。
 
 ---

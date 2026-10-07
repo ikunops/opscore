@@ -535,7 +535,8 @@ func TestP47T284PendingVisibleAndExistingStatusUnchanged(t *testing.T) {
 	if post.AnchorDelivery == nil || post.AnchorDelivery.Converged {
 		t.Fatalf("T284: the global converged must be false while a stream is pending: %+v", post.AnchorDelivery)
 	}
-	// The pre-existing document (every field but anchor_delivery) is byte-identical.
+	// The pre-existing document (every field but the Phase 47 and Phase 49
+	// groups) is byte-identical.
 	if got := p47WithoutDelivery(t, post); got != preJSON {
 		t.Fatalf("T284: seeding anchor streams must not change the pre-existing status:\n got %s\nwant %s", got, preJSON)
 	}
@@ -546,9 +547,18 @@ func TestP47T284PendingVisibleAndExistingStatusUnchanged(t *testing.T) {
 }
 
 // p47WithoutDelivery marshals the status with the Phase 47 group removed.
+//
+// Phase 49 (ADR-074 §4) adds a SECOND new top-level group, `anchor_realization`,
+// and it legitimately moves with the anchor-stream content: T284 seeds three
+// `pending` anchor entries claiming evidence no main ledger holds, so the new
+// face reads those families `unrealized` — which is exactly its job. T284's
+// assertion is that the P47 ADDITION does not perturb the PRE-P47 document, so
+// both post-P47 groups are dropped here; every other field is still compared
+// byte-for-byte.
 func p47WithoutDelivery(t *testing.T, st HistoryExportStatus) string {
 	t.Helper()
 	st.AnchorDelivery = nil
+	st.AnchorRealization = nil
 	data, err := json.Marshal(st)
 	if err != nil {
 		t.Fatal(err)

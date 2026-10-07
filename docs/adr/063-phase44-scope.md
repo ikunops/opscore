@@ -125,7 +125,7 @@ P42 把「从未验证」变成可断言，但 ADR-057 §6 已知代价 1 同一
 6. 不改 P43 销毁面任何文件；
 7. 不迁移/转换既有 `verification-log.jsonl`（fail-closed，不洗白，Q2 / T229）；
 8. 不做验证者的人类身份、授权策略或审批流判定（同 P43 Q2 边界，`policy` 是声明不是授权）；
-9. 不提供 VAK 旋转/吊销机制（静态锚，同 manifest trust 先例；列 Phase 45+ 候选）；
+9. 不提供 VAK 旋转/吊销机制（静态锚，同 manifest trust 先例）。**（P49 补记，ADR-073 §7 D10）登记已对齐：P45~P48 对「VAK 旋转/吊销」零命中 ⇒ 至今未做，且本轮仍不认领**——它是「when」维度在**另一把密钥**上的延伸（需独立威胁模型与 KAK 授权的第二账本，工程量 ≥1 Phase），且**不解决 A-3**（能吊销 VAK 者仍可伪造锚定条目）⇒ 排序在兑现面之后。不再悬挂为「Phase 45+ 候选」；
 10. 不回写既有只读面任何既有字段（新字段全 omitempty）；
 11. 不新建第二套 append-only / canonical / 签名实现；
 12. 不改 `go.mod` / `go.sum` 与四冻结包（platform / governance / plugin/{runtime,isolation} / controlplane/hostregistry）；
@@ -155,7 +155,7 @@ P42 把「从未验证」变成可断言，但 ADR-057 §6 已知代价 1 同一
 4. **`verifier_independent` 是构造期事实的投影**：互斥由守卫在构造期判定，运行期不持续重证（前提：trust 配置进程内不可变）；
 5. **词汇双轨**：`verification_unauthorized`（异族已知钥）与 `key_unknown`（无锚钥）的区分要求读者理解 I3——若 Architecture 轮认为区分成本 > 收益，可收敛为单一词汇（Q3 备选）；
 6. **继承自 P43 的两条程序债**（r218 裁定应补入 ADR-060/061 §8；本轮实测 grep 两 ADR 均无此二行，因单文件纪律未触碰已发布 ADR，登记如下保持账目可见）：① stuck-intended 组的 publications 可能同时出现在 `unaccounted` 与 `unconfirmed`；② destruction-anchor 流自身 compaction 不被观察（I5 自指，无外部损失）；
-7. **【R44-1 新增】验证锚定条目通道原样**：持导出私钥者仍可伪造 `kind=verification` 锚定条目（`Overall=attested` + 任意 `ReportDigest`）并被见证端接收——本地验签走 manifest 信任锚（`snapshot_verification.go:1053`），本地不可检测；域外检测依赖被冻结的对账（A7-11，ADR-057 §4 A7-11）。P44 收缩的是「验证报告」通道，**不是**「验证锚定条目」通道；处置（为何本 Phase 不修）见 ADR-064 §7，与 C2 一并列为 Phase 45 候选。
+7. **【R44-1 新增】验证锚定条目通道原样**：持导出私钥者仍可伪造 `kind=verification` 锚定条目（`Overall=attested` + 任意 `ReportDigest`）并被见证端接收——本地验签走 manifest 信任锚（`snapshot_verification.go:1053`），本地不可检测；域外检测依赖被冻结的对账（A7-11，ADR-057 §4 A7-11）。P44 收缩的是「验证报告」通道，**不是**「验证锚定条目」通道。**（P49 补记，ADR-073 §7 D8）处置已对齐：持导出私钥分支由 P49 兑现面闭合（`anchor_unrealized`，ADR-073 §3）；持 VAK 私钥分支原样保留（ADR-073 §4 A7-⑧）。** 原处置「与 C2 一并列为 Phase 45 候选」已陈旧：P45 选了 C2，P46/P47/P48 全文对 A-3 零命中。
 
 ---
 
