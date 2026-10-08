@@ -2,7 +2,7 @@
 
 - **Status**: Proposed (Phase 50, Architecture stage)
 - **Base**: ADR-075（Scope）。冲突以 Scope 为准。
-- **前置**：Phase 49 CLOSED（HEAD = `8188879`），最大既有 T 编号 = **T339**（`snapshot_anchor_realization_test.go`，P49 §5），故本 Phase 用 **T340~T361**。
+- **前置**：Phase 49 CLOSED（HEAD = `8188879`），最大既有 T 编号 = **T339**（`snapshot_anchor_realization_test.go`，P49 §5），故本 Phase 用 **T340~T362**（T362 由实现轮终审修复 `fcf5506` 补入；ADR-076 原文写 T340~T361，本次修正为实测值）。
 
 ---
 
@@ -11,7 +11,7 @@
 | 文件 | 变更 | 内容 |
 |---|---|---|
 | `internal/controlplane/server/snapshot_verifier_authority.go` | **新增** | 验证者授权面：验证账本 × 生命周期账本的交汇 / **签发者身份绑定（§2 脚注，M1）** / 逐签发者区间核对（复用 `authorizationFor` + `authorizeByLifecycle` 语义）/ **行级全序裁决（M2）** / 域歧义复检 / 多态判别 / 状态面派生 |
-| `internal/controlplane/server/snapshot_verifier_authority_test.go` | **新增** | T340~T361（22 例） |
+| `internal/controlplane/server/snapshot_verifier_authority_test.go` | **新增** | T340~T362（23 例） |
 | `internal/controlplane/server/snapshot_key_lifecycle.go` | **修改** | ① `keyLifecycleConfig`（`:274-283`）新增 `verifierTrust *exportTrustStore`；② `appendKeyLifecycleEvent`（`:636`）主体判据由「`∈ signingTrust`」改为「`∈ signingTrust ∪ verifierTrust` ∧ **不得同时在两者中**」（`:648-654`）；③ `keyLifecycleSummary` 的枚举**只加一个**过滤——「不在验证者锚中」（`∉ verifierTrust`）；**不加**「在签名锚中」那半边（终审 M3：它对**退役**输入不是恒等——旧代码遍历 `st.byKey`、无 trust 过滤，而 trust 文件会变，见 ADR-075 §4 A3 / T362）⇒ 枚举仍是**账本的纯函数，永不依赖当前 trust 文件**；④ `:278` 注释与 `:649`/`:652` 拒绝文案更新（D15）。**账本结构 / 规范序列化 / 既有判定零变更** |
 | `internal/controlplane/server/history_export_scheduler.go` | **修改** | ① `keyLifecycleConfig()`（`:637-651`）填 `verifierTrust: s.verifierTrust`；② `Status()`（`:1526`）新增 `VerifierAuthority` 组（全 `omitempty`，与 `KeyLifecycle`（`:1564`）同受「verifier 已配置」约束） |
 | `snapshot_verification.go` · `snapshot_anchor.go` · `snapshot_witness_reconcile.go` · `snapshot_ledger.go` · `history_export_manifest.go` · `snapshot_signature.go` · `snapshot_chain.go` · `history_export_coverage.go` · `appendonly_log.go` · `snapshot_anchor_realization.go` · 冻结五文件 · `internal/protection/**` · `go.mod`/`go.sum` | **零 diff** | A3 承重承诺（**特别**：P42 报告零字节变更 A7-③；P44 判定零变更 A7-②；P41 `authorizeByLifecycle` 唯一调用点 `history_export_manifest.go:596-597` 不动） |

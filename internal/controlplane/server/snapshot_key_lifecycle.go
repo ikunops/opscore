@@ -754,7 +754,7 @@ func appendKeyLifecycleEvent(c keyLifecycleConfig, req keyLifecycleRequest, at t
 		}
 		history = append(history, e)
 	}
-	if verr := validateLifecycleTransition(history, req); verr != nil {
+	if verr := validateLifecycleTransition(history, req, lifecycleRoleOf(inSigning, inVerifier)); verr != nil {
 		return zero, verr
 	}
 
@@ -801,11 +801,33 @@ func appendKeyLifecycleEvent(c keyLifecycleConfig, req keyLifecycleRequest, at t
 
 // validateLifecycleTransition enforces the per-key state machine (ADR-055 §3).
 // Every refusal is fail-closed: nothing is written and the file is untouched.
-func validateLifecycleTransition(history []keyLifecycleEntry, req keyLifecycleRequest) error {
+func validateLifecycleTransition(history []keyLifecycleEntry, req keyLifecycleRequest, newRole string) error {
 	var mine []keyLifecycleEntry
 	for _, e := range history {
 		if e.KeyID == req.KeyID {
 			mine = append(mine, e)
+		}
+	}
+	// Single-domain subjects (Phase 51 review R1 — load-bearing). The anchor-side
+	// domain now lands in the evidence, but ONE consumer is frozen and folds a
+	// subject's rows WITHOUT looking at `role`: the Phase 41 verdict face
+	// (history_export_manifest.go:596 `authorizationFor(v.KeyID)`, and the Phase 42
+	// ruler at snapshot_verification.go:979). If a subject carried rows of two
+	// DECLARED domains, that consumer would fold a foreign domain's terminal bound
+	// into the signing interval and report `signature_after_rotation` /
+	// `signature_after_revocation` for a manifest signed INSIDE the key's true
+	// signing window — a false accusation produced by a legitimate-looking write.
+	// So the shape must not exist, exactly as Phase 50 refuses a key that sits in
+	// BOTH anchors at once: a record whose domain is undecidable is not written
+	// down. A key that must serve the other domain needs a NEW key_id (which Phase
+	// 44's "deliberately a different key" requires anyway). Rows with NO `role`
+	// (Phase 50-era, or written by another build) are not judged here — their
+	// residue is registered separately (ADR-077 A8-②).
+	if newRole != "" {
+		for _, e := range mine {
+			if e.Role != "" && e.Role != newRole {
+				return fmt.Errorf("key lifecycle: key %q already carries a %s-domain row — a subject's domain is fixed by its first declared row, and a %s-domain event would make the frozen Phase 41 verdict face fold two domains into one interval; use a new key_id", req.KeyID, e.Role, newRole)
+			}
 		}
 	}
 	activated, terminal := false, ""

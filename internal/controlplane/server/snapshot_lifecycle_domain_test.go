@@ -1,6 +1,6 @@
 package server
 
-// Phase 51 — Lifecycle Subject Domain tests (T363~T383; ADR-077 §5, ADR-078 §7).
+// Phase 51 — Lifecycle Subject Domain tests (T363~T384; ADR-077 §5, ADR-078 §7).
 //
 // The discriminating cases all follow one shape: ONE ledger that a pre-Phase-51
 // reader could only answer by consulting the deployment's LIVE trust file is now
@@ -644,6 +644,12 @@ func TestP51T367RetiredVerifierStaysOutOfTheSigningRollup(t *testing.T) {
 // ---------------------------------------------------------------------------
 // T368 — red example B: a SEQUENTIAL migration is the domain face's job, and A6
 // is silent on it (A8-③)
+//
+// JUDGE ROUND 2 (A11/I14): the real write face now REFUSES to create this shape
+// (see T384), so the migrated ledger is built on the BYTES — the only way such a
+// ledger is reachable any more is another build or a hand-edited file, which is
+// exactly what this detector exists for. Everything below the construction is
+// unchanged.
 // ---------------------------------------------------------------------------
 
 func TestP51T368SequentialMigrationIsReportedAndA6IsSilent(t *testing.T) {
@@ -651,18 +657,22 @@ func TestP51T368SequentialMigrationIsReportedAndA6IsSilent(t *testing.T) {
 	mPriv, mPub, mID := e.key("moving")
 	v2Priv, v2Pub, _ := e.key("vak2")
 
-	// Run 1: M is a VERIFIER and its window is opened for real.
+	// Run 1: M is a VERIFIER and its window is opened for real (through the write
+	// face — role=verifier).
 	s1 := e.build([]string{e.signPub}, mPriv, []string{mPub})
 	e.activate(s1, mID, p50T0)
 
-	// Run 2: the SAME key_id is now a MANIFEST SIGNING subject. It is never in
-	// both anchors at once, so the construction guard has nothing to see, and a
-	// NEW event declares the new domain.
+	// Run 2: the SAME key_id is now a MANIFEST SIGNING subject. The write face
+	// refuses to record that (T384), so the row is appended as BYTES: a
+	// self-consistent, KAK-signed row carrying role=signing.
 	s2 := e.build([]string{e.signPub, mPub}, v2Priv, []string{v2Pub})
 	if ov := verifierTrustOverlap(s2.trust, s2.verifierTrust); len(ov) != 0 {
 		t.Fatalf("A6 must be silent on a sequential migration, got overlap %v", ov)
 	}
-	e.terminal(s2, mID, lifecycleEventRotatedOut, p50T5)
+	if _, err := s2.AppendKeyLifecycleEvent(keyLifecycleRequest{EventType: lifecycleEventRotatedOut, KeyID: mID, NotAfter: klTS(p50T5)}); err == nil {
+		t.Fatal("A11/I14: the write face must REFUSE a cross-domain event (see T384)")
+	}
+	e.rawRow(s2, mID, lifecycleDomainSigning, lifecycleEventRotatedOut, "", klTS(p50T5))
 
 	sum := p51DomainFace(s2)
 	if sum.State != lifecycleDomainStateMigrated {
@@ -1016,14 +1026,17 @@ func TestP51T374UndecidableIsLoud(t *testing.T) {
 		t.Fatalf("undeclared must be loud at both levels: %+v", und)
 	}
 
-	// migrated
+	// migrated (A11/I14: the write face refuses the shape, so the row is bytes)
 	g := newP51Env(t)
 	mPriv, mPub, mID := g.key("moving")
 	s1 := g.build([]string{g.signPub}, mPriv, []string{mPub})
 	g.activate(s1, mID, p50T0)
 	v2Priv, v2Pub, _ := g.key("vak2")
 	s2 := g.build([]string{g.signPub, mPub}, v2Priv, []string{v2Pub})
-	g.terminal(s2, mID, lifecycleEventRotatedOut, p50T5)
+	if _, err := s2.AppendKeyLifecycleEvent(keyLifecycleRequest{EventType: lifecycleEventRotatedOut, KeyID: mID, NotAfter: klTS(p50T5)}); err == nil {
+		t.Fatal("A11: the write face must refuse a cross-domain event")
+	}
+	g.rawRow(s2, mID, lifecycleDomainSigning, lifecycleEventRotatedOut, "", klTS(p50T5))
 	mig := p51DomainFace(s2)
 	if mig.Reason == "" || p51Subject(t, mig, mID).Reason == "" {
 		t.Fatalf("migrated must be loud at both levels: %+v", mig)
@@ -1449,14 +1462,18 @@ func TestP51T382MutationSensitivity(t *testing.T) {
 		t.Fatalf("MU3 baseline: %+v", u)
 	}
 
-	// MU4 (fold migrated into conflict) — a two-domain subject.
+	// MU4 (fold migrated into conflict) — a two-domain subject. A11/I14: the write
+	// face refuses the shape, so the second row is bytes.
 	e4 := newP51Env(t)
 	mPriv, mPub, mID := e4.key("moving")
 	t1 := e4.build([]string{e4.signPub}, mPriv, []string{mPub})
 	e4.activate(t1, mID, p50T0)
 	v4Priv, v4Pub, _ := e4.key("vak2")
 	t2 := e4.build([]string{e4.signPub, mPub}, v4Priv, []string{v4Pub})
-	e4.terminal(t2, mID, lifecycleEventRotatedOut, p50T5)
+	if _, err := t2.AppendKeyLifecycleEvent(keyLifecycleRequest{EventType: lifecycleEventRotatedOut, KeyID: mID, NotAfter: klTS(p50T5)}); err == nil {
+		t.Fatal("A11: the write face must refuse a cross-domain event")
+	}
+	e4.rawRow(t2, mID, lifecycleDomainSigning, lifecycleEventRotatedOut, "", klTS(p50T5))
 	if mig := p51DomainFace(t2); mig.State != lifecycleDomainStateMigrated || len(mig.ConflictKeys) != 0 {
 		t.Fatalf("MU4 baseline: %+v", mig)
 	}
@@ -1587,5 +1604,90 @@ func TestP51T383FacesAreSimultaneouslyVisible(t *testing.T) {
 	}
 	if !st.verifiable {
 		t.Fatalf("the ledger stays verifiable across the rotation: %v", st.errs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T384 — the SINGLE-DOMAIN invariant (judge round 2, ADR-077 A11 / ADR-078 I14):
+// the write face refuses to create a two-domain subject
+// ---------------------------------------------------------------------------
+//
+// The domain now rides in the evidence, but ONE consumer is frozen and folds a
+// subject's rows without looking at `role` (history_export_manifest.go:596, plus
+// P42's ruler at snapshot_verification.go:979). A subject carrying two DECLARED
+// domains would make that face read `signature_after_rotation` on a manifest
+// signed inside the key's true window, so the shape is refused at the write face
+// exactly as Phase 50 refuses a key sitting in both anchors at once.
+func TestP51T384WriteFaceRefusesCrossDomainEvent(t *testing.T) {
+	ledger := func(s *HistoryExportScheduler) string {
+		t.Helper()
+		b, err := os.ReadFile(keyLifecycleLogPath(s.cfg.Dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+
+	e := newP51Env(t)
+	mPriv, mPub, mID := e.key("moving")
+	v2Priv, v2Pub, _ := e.key("vak2")
+
+	// Run 1: M is the VERIFIER; a window is opened for it through the write face.
+	s1 := e.build([]string{e.signPub}, mPriv, []string{mPub})
+	e.activate(s1, mID, p50T0)
+	before := ledger(s1)
+
+	// Run 2: M is now in the SIGNING anchor. Recording a signing-domain event for
+	// it would span two declared domains.
+	s2 := e.build([]string{e.signPub, mPub}, v2Priv, []string{v2Pub})
+	_, err := s2.AppendKeyLifecycleEvent(keyLifecycleRequest{
+		EventType: lifecycleEventRotatedOut, KeyID: mID, NotAfter: klTS(p50T5),
+	})
+	if err == nil {
+		t.Fatal("T384/A11: a cross-domain event must be REFUSED")
+	}
+	if !strings.Contains(err.Error(), "fixed by its first declared row") || !strings.Contains(err.Error(), "new key_id") {
+		t.Fatalf("T384: the refusal must name the rule and the remedy, got %q", err.Error())
+	}
+	if got := ledger(s2); got != before {
+		t.Fatal("T384: a refused write must leave the ledger BYTE-IDENTICAL")
+	}
+
+	// The domain face still reads exactly what the ledger holds: one declared
+	// verifier subject, and it never became `migrated`.
+	sum := p51DomainFace(s2)
+	sub := p51Subject(t, sum, mID)
+	if sub.Domain != lifecycleDomainVerifier || sub.Migrated {
+		t.Fatalf("T384: the subject must stay single-domain (verifier), got %+v", sub)
+	}
+	if sum.State != lifecycleDomainStateDeclared {
+		t.Fatalf("T384: one declared verifier subject => declared, got %s (%s)", sum.State, sum.Reason)
+	}
+	if len(sum.MigratedKeys) != 0 {
+		t.Fatalf("T384: the refused shape must not appear as migrated: %v", sum.MigratedKeys)
+	}
+
+	// The reverse direction is refused too: a verifier-anchor event for a subject
+	// that already carries a signing-domain row.
+	e2 := newP51Env(t)
+	nPriv, nPub, nID := e2.key("north")
+	s3 := e2.build([]string{e2.signPub, nPub}, "", nil)
+	e2.activate(s3, nID, p50T0)
+	s4 := e2.build([]string{e2.signPub}, nPriv, []string{nPub})
+	if _, err := s4.AppendKeyLifecycleEvent(keyLifecycleRequest{
+		EventType: lifecycleEventRotatedOut, KeyID: nID, NotAfter: klTS(p50T5),
+	}); err == nil {
+		t.Fatal("T384/A11: the reverse cross-domain event must be refused as well")
+	}
+	// A row with NO role never triggers it: the Phase 50-era residue (A8-2) must
+	// stay recordable, or no upgraded deployment could ever rotate a legacy key.
+	e3 := newP51Env(t)
+	_, lPub, lID := e3.key("legacy")
+	s5 := e3.build([]string{e3.signPub, lPub}, "", nil)
+	e3.rawRow(s5, lID, "", lifecycleEventActivated, klTS(p50T0), "")
+	if _, err := s5.AppendKeyLifecycleEvent(keyLifecycleRequest{
+		EventType: lifecycleEventRotatedOut, KeyID: lID, NotAfter: klTS(p50T5),
+	}); err != nil {
+		t.Fatalf("T384: a legacy role-less subject must still be rotatable, got %v", err)
 	}
 }

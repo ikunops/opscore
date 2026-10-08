@@ -2,7 +2,7 @@
 
 - **Status**: Proposed (Phase 51, Architecture stage)
 - **Base**: ADR-077（Scope）。冲突以 Scope 为准。
-- **前置**：Phase 50 CLOSED（HEAD = `fcf5506`），最大既有 T 编号 = **T362**（`snapshot_verifier_authority_test.go`，P50 §5），故本 Phase 用 **T363~T383**。
+- **前置**：Phase 50 CLOSED（HEAD = `fcf5506`），最大既有 T 编号 = **T362**（`snapshot_verifier_authority_test.go`，P50 §5），故本 Phase 用 **T363~T384**（T384 = 裁判第二轮评审 M1 的单域不变量，写入面拒绝跨域迁移）。
 
 ---
 
@@ -11,7 +11,7 @@
 | 文件 | 变更 | 内容 |
 |---|---|---|
 | `internal/controlplane/server/snapshot_lifecycle_domain.go` | **新增** | 主体域面：`role` 的**派生与读取**（`domainOf`）/ **按域折叠**（`authorizationForDomain`，复用 P41 的 `authorizationFor`）/ 冲突与迁移归类 / 面级状态派生 |
-| `internal/controlplane/server/snapshot_lifecycle_domain_test.go` | **新增** | T363~T383（21 例） |
+| `internal/controlplane/server/snapshot_lifecycle_domain_test.go` | **新增** | T363~T384（22 例） |
 | `internal/controlplane/server/snapshot_key_lifecycle.go` | **修改** | ① `keyLifecycleEntry`（`:98-114`）与 `keyLifecycleSigned`（`:116-128`）**末尾**追加 `Role string \`json:"role,omitempty"\``；② `keyLifecycleSignedFields`（`:130`）带上它；③ `appendKeyLifecycleEvent`（`:646`）把 `:664` 已算出的 `inSigning`/`inVerifier` **落进 `Role`**（准入判据 `:673`/`:681` 一字不改）；④ `keyLifecycleSummary`（`:856`）的 `:897-901` 过滤改为 **A4-1（有 `role` 的行按行内 `role`）+ A4-2（无 `role` 的行照搬 P50 的 `∉ 当前 verifierTrust` 规则）**（D17）；⑤ `:286-288` 注释按 A8-⑧ 的新口径改写。**账本 schema 语义零变更**（旧行逐字节不变，T363） |
 | `internal/controlplane/server/snapshot_verifier_authority_test.go` | **修改** | **同步四条既有钉死断言**（评审 major-4，缺一条即「未声明的行为变更」）：`:349-351`（T340 行 JSON 键集 11 ⇒ **12**）、`:386-388`（T341 无 VAK 顶层键序列）、`:404-405`（T341 有 VAK：基线 + `verifier_authority`，**含新键顺序**）、`:417`（`p50BaselineStatusKeys()` 基线本身） |
 | `internal/controlplane/server/snapshot_verifier_authority.go` | **修改** | ① 新增行级取值 `domain_mismatch`（`:67-73` 的常量块）；② `:323` 的 `ls.authorizationFor(keyID)` 改为按**验证域**折叠的 `authorizationForDomain(ls, keyID, DOMAIN_VERIFIER)`；③ 行级全序插入 `domain_mismatch`（在 `violated` 之后、`authorized` 之前）；④ `verifierAuthorityKeyStatus`（`:79-95`）新增 `DomainMismatch int` 计数 |
@@ -109,10 +109,10 @@ for each keyID in observedSigners(vs.entries):
 |---|---|---|
 | 行的 `role == "signing"`（P51 之后写入） | 主体 `domain == "signing"`；**不出现在 P50 的验证域授权里**（`domain_mismatch`） | A1/A2/A9；ADR-077 §3 红例 C |
 | 行的 `role == "verifier"`（P51 之后写入） | 主体 `domain == "verifier"`；**永不进入 P41 的 `authorizations`**（与 live trust 文件无关） | A9；ADR-077 §3 红例 A（probe 1 的形状） |
-| 该 key 的行**全部** `role == "signing"`，而它作为验证者签发了一条报告 | P50 面 `domain_mismatch`；**注意触发是「按验证域折叠后 `n == 0`」而不是 `domain == "signing"`** ⇒ 一个**迁移**主体（最后一行是 signing 但**有** `role=verifier` 行）**仍走**验证域的常规判定 | A7；红例 C（probe 3）；评审 M2 |
+| 该 key 的行**全部** `role == "signing"`，而它作为验证者签发了一条报告 | P50 面 `domain_mismatch`；**注意触发是「按验证域折叠后 `n == 0`」而不是 `domain == "signing"`** ⇒ 一个**迁移**主体（最后一行是 signing 但**有** `role=verifier` 行）**仍走**验证域的常规判定 | A10；红例 C（probe 3）；评审 M2 |
 | 行**没有** `role`（P51 之前的行） | `undeclared`（主体级），**且**按 **A4-2** 归属：P41 状态面 = `keyID ∈ 当前 verifierTrust` ⇒ 不列、否则列；P50 授权面 = 一律参与验证域折叠 ⇒ **两个消费者的取值逐字等于 P50**（含 T362 的退役恒等与 T351 的验证者排除）。**这不是「域中立」**（评审 blocker） | A4-2；T371 |
 | 同一 key 在**不同 `event_seq`** 上两个域 | `lifecycle_domain_state == "migrated"`；`domain` 取最后一条 `role` 行；**不** fail-closed | A8-③；红例 B（probe 2） |
-| 同一 key 在**同一事件组**内两个域 / `role` 不在值域内 | `conflict` ⇒ 面级 `conflict`、响亮报错、**绝不** `declared` | A7；T370 |
+| 同一 key 在**同一事件组**内两个域 / `role` 不在值域内 | `conflict` ⇒ 面级 `conflict`、响亮报错、**绝不** `declared` | A10；T370 |
 | 账本为空 / 全部行 `undeclared` | `lifecycle_domain_state == "undeclared"` ∧ `declared == false`（**空集不为真**） | T373 |
 
 ### 3.2 与 P41 / P50 / P44 / A6 的分工（不可混写）
@@ -150,7 +150,7 @@ key_lifecycle_domains = {
 ```
 
 - **`undeclared_events` 是承重的**：它是「本面的域断言**没有**覆盖到哪些行」的机器可读形式。**它不蕴含任何状态**：`declared` **不**要求 `undeclared_events == 0`（评审 M3——否则**任何**存有 P51 之前行的账本永远拿不到 `declared`）；非空泛的锚点是 **`declared` ⟹ `declared_events > 0`**，`declared` 与 `undeclared_events > 0` **可以并存**且两者都响亮（T373(a) 钉死这一对）。
-- **不可判必须响亮**（A7/A8-②）：`undeclared` / `migrated` / `conflict` 三态**必须**带 `reason` 与计数（沿用 P47 `last_unanchored_reason` / P49 A5 / P50 §4 的纪律，不用粘滞字段）。
+- **不可判必须响亮**（A10/A8-②）：`undeclared` / `migrated` / `conflict` 三态**必须**带 `reason` 与计数（沿用 P47 `last_unanchored_reason` / P49 A5 / P50 §4 的纪律，不用粘滞字段）。
 - **P50 面的新增计数**：`verifier_authority` 组内每行新增 `domain_mismatch`（int，omitempty）；全局新增 `verifier_authority_domain_mismatches`（int）；**全局标量 `verifier_authority_state` 在新输入上可取 `domain_mismatch`**（全序 `indeterminate > violated > domain_mismatch > authorized > nothing_assessed`）。
 - 读面**只读**：既有 load + `os.Stat`；不落盘、不写 audit、不发网络、不派发、不压缩（T375）。
 
@@ -170,7 +170,8 @@ key_lifecycle_domains = {
 | I10 | **写入面准入判据不变**：「既不在签名也不在验证者锚」拒绝、「同时在两锚」拒绝的**行为与文案**逐字不变（P50 T349 取值不变）；本 Phase **只**追加「把已判定的域落进事件」（T365） |
 | I11 | **A4 回退恒等（承重，与 I13 同源）**：全部行无 `role` 的账本上，P41 状态面与 P50 授权面的取值**逐字等于 P50**（含 T362 的退役恒等与 T351 的验证者排除）——**理由是 I13 的逐消费者旧规则**，**不是**「域中立」（评审 blocker 已删除该措辞）。**先红后绿**（T371/T379/T380） |
 | I12 | **主体级域判定必须「全序首个命中」**：`conflict > {signing, verifier} > undeclared`；**禁止**用顺序赋值产出（P50 首轮 M2 的教训：后置赋值会覆盖 fail-closed，方向是 fail-open）（T370） |
-| I13 | **A4-2 回退必须逐消费者照搬其 P50 时代的规则（承重，评审 blocker）**：无 `role` 的行**不得**被统一成「一律保留」或「一律排除」——**P41 状态面**按 `keyID ∈ 当前 verifierTrust ⇒ 不列、否则列`（`:897-901` 的原规则），**P50 授权面**按「一律参与验证域折叠」（P50 时代没有域这一维）。⇒ 对**全部**无 `role` 的输入，两个消费者的取值**逐字等于 P50**（T351/T362 双双保持，T371 钉死三种输入）。**违反形态**：任何统一规则 ⇒ MU10（**HEAD 上实测为红**，ADR-077 §2 probe 5） |
+| I14 | **单域主体（承重，裁判第二轮评审 M1 / ADR-077 A11）**：写入面**拒绝**跨越**已声明**域的行政事件（`validateLifecycleTransition` 的第三个参数 = 新行的域）；`lifecycle_domain_state == migrated` 因此只能来自**本二进制写不出**的账本（其它构建 / 手工编辑）。原因如实记录：P41 的**判定面**（`history_export_manifest.go:596`）与 P42 的 ruler（`snapshot_verification.go:979`）**被冻结**且按行折叠，允许该形状会让它们在**真实签名窗口之内**签发的 manifest 上读出 `signature_after_rotation`（假指控）。**无 `role` 的历史行不在此列**（A8-② 残差）。**违反形态**：摘掉该拒绝 ⇒ T384 必红 |
+| I13 | **A4-2 回退必须逐消费者照搬其 P50 时代的规则（承重，评审 blocker）**：无 `role` 的行**不得**被统一成「一律保留」或「一律排除」——**P41 状态面**按 `keyID ∈ 当前 verifierTrust ⇒ 不列、否则列`（`:897-901` 的原规则），**P50 授权面**按「一律参与验证域折叠」（P50 时代没有域这一维）。⇒ 对**全部**无 `role` 的输入，两个消费者的取值**逐字等于 P50**（T351/T362 双双保持，T371 钉死三种输入）。**违反形态**：任何统一规则 ⇒ MU10（**判别点为 T371(b)，实测为红**；原稿声称 `TestP50T351` 必红，实现轮已实测证伪并归位——该行现在带 `role=verifier`，由 A4-1 处置，MU10 够不到它） |
 
 ## 6. 实现步骤（每步跑门禁）
 
@@ -181,11 +182,12 @@ key_lifecycle_domains = {
 5. 迁移与冲突归类（`migrated` / `conflict` + 面级全序）→ T368/T370/T372/T373
 6. 新组 `key_lifecycle_domains`（§4，全 `omitempty`）+ 零副作用 → T364/T374/T375
 7. **同步既有钉死断言（评审 major-4 补全，四条全列）**：**(a)** `snapshot_verifier_authority_test.go:349-351`（T340）的行 JSON 键集 **11 ⇒ 12**（加 `role`）；**(b)** `:386-388`（T341 无 VAK：顶层键序列 `== p50BaselineStatusKeys()`）；**(c)** `:404-405`（T341 有 VAK：`== 基线 + ["verifier_authority"]`，**含新键相对 `verifier_authority` 的顺序**）；**(d)** 基线本身 `:417`（`p50BaselineStatusKeys()` 加 `key_lifecycle_domains`）→ T364
-8. 跨维/冻结/字节等价 T363 + 畸形输入 T378 + 零新增 T376 + 删除保护复用 P49 T381 + 变异 **MU1~MU10**（含 MU10 = 统一 A4-2 ⇒ T351/T371(b) 必红；红→绿，sha256 还原）+ 三道门禁 + mktree 提交 → T382
+8. **写入面单域不变量（I14/A11，裁判第二轮评审 M1）**：`validateLifecycleTransition` 增加 `newRole` 参数并拒绝跨越已声明域的行政事件 → T384；
+9. 跨维/冻结/字节等价 T363 + 畸形输入 T378 + 零新增 T376 + 删除保护复用 P49 T381 + 变异 **MU1~MU10**（含 MU10 = 统一 A4-2 ⇒ **T371(b)** 必红——原稿写 T351/T371(b)，实现轮实测 T351 已不再是判别点；红→绿，sha256 还原）+ 三道门禁 + mktree 提交 → T382
 
 ## 7. 测试映射
 
-T363→I1（冻结面 + 账本字节等价 + `go.mod`/`go.sum`）；T364→I3（默认零回归 + 基线穷举）；T365→I10（写入面落域、调用方不可声明）；T366→A1/A9（域断言）；T367→I4（退役：**先红后绿**，D17）；T368→A8-③/I5（迁移，且 A6 沉默）；T369→I7（域错配：**绝不** `authorized`）；T370→I8/I12（冲突 fail-closed + 全序）；T371→I11/I13（A4-2 逐消费者回退恒等）；T372→I5（三态不折叠）；T373→I6（非空泛 + 空集不为真）；T374→A7（不可判响亮）；T375→§4（零副作用）；T376→I9（零新增）；T377→I2（P41 判定面零回归）；T378→I8（畸形不 panic）；T379→I11/I13（P41 状态面零回归）；T380→I11/I13（P50 零回归）；T381→§3.2（删除保护**复用** P49）；T382→MU1~MU10（**MU10 含 HEAD 上实测为红的判别点**）；T383→I5（跨面同时可见）。
+T363→I1（冻结面 + 账本字节等价 + `go.mod`/`go.sum`）；T364→I3（默认零回归 + 基线穷举）；T365→I10（写入面落域、调用方不可声明）；T366→A1/A9（域断言）；T367→I4（退役：**先红后绿**，D17）；T368→A8-③/I5（迁移，且 A6 沉默；**裁判第二轮起该用例用 `rawRow` 在字节层构造迁移账本**——真实写入路径已由 I14 拒绝该形状）；T369→I7（域错配：**绝不** `authorized`）；T370→I8/I12（冲突 fail-closed + 全序）；T371→I11/I13（A4-2 逐消费者回退恒等）；T372→I5（三态不折叠）；T373→I6（非空泛 + 空集不为真）；T374→A10（不可判响亮）；T375→§4（零副作用）；T376→I9（零新增）；T377→I2（P41 判定面零回归）；T378→I8（畸形不 panic）；T379→I11/I13（P41 状态面零回归）；T380→I11/I13（P50 零回归）；T381→§3.2（删除保护**复用** P49）；T382→MU1~MU10（MU10 的判别点为 T371(b)，实测为红）；T383→I5（跨面同时可见）；**T384→I14/A11（写入面拒绝跨域迁移：拒绝 + 账本逐字节不变 + 域面仍 `declared`）**。
 
 ## 8. 容量与成本（诚实声明）
 
