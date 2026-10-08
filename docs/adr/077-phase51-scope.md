@@ -134,11 +134,15 @@ P37 who / P40 where / P41 when / P42 whether / P43 why-absent / P45 what-accepte
   ⑦ **行为变更声明（穷举；评审 major-4 已补全三条既有钉死用例）**：① 新事件多一个 `role` 字段（旧行零字节变化，probe 4 / T363）；② 新增一个**只读面**（组）`key_lifecycle_domains`，其启用门与 `key_lifecycle` **完全相同**（⇒ **账本启用的部署**的状态文档**多一个顶层键**）；③ **【评审 major-4 补入】以下既有钉死断言**必然**随之变红，**必须**同步更新（漏掉任何一条都是「未声明的行为变更」）：**(a)** `snapshot_verifier_authority_test.go:349-351`（T340：把持久化生命周期行的 JSON 键集钉死为**恰 11 个键**，不含 `role`）⇒ 必须扩为 **12 键**；**(b)** `:386-388`（T341：无 VAK 部署的顶层键序列 `== p50BaselineStatusKeys()`）与 **(c)** `:404-405`（T341：有 VAK 时 `== 基线 + ["verifier_authority"]`，**含顺序**）⇒ 必须把 `key_lifecycle_domains` 写进基线 `:417` 并钉死它相对 `verifier_authority` 的位置；④ 键生命周期账本**启用**时，P41 的状态面在**退役验证者**与**迁移**两类输入上取值改变（红例 A/B —— 这是**修**，且是 A3 承重承诺的兑现，**仅**对携带 `role` 的行）；⑤ P50 授权面在**明确签名域**区间上新增 `domain_mismatch`（红例 C）——**既有输入上零变化**（T380）；
   ⑧ **不做销毁授权域的域扩展**（ADR-063 Q1 的另一半）：§9 裁定**淘汰**（其对象是 KAK 自身的授权，见 §9 ②），本 Phase 非目标 A7-⑤；
   ⑨ **不给 `lifecycle_domain_state` 加 `violated` 之类的强取值**：迁移与退役都是**合法运维动作**，本 Phase 判**是不是同一个域**，不判**该不该迁移**（「政策的执行面不是判据面」，同 P50 A7-⑥）。
-  ⑪ **`domain_mismatch` 无法排除「另一域的行已被前缀压缩删掉」（裁判第二轮评审 M2；**登记为债 D20**）**：触发条件是「按验证域折叠后 `n == 0` ∧ 该主体在册有行」，而 `compactKeyLifecyclePrefix` 是**前缀**压缩——迁移主体的验证域行（较早）可能已被合法裁掉、只剩较新的签名域行 ⇒ 此时如实取值是 `unbounded`（不可判），本面却报 `domain_mismatch`（断言「不属于这个域」）。**本 Phase 不修**（要判定「缺席可断言」需在本面复用 P43 的压缩记账），**修法已具名**：读 P43 的 `key_lifecycle_compaction` **已完成**记录的**闭区间**，覆盖到该主体身份即降级为 `unbounded`。在修好之前它仍**fail-closed**（既非 `authorized` 也非 `violated`），且 A11 已使该输入**无法由本二进制产出**。
+  ⑪ **【债 D20 —— 已清偿，见下方「D20 清偿」】** `domain_mismatch` 无法排除「另一域的行已被前缀压缩删掉」（裁判第二轮评审 M2）：触发条件是「按验证域折叠后 `n == 0` ∧ 该主体在册有行」，而 `compactKeyLifecyclePrefix` 是**前缀**压缩——迁移主体的验证域行（较早）可能已被合法裁掉、只剩较新的签名域行 ⇒ 此时如实取值是 `unbounded`（不可判），本面却报 `domain_mismatch`（断言「不属于这个域」）。**本 Phase 不修**（要判定「缺席可断言」需在本面复用 P43 的压缩记账），**修法已具名**：读 P43 的 `key_lifecycle_compaction` **已完成**记录的**闭区间**，覆盖到该主体身份即降级为 `unbounded`。在修好之前它仍**fail-closed**（既非 `authorized` 也非 `violated`），且 A11 已使该输入**无法由本二进制产出**。
+
+  **D20 清偿（后续修复轮）**：`snapshot_verifier_authority.go` 的 `judgeVerifierAuthoritySigner` 在断言「不属于这个域」之前先问 `verifierDomainAbsenceIsAssertable` —— 复用 P49 已读的 **P43 压缩记账**（`loadRealizationAccounting`，状态文档内**一次读、全体签名者共享**）：若一条**已完成**的 `key_lifecycle_compaction` 记录的闭区间覆盖到该主体**最早留存行之下**（`covers(kind, minSeq-1)`），则该域的行**可能已被合法裁掉** ⇒ 降级为 `unbounded`（不可判），reason 点名「compacted away」。
+  **零回归（承重）**：销毁面**关闭**时记账表为空且无错（`loadRealizationAccounting` 直接返回、不读盘）⇒ 判据**照旧** `domain_mismatch`；因此**既有输入一个取值都不动**（T369/T380 仍绿）。**残余如实登记**：销毁面关闭期间发生的（因而**未被记账**的）压缩仍会读到 `domain_mismatch` —— 这是 A8-②/⑪ 家族的残差，**不以断言掩盖**。
+  **新增用例 T385**：同一账本、两种配置 —— 面开（记账可见）⇒ `unbounded`；面关（记账不可用）⇒ `domain_mismatch`（零回归侧 + 残余侧各钉一次）。
 - **A9 域与身份的绑定（承重，与 P50 A9 同构）**：`role` 进 `keyLifecycleSigned` ⇒ 被 KAK 签名覆盖；**读面一律以行内的 `role` 为准**，**绝不**在 `role` 缺失时回退到「查当前 trust 文件」（那正是 probe 1 的成因）。**不违反 A3**：所有域判定落在**新文件**内。
 - **A7 非目标（重新冻结，11 条）**：① 不改 P41 账本结构与既有判定（`signature_*` 四词取值逐字节不变）；② 不改 P41 的三个区间函数；③ 不改 P42 报告任何字节（`lifecycle` 维度继续指 manifest 签名者）；④ 不改 P44 判定（`verification_unauthorized` / `key_unknown` 两轨不变）；⑤ 不重审销毁授权域（§9 ② 淘汰）；⑥ 不做自动轮换/吊销调度（同 P50 A7-⑥）；⑦ 不引入绝对时间权威；⑧ 不做 HSM/KMS；⑨ 不新增密钥类型 / 账本 / 证据族 / 路由 / 常驻组件 / **API 参数**；⑩ 不追溯重写既有账本、不提供转换器；⑪ 不改 P49 兑现面的任何判据。
 
-## 5. 测试契约（T363~T384，22 例；T382 内 MU1~MU10）
+## 5. 测试契约（T363~T384，22 例；T382 内 MU1~MU10；**另加 D20 清偿的 T385，见 §4 A8-⑪**）
 
 | # | 断言 |
 |---|---|

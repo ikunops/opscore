@@ -122,6 +122,21 @@ func (e *p51Env) buildAnchored(signTrust []string, vpriv string, vtrust []string
 	return s
 }
 
+// buildTuned is build() with the config passed through a tune hook. T385 needs
+// exactly two knobs build() does not expose: the Phase 43 destruction face (so
+// that a prefix compaction is ACCOUNTED for) and the lifecycle capacity (so that
+// one actually happens).
+func (e *p51Env) buildTuned(signTrust []string, vpriv string, vtrust []string, tune func(*HistoryExportConfig)) *HistoryExportScheduler {
+	e.t.Helper()
+	cfg := e.config(signTrust, vpriv, vtrust, false)
+	tune(&cfg)
+	s, err := NewHistoryExportScheduler(cfg)
+	if err != nil {
+		e.t.Fatalf("scheduler: %v", err)
+	}
+	return s
+}
+
 // buildNoLedger has NO key authority at all: the lifecycle ledger is disabled.
 func (e *p51Env) buildNoLedger(signTrust []string) *HistoryExportScheduler {
 	e.t.Helper()
@@ -1689,5 +1704,94 @@ func TestP51T384WriteFaceRefusesCrossDomainEvent(t *testing.T) {
 		EventType: lifecycleEventRotatedOut, KeyID: lID, NotAfter: klTS(p50T5),
 	}); err != nil {
 		t.Fatalf("T384: a legacy role-less subject must still be rotatable, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// T385 — `domain_mismatch` needs an ASSERTABLE absence (debt D20, discharged):
+// a RECORDED prefix compaction that could have dropped the other domain's rows
+// downgrades the verdict to `unbounded`
+// ---------------------------------------------------------------------------
+//
+// The trigger for `domain_mismatch` is a ZERO folded count, but this ledger's
+// compaction is a PREFIX drop and the oldest rows go first — exactly the
+// verifier-domain rows of a subject that migrated. When a COMPLETED Phase 43
+// record accounts for a drop that reaches the row just below the subject's
+// earliest retained row, the absence is not assertable: `unbounded` (cannot say),
+// never `domain_mismatch` (it is simply not this domain). Both are fail-closed —
+// neither is ever `authorized`.
+//
+// The SAME ledger is read under two configs to pin BOTH halves: with the
+// destruction face ON the record is visible and the verdict is `unbounded`; with
+// it OFF the accounting is empty (and error-free) so the verdict stays
+// `domain_mismatch` — that is the registered residual (an UNRECORDED drop), and
+// it is why this fix changes no pre-existing input's value.
+func TestP50T385DomainMismatchNeedsAssertableAbsence(t *testing.T) {
+	e := newP51Env(t)
+	mPriv, mPub, mID := e.key("migrated")
+	_, pPub, pID := e.key("plain")
+	_, qPub, qID := e.key("fresh")
+
+	tuned := func(c *HistoryExportConfig) {
+		c.DestructionLog = true
+		c.KeyLifecycleCapacity = 2
+	}
+	s := e.buildTuned([]string{e.signPub, pPub, qPub}, mPriv, []string{mPub}, tuned)
+
+	// Rows 1..5 are written on the BYTES: A11 refuses to produce a two-domain
+	// subject through the write face, and this is the shape a migrated subject has
+	// in a ledger written by another build.
+	e.rawRow(s, mID, lifecycleDomainVerifier, lifecycleEventActivated, klTS(p50T0), "")
+	e.rawRow(s, pID, lifecycleDomainSigning, lifecycleEventActivated, klTS(p50T0), "")
+	e.rawRow(s, pID, lifecycleDomainSigning, lifecycleEventRotatedOut, "", klTS(p50T2))
+	e.rawRow(s, pID, lifecycleDomainSigning, lifecycleEventActivated, klTS(p50T2), "")
+	e.rawRow(s, mID, lifecycleDomainSigning, lifecycleEventRotatedOut, "", klTS(p50T5))
+
+	// One REAL write makes six event groups; capacity 2 makes the prefix
+	// compaction drop groups 1..4 — M's VERIFIER row goes, M's signing row (5)
+	// survives — and the destruction face RECORDS the drop.
+	e.activate(s, qID, p50T6)
+
+	// Sanity: M still owns exactly one row, and it is the signing one.
+	st, err := loadKeyLifecycleState(s.keyLifecycleConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows := st.byKey[mID]; len(rows) != 1 || rows[0].Role != lifecycleDomainSigning {
+		t.Fatalf("fixture: want M to retain exactly its signing row, got %+v", rows)
+	}
+
+	e.now = p50T1
+	if _, err := s.AttestVerification(100); err != nil {
+		t.Fatalf("attest: %v", err)
+	}
+
+	// (a) destruction face ON: the drop is accounted for ⇒ the absence is NOT
+	// assertable ⇒ `unbounded`, and the reason says why.
+	on := s.VerifierAuthorityStatus()
+	rowOn := p50Row(t, on, mID)
+	if rowOn.Verdict == verifierAuthorityDomainMismatch {
+		t.Fatalf("T385/D20: a recorded prefix drop must not be asserted as 'another domain', got %+v", rowOn)
+	}
+	if rowOn.Verdict != verifierAuthorityUnbounded {
+		t.Fatalf("T385/D20: the honest value is unbounded (cannot say), got %s (%s)", rowOn.Verdict, rowOn.Reason)
+	}
+	if !strings.Contains(rowOn.Reason, "compacted away") {
+		t.Fatalf("T385/D20: the reason must name the compaction, got %q", rowOn.Reason)
+	}
+	if rowOn.Authorized != 0 {
+		t.Fatal("T385: neither verdict may ever be authorized")
+	}
+
+	// (b) destruction face OFF over the SAME directory: the accounting is empty
+	// and error-free, so the absence is asserted exactly as it was before this
+	// fix — the zero-regression half, and the registered residual.
+	off := e.build([]string{e.signPub, pPub, qPub}, mPriv, []string{mPub})
+	rowOff := p50Row(t, off.VerifierAuthorityStatus(), mID)
+	if rowOff.Verdict != verifierAuthorityDomainMismatch {
+		t.Fatalf("T385: with the accounting unavailable the pre-existing value must not move, got %s (%s)", rowOff.Verdict, rowOff.Reason)
+	}
+	if rowOff.Authorized != 0 {
+		t.Fatal("T385: domain_mismatch is never an authority either")
 	}
 }

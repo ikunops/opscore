@@ -269,8 +269,16 @@ func (s *HistoryExportScheduler) VerifierAuthorityStatus() verifierAuthorityStat
 	sortStrings(signers)
 
 	out.Keys = make(map[string]verifierAuthorityKeyStatus, len(signers))
+	// Debt D20 (discharged): the `domain_mismatch` trigger below is a ZERO folded
+	// count, but this ledger's compaction is a PREFIX drop, so the absence of a
+	// verifier-domain row is only assertable while nothing could have removed one.
+	// The Phase 43 accounting is READ ONCE here and shared by every signer (the
+	// same one-read discipline P49's realization face uses); with the destruction
+	// face off this returns an empty, error-free table without touching the disk,
+	// which is what keeps every pre-existing input on its old value.
+	acc := loadRealizationAccounting(s)
 	for _, kid := range signers {
-		row := judgeVerifierAuthoritySigner(klc, kid, bySigner[kid], ls)
+		row := judgeVerifierAuthoritySigner(klc, kid, bySigner[kid], ls, acc)
 		out.Keys[kid] = row
 		out.Entries += row.Entries
 		out.Claims += row.Checked
@@ -317,6 +325,51 @@ func (s *HistoryExportScheduler) VerifierAuthorityStatus() verifierAuthorityStat
 	return out
 }
 
+// verifierDomainAbsenceIsAssertable reports whether "this subject owns NO
+// verifier-domain row" may be ASSERTED rather than merely observed (debt D20,
+// discharged here). The only way a row leaves this ledger without a trace in the
+// ledger itself is a PREFIX compaction, and the oldest rows are exactly what it
+// drops first. When a COMPLETED Phase 43 record accounts for a drop that reaches
+// the row just below this subject's earliest retained row, a verifier-domain row
+// of this subject may have been compacted away and the absence is not assertable.
+//
+// Zero-regression note: with the destruction face OFF the accounting table is
+// EMPTY and error-free (`loadRealizationAccounting` returns it without reading
+// anything), so this returns true and every pre-existing input keeps the verdict
+// it had. The residual — a drop that happened while the face was off, and is
+// therefore unrecorded — stays registered as a known cost (ADR-077 A8-⑪), never
+// asserted away. An UNREADABLE accounting (face on, corrupt log) is fail-closed
+// here: we cannot rule out a drop, so nothing is asserted about the absence.
+func verifierDomainAbsenceIsAssertable(acc *realizationAccounting, ls *keyLifecycleState, keyID string) bool {
+	if acc == nil || acc.err != nil {
+		return false
+	}
+	minSeq, ok := subjectEarliestSeq(ls, keyID)
+	if !ok || minSeq <= 1 {
+		// Nothing can have been dropped below the ledger's first sequence.
+		return true
+	}
+	return !acc.covers(destructionKindKeyLifecycleCompaction, minSeq-1)
+}
+
+// subjectEarliestSeq is the smallest event_seq this subject still owns on record.
+func subjectEarliestSeq(ls *keyLifecycleState, keyID string) (int64, bool) {
+	if ls == nil {
+		return 0, false
+	}
+	rows := ls.byKey[keyID]
+	if len(rows) == 0 {
+		return 0, false
+	}
+	min := rows[0].EventSeq
+	for _, e := range rows[1:] {
+		if e.EventSeq < min {
+			min = e.EventSeq
+		}
+	}
+	return min, true
+}
+
 // judgeVerifierAuthoritySigner judges ONE signer from counters (I12) and only
 // then decides the row verdict by the total order
 // indeterminate > violated > domain_mismatch > authorized > unbounded >
@@ -327,7 +380,7 @@ func (s *HistoryExportScheduler) VerifierAuthorityStatus() verifierAuthorityStat
 // `c` is the lifecycle config the ledger was loaded with; it is needed for the
 // ONE A4-2 fallback (a pre-Phase-51 row has no domain of its own), and for
 // nothing else.
-func judgeVerifierAuthoritySigner(c keyLifecycleConfig, keyID string, entries []verificationLogEntry, ls *keyLifecycleState) verifierAuthorityKeyStatus {
+func judgeVerifierAuthoritySigner(c keyLifecycleConfig, keyID string, entries []verificationLogEntry, ls *keyLifecycleState, acc *realizationAccounting) verifierAuthorityKeyStatus {
 	row := verifierAuthorityKeyStatus{Entries: len(entries)}
 	if keyID == "" {
 		// A usable record must carry a signing key id (a malformed signature block
@@ -364,6 +417,20 @@ func judgeVerifierAuthoritySigner(c keyLifecycleConfig, keyID string, entries []
 	a, domainRows := authorizationForDomain(c, ls, keyID, lifecycleDomainVerifier)
 	row.Validity = validityOf(a)
 	if domainRows == 0 && ls != nil && len(ls.byKey[keyID]) > 0 {
+		// Debt D20 (discharged): a zero folded count means "no verifier-domain row
+		// is ON RECORD", which is only the same as "this subject was never issued
+		// one" while nothing could have dropped one. This ledger's compaction is a
+		// PREFIX drop (the oldest rows go first — exactly the verifier-domain rows
+		// of a subject that migrated), so when a COMPLETED Phase 43 record accounts
+		// for a drop reaching the row just below this subject's earliest retained
+		// row, the absence is not assertable and the honest value is `unbounded`
+		// (cannot say), not `domain_mismatch` (it is simply not this domain). Both
+		// are fail-closed — neither is ever `authorized`.
+		if !verifierDomainAbsenceIsAssertable(acc, ls, keyID) {
+			row.Verdict = verifierAuthorityUnbounded
+			row.Reason = "no verifier-domain authorization is on record for this signer, but a COMPLETED destruction record accounts for a prefix drop that reaches its earliest retained row — the subject's verifier-domain rows may have been compacted away, so the absence is NOT assertable (cannot say; this is not an authority and not an over-reach)"
+			return row
+		}
 		row.DomainMismatch = len(entries)
 		row.Verdict = verifierAuthorityDomainMismatch
 		row.Reason = "every authorization on record for this signer belongs to ANOTHER domain (not one in-ledger row was issued to the verification domain) — the interval is assertable and it is simply not this one, so it is neither an authority nor an over-reach"
