@@ -58,7 +58,6 @@ package server
 //     is NOT assertable, and is NEVER reconstructed from audit rows.
 
 import (
-	"strings"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -66,6 +65,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -92,7 +92,16 @@ const (
 	// happened" by a restart (ProvenanceStats is process-local, provenance.go
 	// :129-138, and resets to zero).
 	decisionLossFile = "protection-decision-loss.json"
+)
 
+// The two retention caps are VARIABLES, not constants, for one reason: the tests
+// that pin the OVERFLOW and the PREFIX-COMPACTION disciplines must push more
+// records than the cap, and every drained record costs an fsync'd append
+// (appendLogLine: open, write, Sync, close). With the production caps that cost a
+// minute of disk latency per test on this host (measured: T303 60s, T304 53s,
+// T315 37s). The cap's SIZE is incidental to those disciplines, so a test shrinks
+// it for its own duration and restores it; production never writes them.
+var (
 	// decisionQueueCap bounds the in-flight queue. Larger than the log's
 	// retention on purpose: the queue is a microsecond-scale hand-off buffer, the
 	// log is the retention boundary.
@@ -111,12 +120,12 @@ const anchorKindProtectionDecision = "protection_decision"
 // anchor entry yet" (before the first tick); `not_enabled` is "the producer gate
 // is off", never a claim about history (ADR-071 A7-⑧).
 const (
-	decisionLogStateAttested   = "attested"
-	decisionLogStateDivergent  = "divergent"
-	decisionLogStateTruncated  = "truncated"
-	decisionLogStateNoAnchor   = "no_anchor"
+	decisionLogStateAttested      = "attested"
+	decisionLogStateDivergent     = "divergent"
+	decisionLogStateTruncated     = "truncated"
+	decisionLogStateNoAnchor      = "no_anchor"
 	decisionLogStatePendingAnchor = "pending_anchor"
-	decisionLogStateNotEnabled = "not_enabled"
+	decisionLogStateNotEnabled    = "not_enabled"
 )
 
 // witnessFamilyProtectionDecision is the sixth registered family name. It lives

@@ -17,7 +17,6 @@ package server
 // claim, not a narrative one.
 
 import (
-	"regexp"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -27,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -138,6 +138,24 @@ func p48Prov(i int) protection.DecisionProvenance {
 }
 
 // emit queues n decisions through the sink — the exact call the Gate makes.
+// shrinkDecisionCaps makes the two retention caps small for ONE test. What T303,
+// T304, T305 and T315 pin is the OVERFLOW / PREFIX-COMPACTION DISCIPLINE, and the
+// caps' SIZE is incidental to it — but every drained record costs an fsync'd
+// append, so with the production caps each of those tests spent ~40-60s in disk
+// latency on this host. Every assertion that names a cap names the VARIABLE, so
+// shrinking it changes no expectation; the values are restored when the test ends.
+func shrinkDecisionCaps(t *testing.T) {
+	t.Helper()
+	q, l := decisionQueueCap, decisionLogCapacity
+	// The QUEUE must stay larger than the LOG (that is the production
+	// relationship, and T315's head-seq expectation rests on it: a record dropped
+	// by the queue never reaches the log at all). 64/16 preserves the relation
+	// while cutting the drained records — and therefore the fsync'd appends — by
+	// more than an order of magnitude.
+	decisionQueueCap, decisionLogCapacity = 64, 16
+	t.Cleanup(func() { decisionQueueCap, decisionLogCapacity = q, l })
+}
+
 func (f *p48Fixture) emit(n int) {
 	f.t.Helper()
 	for i := 0; i < n; i++ {
@@ -675,6 +693,7 @@ func anchorDigestCoversManifestDigest(t *testing.T, e *anchorEntry) bool {
 // test fails — i.e. "we lost a decision" would read exactly like "nothing
 // happened".
 func TestP48T303QueueOverflowSuppressesAttested(t *testing.T) {
+	shrinkDecisionCaps(t)
 	f := newP48Fixture(t, nil)
 	f.emit(decisionQueueCap + 5)
 	if got := f.sink.Dropped(); got != 5 {
@@ -702,6 +721,7 @@ func TestP48T303QueueOverflowSuppressesAttested(t *testing.T) {
 // through to disk, so the restarted sink reports 0 and this test fails — the
 // loss would be laundered into "no loss" by a restart.
 func TestP48T304LossSurvivesRestart(t *testing.T) {
+	shrinkDecisionCaps(t)
 	f := newP48Fixture(t, nil)
 	f.emit(decisionQueueCap + 3)
 	f.tick()
@@ -727,6 +747,7 @@ func TestP48T304LossSurvivesRestart(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestP48T305SaturatedSinkNeverBlocksDecisions(t *testing.T) {
+	shrinkDecisionCaps(t)
 	dir := t.TempDir()
 	ring := protection.NewRecordingProvenanceSink(8)
 	sink := NewDecisionAttestSink(ring, dir)
@@ -1159,6 +1180,7 @@ func TestP48T314NoRetroAttestationFromAudit(t *testing.T) {
 // an existing anchor entry, i.e. the criterion is near-tautological and the
 // truncation half of this test fails.
 func TestP48T315CompactionVersusTailDeletion(t *testing.T) {
+	shrinkDecisionCaps(t)
 	f := newP48Fixture(t, nil)
 	// One more record than the retention cap, so the drain's own compaction drops
 	// the oldest whole groups in the SAME tick that anchors the head.
