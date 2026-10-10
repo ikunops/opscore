@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/YuDong999/opscore/internal/plugin/manifest"
 )
@@ -42,7 +43,16 @@ type ErrorReporter interface {
 // Load(path) method — that would re-blur the Provider/Loader boundary
 // (anti-.so slide, Round 6/7).
 type FileLoader struct {
-	provider   manifest.Provider
+	provider manifest.Provider
+
+	// mu guards lastErrors. Once a Watcher is active, Discover runs on TWO
+	// concurrent paths — the poller goroutine (Watcher.Start → poll) and the
+	// debounced reload (enqueueReload → runReload → Manager.Reload) — and both
+	// would otherwise write lastErrors unsynchronized (caught by the race detector
+	// on 2026-10-10 via TestWatcher_SurvivesReloadError; ADR-079). The mutex is a
+	// LEAF: nothing else is locked while it is held, so it cannot participate in a
+	// lock-order cycle.
+	mu         sync.Mutex
 	lastErrors []PluginError
 }
 
@@ -52,9 +62,21 @@ func NewFileLoader(provider manifest.Provider) *FileLoader {
 }
 
 // LoadErrors returns plugin failures captured during the most recent Discover.
-// Implements ErrorReporter.
+// Implements ErrorReporter. The slice is COPIED so a caller holding it cannot
+// race with the next Discover's store.
 func (l *FileLoader) LoadErrors() []PluginError {
-	return l.lastErrors
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]PluginError, len(l.lastErrors))
+	copy(out, l.lastErrors)
+	return out
+}
+
+// storeLastErrors publishes one Discover pass's errors under the mutex.
+func (l *FileLoader) storeLastErrors(errs []PluginError) {
+	l.mu.Lock()
+	l.lastErrors = errs
+	l.mu.Unlock()
 }
 
 // Discover reads every plugin the provider exposes. It:
@@ -66,12 +88,15 @@ func (l *FileLoader) LoadErrors() []PluginError {
 //
 // Only successfully discovered descriptors are returned.
 func (l *FileLoader) Discover(ctx context.Context) []Descriptor {
-	l.lastErrors = nil
+	// Errors accumulate LOCALLY and are published once, at the end — see mu on
+	// FileLoader (two concurrent Discover paths share this loader, ADR-079).
+	errs := []PluginError(nil)
 	keys, err := l.provider.List()
 	if err != nil {
 		// Provider-level failure: nothing to discover. The Manager treats an
 		// empty Discover result as "nothing to load" and continues.
-		l.lastErrors = append(l.lastErrors, PluginError{Key: "<provider>", Err: err})
+		errs = append(errs, PluginError{Key: "<provider>", Err: err})
+		l.storeLastErrors(errs)
 		return nil
 	}
 	sort.Strings(keys) // Round 10 SHOULD: deterministic order
@@ -84,7 +109,7 @@ func (l *FileLoader) Discover(ctx context.Context) []Descriptor {
 	for _, key := range keys {
 		m, err := l.provider.Read(key)
 		if err != nil {
-			l.lastErrors = append(l.lastErrors, PluginError{Key: key, Err: err})
+			errs = append(errs, PluginError{Key: key, Err: err})
 			continue
 		}
 		d := NewDescriptor(m)
@@ -100,7 +125,7 @@ func (l *FileLoader) Discover(ctx context.Context) []Descriptor {
 			for i, e := range es {
 				keys[i] = e.key
 			}
-			l.lastErrors = append(l.lastErrors, PluginError{
+			errs = append(errs, PluginError{
 				ID:  id,
 				Err: fmt.Errorf("duplicate plugin ID %q across keys %v", id, keys),
 			})
@@ -110,6 +135,7 @@ func (l *FileLoader) Discover(ctx context.Context) []Descriptor {
 	}
 	// Deterministic output order (by ID) for stable logs/audit.
 	sort.Slice(descs, func(i, j int) bool { return descs[i].ID < descs[j].ID })
+	l.storeLastErrors(errs)
 	return descs
 }
 
