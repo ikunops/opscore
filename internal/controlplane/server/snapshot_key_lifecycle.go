@@ -879,7 +879,7 @@ func fingerprintOfPublicKey(pub ed25519.PublicKey) string {
 // compactKeyLifecyclePrefix bounds the log by whole event groups. It is the
 // ONLY rewrite and it copies survivors verbatim (shared primitive, R40-4).
 func compactKeyLifecyclePrefix(c keyLifecycleConfig) error {
-	return compactLogPrefixGroupsObserved(keyLifecycleLogPath(c.dir), c.capacity, keyLifecycleGroupOf, c.observe)
+	return compactAccountedLog(keyLifecycleLogPath(c.dir), c.capacity, keyLifecycleGroupOf, c.observe)
 }
 
 // ---------------------------------------------------------------------------

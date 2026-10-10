@@ -1113,7 +1113,7 @@ func appendVerificationReport(c verificationConfig, r *VerificationReport, at ti
 }
 
 func compactVerificationPrefix(c verificationConfig) error {
-	return compactLogPrefixGroupsObserved(verificationLogPath(c.dir), c.capacity, verificationGroupOf, c.observe)
+	return compactAccountedLog(verificationLogPath(c.dir), c.capacity, verificationGroupOf, c.observe)
 }
 
 // ---------------------------------------------------------------------------

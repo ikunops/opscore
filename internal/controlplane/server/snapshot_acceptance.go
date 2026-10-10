@@ -557,7 +557,7 @@ func (a *acceptanceRecorder) record(seq int64, line []byte) error {
 		if keep <= 0 {
 			return fmt.Errorf("acceptance: capacity %d cannot rotate (the shared compaction primitive always keeps at least one group); refusing the new entry (I7)", a.capacity)
 		}
-		if cerr := compactLogPrefixGroupsObserved(a.path, keep, acceptanceGroupOf, a.observe); cerr != nil {
+		if cerr := compactAccountedLog(a.path, keep, acceptanceGroupOf, a.observe); cerr != nil {
 			return fmt.Errorf("acceptance: compaction refused (%v) — new acceptance entries are refused until accounting recovers (I7)", cerr)
 		}
 		// The rewrite kept the newest `keep` groups verbatim: the chain head and

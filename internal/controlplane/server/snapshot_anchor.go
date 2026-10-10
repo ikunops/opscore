@@ -637,6 +637,14 @@ func compactAnchorPrefixPathObserved(path string, capacity int, observe compacti
 		return fmt.Errorf("anchor capacity %d exceeded (%d groups) but seq %d is still %s — refusing to evict an unconfirmed group",
 			capacity, st.window.Entries, st.window.MinSeq, oldest.State)
 	}
+	// ADR-081/ADR-079: the window mutex is taken ONLY for an observed compaction
+	// (a destruction window). The nil-observer calls on this path run inside the
+	// destruction-anchor dispatch (destructionDispatchMu held); taking the window
+	// mutex there would cycle with WindowMu → destructionWriteMu → destructionDispatchMu.
+	if observe != nil {
+		destructionWindowMu.Lock()
+		defer destructionWindowMu.Unlock()
+	}
 	return compactLogPrefixGroupsObserved(path, capacity, anchorGroupOf, observe)
 }
 

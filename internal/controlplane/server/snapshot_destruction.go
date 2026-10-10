@@ -843,6 +843,29 @@ func completeDestructionLocked(c destructionConfig, seq int64, state string, at 
 // Lock ordering is always dispatchMu → writeMu, never the reverse.
 var destructionDispatchMu sync.Mutex
 
+// destructionWindowMu (ADR-081) serializes the OBSERVE→REWRITE→COMPLETE window
+// of every accounted-log compaction. Two family compactions whose windows
+// interleave would trip the destruction log's chain-tail rule — the second
+// begin makes the first group non-tail, so the first completion is REFUSED and
+// that destruction stays `intended` forever (ADR-080). Holding the mutex across
+// the whole compaction call makes the window atomic. Lock order: family-write
+// mutexes / L1 (already held by the callers) → destructionWindowMu →
+// destructionWriteMu → destructionDispatchMu → s.mu — acyclic, because no path
+// holding destructionWriteMu/destructionDispatchMu/s.mu ever reaches a window
+// site (the destruction log has no observed self-compaction, and the
+// destruction-anchor dispatch compaction passes a NIL observer).
+var destructionWindowMu sync.Mutex
+
+// compactAccountedLog runs one accounted-log compaction inside the destruction
+// window (ADR-081). Every compaction whose observer opens a destruction window
+// must go through this; a nil observer opens no window and pays only an
+// uncontended lock.
+func compactAccountedLog(path string, keepGroups int, classify groupClassifier, observe compactionObserver) error {
+	destructionWindowMu.Lock()
+	defer destructionWindowMu.Unlock()
+	return compactLogPrefixGroupsObserved(path, keepGroups, classify, observe)
+}
+
 // dispatchDestructionPending runs the anchor hook for every durably appended
 // terminal record. I6-safe by contract: the hook logs its own failures and
 // never blocks. Called OUTSIDE the write mutex only.

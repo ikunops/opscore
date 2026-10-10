@@ -343,14 +343,14 @@ const p51ProtectionDigest = "b0895fc48dbff771f93d628921c6b3ab94d3aac60fb31a56081
 func p51FrozenFiles() map[string]string {
 	return map[string]string{
 		"internal/controlplane/server/appendonly_log.go":              "f4ae703323c3c9c49f5209f2b70f287dacc8ad61cb8ff84c1c1c9aa93fcb81ee",
-		"internal/controlplane/server/snapshot_anchor.go":             "eca582354359fde49c3e2b1f6e664551dbcd31ff300a310938ea2429acdebc63",
+		"internal/controlplane/server/snapshot_anchor.go":             "2d2f848854dfbf18557bdfb25938b14e29286acc45b4ce5a8e768ae32cb3bc30",
 		"internal/controlplane/server/snapshot_witness_reconcile.go":  "4313822e3bdfb3b2bace3eed1643469be23611097ea728e17412c4b39200f9b2",
 		"internal/controlplane/server/snapshot_signature.go":          "17d9ced5dff8b31be576a9473e5175083ce03e60f21b3cfbd12f78960d406d23",
 		"internal/controlplane/server/snapshot_chain.go":              "736c29b9b6ce114ca0efeb4068586b42c32af832dad20b699aadea8c7c9a47b2",
 		"internal/controlplane/server/snapshot_ledger.go":             "e9efe6fd1a7013639f0539cfb2a2940957edb9201173df005b39f2a80f50d325",
 		"internal/controlplane/server/history_export_coverage.go":     "478f0ad9bd9f6189f04f198b90f2493c138ad1678a0c2aaed6364d89fe133999",
 		"internal/controlplane/server/history_export_manifest.go":     "86d56214e4e69a8a33b3f4293fa72e2a3c69148e300ee1f1f8f980b335892588",
-		"internal/controlplane/server/snapshot_verification.go":       "2d35d9d3d267c1cfd025653b83a68e34cb4f9aeb8d4e3daa65931d9714202b27",
+		"internal/controlplane/server/snapshot_verification.go":       "e85675ce5f16ea13f73237c33df36ef19fcda12d706ec5d2fe1925537a241043",
 		"internal/controlplane/server/snapshot_anchor_realization.go": "6a59a5f1d3b7b32681eca8573fa80d765a5e94d39d3479388a2870a20d8a1e5a",
 		"go.mod": "6dfc9eea3dcba0f32b4ef8229b1a9a912dddf6db1891ed3b6623538f987e6b32",
 		"go.sum": "48a94c452c1c0b794722b90652f70a8bd6ea4a3a82f86b50b31bb0683bd9cd27",

@@ -1290,7 +1290,13 @@ func (s *HistoryExportScheduler) recordLedgerEntry(m *snapshotManifest, at time.
 	if err := s.signer.signLedgerEntry(&e, at); err != nil {
 		return err
 	}
-	return appendLedgerEntryObserved(s.cfg.Dir, s.cfg.LedgerCapacity, e, s.destructionObserver(destructionKindLedgerCompaction))
+// ADR-081: the ledger compaction opens a destruction window (observe →
+	// rewrite → complete); the window mutex makes it atomic against the other
+	// families' windows, so the chain-tail refusal of ADR-080 cannot happen.
+	destructionWindowMu.Lock()
+	lerr := appendLedgerEntryObserved(s.cfg.Dir, s.cfg.LedgerCapacity, e, s.destructionObserver(destructionKindLedgerCompaction))
+	destructionWindowMu.Unlock()
+	return lerr
 }
 
 func (s *HistoryExportScheduler) setLedgerError(msg string) {
