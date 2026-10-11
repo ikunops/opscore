@@ -858,7 +858,7 @@ func TestP46T271FrozenSurfaceByteIdentical(t *testing.T) {
 	serverDir := filepath.Dir(thisFile)
 	moduleRoot := filepath.Dir(filepath.Dir(filepath.Dir(serverDir)))
 	pins := map[string]string{
-		filepath.Join(serverDir, "snapshot_anchor.go"):         "eca582354359fde49c3e2b1f6e664551dbcd31ff300a310938ea2429acdebc63",
+		filepath.Join(serverDir, "snapshot_anchor.go"):         "2d2f848854dfbf18557bdfb25938b14e29286acc45b4ce5a8e768ae32cb3bc30",
 		filepath.Join(serverDir, "appendonly_log.go"):          "f4ae703323c3c9c49f5209f2b70f287dacc8ad61cb8ff84c1c1c9aa93fcb81ee",
 		filepath.Join(serverDir, "snapshot_signature.go"):      "17d9ced5dff8b31be576a9473e5175083ce03e60f21b3cfbd12f78960d406d23",
 		filepath.Join(serverDir, "snapshot_chain.go"):          "736c29b9b6ce114ca0efeb4068586b42c32af832dad20b699aadea8c7c9a47b2",
