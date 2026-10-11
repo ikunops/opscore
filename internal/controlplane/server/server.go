@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -1783,7 +1784,7 @@ func decodeParams(r *http.Request) (map[string]any, error) {
 	}
 	defer r.Body.Close()
 	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
-		if err.Error() == "EOF" {
+		if errors.Is(err, io.EOF) {
 			return params, nil
 		}
 		return params, err
