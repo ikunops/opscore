@@ -55,6 +55,12 @@ surface as destruction_unconfirmed / <nil>
 
 ## 3. 裁决：登记，**不在维护轮修**
 
+> **[2026-10-11 更新：本债已由 ADR-081 闭合。]** ADR-080 否决窗口互斥的理由（rewrite 失败路径
+> 不调用 complete ⇒ 锁泄漏）经 ADR-081 §2 的设计**绕开**：互斥不在 observe/complete 回调上，
+> 而是由**压缩调用的调用方**持有、`defer` 释放——覆盖 observe→rewrite→complete 整段窗口且
+> 释放无条件。接线与锁序证明见 ADR-081 §3/§4；生产形状并发验收（24+ 窗口零拒斥、零
+> unconfirmed、锚定流逐窗对齐）见 ADR-081 §5。本节其余内容保留为**当时的裁决记录**。
+
 **为什么不修**：修复方向是给 begin↔complete 窗口加一把「销毁窗口互斥」。但
 `compactLogPrefixGroupsObserved` 的契约**不保证 rewrite 失败路径会调用 complete**：
 
