@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/YuDong999/opscore/internal/core"
@@ -19,12 +20,22 @@ type syncCall struct {
 // newTestManager wires a Manager against MemoryStorage with a SyncFunc that
 // simply registers the ops into the core Registry (miroring what the real
 // control-plane synchronizer does on top of the Storage projection).
+// testSyncCallMu serializes appends into the newTestManager call log: the
+// Watcher's debounced reloads invoke the SyncFunc CONCURRENTLY for different
+// plugin ids, and the closure below is the only part of this fixture that was
+// not thread-safe (caught by the ADR-079 soak under -race). The production
+// components the real synchronizer touches (core.Registry, MemoryStorage) are
+// mutex-guarded; this log is the fixture's own bookkeeping.
+var testSyncCallMu sync.Mutex
+
 func newTestManager() (*Manager, *storage.MemoryStorage, *[]syncCall) {
 	stor := storage.NewMemoryStorage()
 	reg := core.NewRegistry()
 	calls := &[]syncCall{}
 	mgr := NewManager(reg, stor, func(name string, ops []core.Operation) error {
+		testSyncCallMu.Lock()
 		*calls = append(*calls, syncCall{name, len(ops)})
+		testSyncCallMu.Unlock()
 		for _, op := range ops {
 			// Mirror controlplane/sync.SyncPlugin: register into the core
 			// Registry AND persist into Storage.Operations() so Enable/
@@ -59,8 +70,8 @@ func testModule(name string) *StaticModule {
 
 func testModuleCaps(name string, caps []string) *StaticModule {
 	m := &manifest.Manifest{
-		Name:       name,
-		Version:    "1.0.0",
+		Name:         name,
+		Version:      "1.0.0",
 		Capabilities: caps,
 		Operations: []manifest.OperationDecl{
 			{Name: "plugin." + name + ".backup.execute", Resource: "backup", Action: "execute", Risk: "high"},
