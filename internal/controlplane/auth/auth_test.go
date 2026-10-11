@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/YuDong999/opscore/internal/storage"
 )
@@ -175,5 +176,75 @@ func TestAuthService_RegisterLoginRefresh(t *testing.T) {
 	// old access token still valid (not revoked in Phase 1.4; stateless JWT)
 	if _, err := svc.Authenticate(access); err != nil {
 		t.Fatalf("old access should still validate: %v", err)
+	}
+}
+
+// P1-2 (quality-baseline 2026-07-22): refresh tokens could not be revoked.
+// The floor design: RevokeRefresh records a revocation floor per user; Refresh
+// rejects any refresh token whose `iat` precedes the floor. The assertions pin:
+// the leaked (pre-floor) token dies; a fresh login after the revoke works (its
+// iat is after the floor); the floor does not touch access tokens (they expire
+// on their own TTL); a user with no floor is unaffected.
+func TestAuthService_RefreshRevocationFloor(t *testing.T) {
+	srv := NewAuthService(newTestStore(t), "access-secret", "refresh-secret")
+	if _, err := srv.Register("alice", "pw-alice"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	access, refresh, _, err := srv.Login("alice", "pw-alice")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+
+	// Sanity: the fresh refresh token rotates fine before the revoke.
+	if _, _, err := srv.Refresh(refresh); err != nil {
+		t.Fatalf("pre-revoke refresh: %v", err)
+	}
+
+	if err := srv.RevokeRefresh("alice"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	// The pre-floor refresh token must die with ErrTokenRevoked.
+	if _, _, err := srv.Refresh(refresh); !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("P1-2: a pre-floor refresh token must be rejected with ErrTokenRevoked, got %v", err)
+	}
+
+	// A fresh login after the revoke works (its iat is in a LATER second than
+	// the floor — the comparison is `<=` at second granularity, so the test
+	// crosses the second boundary before re-logging-in). Its refresh token can
+	// be rotated, then dies after ANOTHER revoke (the floor moved forward).
+	time.Sleep(1100 * time.Millisecond)
+	_, refresh2, _, err := srv.Login("alice", "pw-alice")
+	if err != nil {
+		t.Fatalf("post-revoke login: %v", err)
+	}
+	if _, _, err := srv.Refresh(refresh2); err != nil {
+		t.Fatalf("post-revoke refresh2: %v", err)
+	}
+	if err := srv.RevokeRefresh("alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := srv.Refresh(refresh2); !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("P1-2: the second revoke must kill refresh2 too, got %v", err)
+	}
+
+	// A fresh login after the SECOND revoke works again (the floor is per-user
+	// and only kills tokens issued before it) — again crossing the second
+	// boundary first.
+	time.Sleep(1100 * time.Millisecond)
+	if _, _, _, err := srv.Login("alice", "pw-alice"); err != nil {
+		t.Fatalf("login after the second revoke: %v", err)
+	}
+
+	// The floor does not touch ACCESS tokens: the pre-revoke access token still
+	// authenticates (it expires on its own TTL) — the revocation targets the
+	// long-lived credential, which is what P1-2 describes.
+	if _, err := srv.Authenticate(access); err != nil {
+		t.Fatalf("P1-2: the access token must be unaffected by the refresh floor: %v", err)
+	}
+
+	// An unknown user revokes to a harmless no-op floor (nothing to reject).
+	if err := srv.RevokeRefresh("ghost"); err != nil {
+		t.Fatalf("revoke for an unknown user must be a no-op, got %v", err)
 	}
 }

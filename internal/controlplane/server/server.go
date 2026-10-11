@@ -256,6 +256,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.HandleFunc("POST /api/auth/refresh", s.handleRefresh)
+	mux.HandleFunc("POST /api/auth/revoke", s.handleRevoke)
 	mux.HandleFunc("POST /api/auth/register", s.handleRegister)
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/me", s.handleMe)
@@ -570,6 +571,26 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, tokenPair{AccessToken: access, RefreshToken: refresh})
+}
+
+// handleRevoke (quality-baseline 2026-07-22 P1-2): invalidates every refresh
+// token issued to the CALLER (self-service "log out everywhere"). It requires
+// a valid ACCESS token: a leaked REFRESH token must not be able to revoke
+// (that would let an attacker lock the real user out), while the real user --
+// who holds a valid access token within its 15-minute TTL -- can always revoke
+// before the attacker can use the refresh token.
+func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	username, err := s.subject(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+	if err := s.auth.RevokeRefresh(username); err != nil {
+		slog.Error("auth: revoke failed", "user", username, "err", err)
+		writeError(w, http.StatusInternalServerError, "revoke failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "refresh tokens revoked"})
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
