@@ -49,3 +49,40 @@
 5. **P2-1 ssh.go 定时器**（量级小，两处 `time.After` → `Timer+Stop`）。
 
 > 以上均为**加固/打磨**，无 P0 级残留；证据链与竞态检测两大体系已闭环。
+
+---
+
+## 五、补记（同日 Phase 52 启动评估亲核，R210 尺子）
+
+Phase 52 启动评估对本表逐项亲核后补记（证据均为当日工作树实测）：
+
+1. **遗留 #1（P1-5）的表述已过时，以本节为准**：「探测未迁移到目标机」与代码实况不符——
+   目标机探测**已存在且已接线**：`internal/core/ssh.go` 的 `probeRemoteCapability`（经 SSH
+   逐项 `command -v *` 探测 + `uname` / `/etc/os-release` 主机身份，`Source=ssh`）在
+   `internal/core/dispatcher.go:82`（内核派发路径）与 `internal/controlplane/server/server.go:385`
+   （控制面派发前）两处接线；`internal/platform/resolver.go:100-113` 的 remote 解析消费该快照；
+   本机版 `DetectCapability()`（`capability.go:71`）**生产代码零调用方**（仅测试/注释引用，
+   `grep -rn "DetectCapability()" --include="*.go" internal/ cmd/` 仅命中定义处）。
+2. **P1-5 的真实残差（本轮清偿）**：SSH 探测的 systemd 判定命令曾是 `command -v systemd`
+   （修复前 `ssh.go:409`），而 systemd 守护进程二进制不在标准发行版 PATH（Debian:
+   `/usr/lib/systemd/systemd`）⇒ 对几乎所有 systemd 主机误报 `Available=false`，remote
+   解析因此系统性绕开 systemctl（`resolver.go:108` 首选 `snap.Available("systemd")`）。
+   三套探测两套正确：本机版探 `LookPath("systemctl")`（`capability.go:85`）、富探测版跑
+   `systemctl --version`（`capability/probe.go` systemdProbe）。**已修**：SSH 版改探
+   `command -v systemctl`；判别用例 `TestProbeRemoteCapability_SystemdBySystemctlBinary`
+   （伪造 bin 目录只含 systemctl ⇒ 修复前红：`Available=false`，`ssh_probe_env_test.go:161`；
+   修复后绿；core + platform 定向回归绿）。
+3. **P1-5 其余残差（保留登记，均非 Phase）**：① 探测失败时 resolver 静默回退主导工具
+   （`resolver.go` 包注释声明的取舍）——决策依据可追责：无快照时执行审计 `capability_hash`
+   为空、有快照时为快照哈希（`executor.go:238-243` + `audit.go` CapabilityHash）；改
+   fail-closed 属姿态加固，非新判据（R210）。② 能力集经主机注册表分发（`SourceCache`）
+   是纯可用性特性——重放已采集的判据，不产生新判据。③ `cat /proc/1/comm`（按 init 名
+   判定）不采纳：与另两套探测的 systemctl 判据不同源，会引入第三种语义。
+4. **遗留 #2~#5 已在本表落笔后当日清偿**（以各自提交为准）：P1-2 → ADR-082（`4f0d7a0`）；
+   P1-3 → 每用户名登录限流（`4dac468`）；P1-6 残留 → `c16d897`；P2-1 → Timer+Stop
+   （`b54b636`）。**当前基线唯一的开放 P1 残差即本节 #3（P1-5 修正后的登记）。**
+5. **R210 裁定（Phase 52 启动轮）**：候选池六条（P1-5、harness 证据读面接线、P1-2 后续
+   精化、P47 A8-⑧、ADR-081 §8 尾、P2 打磨）均不产生「此前给不出的新可断言判据」——
+   P1-5 具名修法的前半已存在（本节 #1），后半（注册表分发）与 harness 读面接线属整合
+   （D9 同款，ADR-077 §9 ⑦），其余为加固/呈现/已登记的诚实边界 ⇒ **Phase 52 收敛，
+   不开 Phase**；本补记与 ssh.go 修复为维护轮清偿（不消耗 ADR-083/084 编号）。

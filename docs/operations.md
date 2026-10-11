@@ -59,5 +59,7 @@
 
 | 顶层 `README.md` 的「演进状态」表停留在 Phase 15/16（R72 时代） | 未反映 Phase 24~51 的证据链、ADR-052~081 与 2026-10 的竞态检测落地 | 新读者无法从 README 得知项目已进入证据链时代并收敛 | 已随 ADR-080/081 维护轮重写演进状态表（2026-10-11），并补冻结面修复先例说明 |
 
+| 质量基线 2026-10-11「遗留 #1」声称 P1-5「探测未迁移到目标机；迁移是接线」 | 目标机 SSH 探测已存在且已接线（`internal/core/ssh.go` `probeRemoteCapability` + `dispatcher.go:82` + `server.go:385` + `resolver.go:100-113` remote 消费；`DetectCapability()` 生产零调用方）——基线表述停在 2026-07-22 的旧实况 | 下一轮评估会重开一个实质已闭合的候选（Phase 52 启动轮已按 R210 裁定收敛，并以维护轮清偿真实残差：SSH systemd 判定命令缺陷） | 已于 2026-10-11 以基线补记（§五）+ 判别用例 `TestProbeRemoteCapability_SystemdBySystemctlBinary` 纠正 |
+
 > Drift 处理原则（R71）：代码事实 ≠ 文档时，**绝不改冻结代码迁就文档**；记录为上述
 > Fact→Drift→Impact，必要时列为 Future Major Candidate。文档不得发明不存在的 endpoint。

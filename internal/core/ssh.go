@@ -394,8 +394,16 @@ func probeRemoteCapability(ctx context.Context, t TargetHost) (*snapshot.Capabil
 	// present with its Availability flag, not just the available ones. This
 	// matches the local capability.Snapshot contract and lets the Resolver /
 	// UI diff capabilities across hosts and over time.
-	addCap := func(name, verCmd string) {
-		if run("command -v "+name) != "" {
+	// addCapProbe takes the availability probe command explicitly. For
+	// "systemd" that probe is `command -v systemctl` — the systemctl CLIENT
+	// binary — NOT `command -v systemd`: the PID-1 daemon binary lives under
+	// /usr(-/lib)/systemd and is not on PATH on standard distros, so probing
+	// the daemon name reported systemd=false on essentially every systemd
+	// host. This keeps the SSH probe symmetric with the local probe
+	// (capability.go LookPath("systemctl")) and the rich probe
+	// (capability/probe.go systemdProbe runs `systemctl --version`).
+	addCapProbe := func(name, probeCmd, verCmd string) {
+		if run(probeCmd) != "" {
 			ver := ""
 			if verCmd != "" {
 				ver = run(verCmd)
@@ -405,8 +413,11 @@ func probeRemoteCapability(ctx context.Context, t TargetHost) (*snapshot.Capabil
 			items[name] = snapshot.CapabilityInfo{Name: name, Available: false}
 		}
 	}
+	addCap := func(name, verCmd string) {
+		addCapProbe(name, "command -v "+name, verCmd)
+	}
 
-	addCap("systemd", "systemctl --version")
+	addCapProbe("systemd", "command -v systemctl", "systemctl --version")
 	addCap("service", "")
 	addCap("firewalld", "firewall-cmd --version")
 	addCap("ufw", "")
