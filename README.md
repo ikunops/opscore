@@ -80,11 +80,16 @@ make build
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| Phase 15 | Deployment Productionization（配置/服务单元/探针/日志/关闭/storeDir） | ✅ CLOSED |
-| Phase 16 | Documentation & Reference Deployment（本文档集） | 🚧 文档落地中（R72 待签字） |
+| Phase 0~14 | 内核优先、九抽象、轻量架构、插件运行时/隔离、平台操作、治理策略、平台集成、事件关联、外部契约 `external/v1`、部署面 | ✅ CLOSED（ADR-001~032） |
+| Phase 15~23 | 部署生产化、文档与参考部署、配额保护 | ✅ CLOSED（ADR-033~051） |
+| Phase 24~39 | **证据链地基**：告警历史导出的快照内部一致性、跨快照 seq 覆盖、Ed25519 签名 + 独立信任锚、逐跳发布链、与保留期无关的 chain ledger | ✅ CLOSED |
+| Phase 40~51 | **证据链的域外/时间/身份维度**：发布锚定（域外见证）、密钥生命周期、验证报告、销毁留痕、验证者独立性（VAK）、输入完整性、见证对账、投递清偿、判定留痕、锚定兑现、验证者授权生命周期、生命周期主体域 | ✅ CLOSED（ADR-052~081） |
+| 证据体系 | **两次独立对抗挑战判定收敛**：十二个问题面各有机制、状态面、判别用例与变异；登记债全部清偿或具名 | ✅（ADR-079~081 为竞态检测落地与并发收口） |
 
 > 演进纪律见 [docs/operations.md](docs/operations.md)：Major 变更须 Scope → Architecture →
-> Implementation 三级签字，且先定范围、不直接编码。
+> Implementation 三级签字，且先定范围、不直接编码。冻结面（执行引擎与证据原语）的
+> 纯同步性缺陷修复走 ADR-079/081 先例：ADR + 检测器证据 + 回归形状，缺一不可。
+> 竞态检测自 2026-10-10 起可用（`RACE=1` 门禁档位，ADR-079）。
 
 ## 与 Demo 的关系
 
