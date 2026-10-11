@@ -75,6 +75,12 @@ func RunOverSSH(ctx context.Context, target TargetHost, executable string, args 
 	done := make(chan error, 1)
 	go func() { done <- session.Run(remoteCmd) }()
 
+	// P2-1 (quality-baseline 2026-07-22): a Timer + Stop, so a fast command does
+	// not leave its timeout timer alive until it fires. (time.After would linger
+	// for the full timeout on the success path.)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case <-ctx.Done():
 		_ = session.Signal(ssh.SIGKILL)
@@ -88,7 +94,7 @@ func RunOverSSH(ctx context.Context, target TargetHost, executable string, args 
 			return so.String(), se.String(), runErr
 		}
 		return so.String(), se.String(), nil
-	case <-time.After(timeout):
+	case <-timer.C:
 		_ = session.Signal(ssh.SIGKILL)
 		_ = session.Close()
 		return so.String(), se.String(), fmt.Errorf("ssh command timed out after %s", timeout)
@@ -253,10 +259,14 @@ func sshClientAlive(c *ssh.Client, timeout time.Duration) bool {
 		_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
 		done <- err == nil
 	}()
+	// P2-1: same Timer + Stop discipline — a live server replies long before the
+	// timeout, and the timer should not linger.
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	select {
 	case ok := <-done:
 		return ok
-	case <-time.After(timeout):
+	case <-timer.C:
 		return false
 	}
 }
