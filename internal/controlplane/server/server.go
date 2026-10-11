@@ -21,7 +21,10 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,6 +33,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"github.com/YuDong999/opscore/internal/controlplane/auth"
@@ -155,6 +159,7 @@ type Server struct {
 	demoMode      bool
 	useSudo       bool
 	allowRegister bool
+	loginLimiter  *loginFailureLimiter
 	// bus is the in-process execution.EventBus fan-out. The
 	// ExecutionService publishes lifecycle events onto it; the WS hub
 	// subscribes and streams them to UI clients (Phase 2.1.4 / Round 3).
@@ -209,6 +214,7 @@ func New(cfg Config) (*Server, error) {
 		demoMode:         cfg.DemoMode,
 		useSudo:          cfg.UseSudo,
 		allowRegister:    cfg.AllowRegister,
+		loginLimiter:     newLoginFailureLimiter(time.Now),
 		bus:              bus,
 		wsHub:            hub,
 		gate:             cfg.Gate,
@@ -494,6 +500,50 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
+// loginFailureLimiter (quality-baseline 2026-07-22 P1-3): per-username token
+// buckets over internal/protection's token-bucket primitive — the protection
+// layer is exactly where this mechanism belongs, so no new limiter is invented.
+//
+// Only FAILED logins consume a token: a successful login never does, so a
+// legitimate user who mistyped a password a few times is never locked out.
+// Buckets are keyed by a salted hash of the username (the salt is per-process,
+// never persisted, and the hash is never logged — the same discipline as the
+// protection layer's principal hashing).
+//
+// Known cost (registered): buckets are in-process, so a multi-instance
+// deployment counts per instance; cross-instance aggregation would need shared
+// state (the deployment story is single-binary, ADR-003).
+type loginFailureLimiter struct {
+	mu      stdsync.Mutex
+	salt    []byte
+	buckets *protection.TokenBucketSet
+}
+
+func newLoginFailureLimiter(clock func() time.Time) *loginFailureLimiter {
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		// A fixed salt on rand failure is still a working limiter; the buckets
+		// are in-memory and never persisted or logged.
+		salt = []byte("login-failure-salt")
+	}
+	return &loginFailureLimiter{
+		salt: salt,
+		buckets: protection.NewTokenBucketSet(protection.TokenBucketConfig{
+			Capacity: 5,
+			Refill:   5.0 / 60.0, // five failures, then one attempt per minute
+		}, clock),
+	}
+}
+
+// take records one FAILED login attempt for username; false ⇒ the username has
+// exhausted its bucket and the handler must serve 429 (Retry-After).
+func (l *loginFailureLimiter) take(username string) bool {
+	h := sha256.New()
+	h.Write(l.salt)
+	h.Write([]byte(username))
+	return l.buckets.Take("login-failure", hex.EncodeToString(h.Sum(nil)))
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var c credentials
 	if err := decodeJSON(r, &c); err != nil {
@@ -503,6 +553,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	access, refresh, _, err := s.auth.Login(c.Username, c.Password)
 	if err != nil {
 		if errors.Is(err, auth.ErrInvalidCredentials) {
+			// P1-3: only FAILED logins consume a token. The first five failures
+			// return the normal 401 (a rate-limit response would hand the
+			// attacker extra information); once the bucket is empty the response
+			// is 429 with Retry-After. A SUCCESSFUL login never takes a token,
+			// so a legitimate user is never locked out.
+			if !s.loginLimiter.take(c.Username) {
+				w.Header().Set("Retry-After", "60")
+				writeError(w, http.StatusTooManyRequests, "too many failed login attempts")
+				return
+			}
 			writeError(w, http.StatusUnauthorized, "invalid credentials")
 			return
 		}
