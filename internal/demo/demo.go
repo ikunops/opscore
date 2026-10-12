@@ -118,10 +118,15 @@ func StartFakeHost(password string) (core.TargetHost, func(), error) {
 	fmt.Sscanf(portStr, "%d", &port)
 
 	target := core.TargetHost{
-		Address:               host,
-		Port:                  port,
-		User:                  "root",
-		Password:              password,
+		Address:  host,
+		Port:     port,
+		User:     "root",
+		Password: password,
+		// DEMO ONLY — NEVER FOR REAL MACHINES (P55/P2-5, ADR-089 §2.4): this
+		// fake host listens on 127.0.0.1 only (net.Listen above) and its
+		// host key is a throwaway in-process RSA key regenerated every start,
+		// so skipping verification is harmless HERE and fatal anywhere else.
+		// A real target MUST verify the host key.
 		InsecureIgnoreHostKey: true,
 	}
 	stop := func() { _ = ln.Close() }

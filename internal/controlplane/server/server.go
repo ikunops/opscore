@@ -982,10 +982,13 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		result = s.dispatcher.Execute(ctx, opName, params)
 	}
 
+	// The operation's OUTCOME is business data, not a server fault (P55/P2-3,
+	// ADR-089 §2.2): a request that ran the operation and got a negative result
+	// COMPLETED. Mapping it to 5xx would let proxies/alerting/retries read a
+	// business "no" as an infrastructure failure. The success/cancelled fields
+	// carry the result; gate rejections keep their own statuses; plan failures
+	// above (404/500) are unchanged — a failed plan is not an operation result.
 	status := http.StatusOK
-	if !result.Success && !result.Cancelled {
-		status = http.StatusInternalServerError
-	}
 	// Phase 21: feed the breaker (protection feedback only — R21-10).
 	if adm != nil {
 		adm.RecordOutcome(!result.Success)
@@ -2044,9 +2047,15 @@ func errString(err error) string {
 	return err.Error()
 }
 
+// decodeJSON decodes a REQUIRED JSON request body. An absent (nil) body is an
+// explicit error, not a silent zero value: every call site is a body-required
+// endpoint, and letting a nil body through produced confusing downstream
+// failures (the P2-2 finding: a zero credentials{} surfaced as 401 instead of
+// a plain 400). An empty-but-present body stays on the io.EOF path, which the
+// call sites already map to 400.
 func decodeJSON(r *http.Request, v any) error {
 	if r.Body == nil {
-		return nil
+		return errors.New("request body required")
 	}
 	defer r.Body.Close()
 	return json.NewDecoder(r.Body).Decode(v)

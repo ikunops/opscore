@@ -396,16 +396,28 @@ func TestServer_RemoteTarget_Wiring(t *testing.T) {
 		t.Fatalf("expected steps in remote plan, got %+v", plan)
 	}
 
-	// run with remote target: reaches SSH server (no systemctl there) -> 500,
-	// but NOT 401/403/404 and NOT the local "systemctl not found on this host".
+	// run with remote target: reaches the SSH server (no systemctl there). The
+	// operation FAILS there — and per P55/T400 (ADR-089/090, P2-3) a negative
+	// operation result is BUSINESS DATA, not a server fault: 200 with
+	// success:false, never 5xx. It must still NOT be 401/403/404 and NOT the
+	// local "systemctl not found on this host".
 	rec = doJSON(t, h, "POST", "/api/operations/system.service.restart/run", tp.AccessToken, map[string]any{"name": "nginx", "target": map[string]any{
 		"address": host, "port": port, "user": "tester", "password": "testpw", "insecure": true,
 	}})
 	if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden || rec.Code == http.StatusNotFound {
 		t.Fatalf("remote run should be authorized; got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("remote run expected 500 (ssh command fails), got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("T400: a failed operation is a completed request reporting a negative result — want 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var runRes struct {
+		Success bool `json:"success"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &runRes); err != nil {
+		t.Fatalf("T400: decode run result: %v", err)
+	}
+	if runRes.Success {
+		t.Fatalf("T400: the remote run against a host without systemctl must report success:false, got %s", rec.Body.String())
 	}
 	if bytes.Contains(rec.Body.Bytes(), []byte("systemctl not found on this host")) {
 		t.Fatalf("remote run incorrectly hit the LOCAL capability gate: %s", rec.Body.String())
