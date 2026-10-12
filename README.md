@@ -95,6 +95,7 @@ export OPESCORE_ADMIN_PASS='<至少12字符、非默认口令>'
 | Phase 40~51 | **证据链的域外/时间/身份维度**：发布锚定（域外见证）、密钥生命周期、验证报告、销毁留痕、验证者独立性（VAK）、输入完整性、见证对账、投递清偿、判定留痕、锚定兑现、验证者授权生命周期、生命周期主体域 | ✅ CLOSED（ADR-052~081） |
 | 证据体系 | **两次独立对抗挑战判定收敛**：十二个问题面各有机制、状态面、判别用例与变异；登记债全部清偿或具名 | ✅（ADR-079~081 为竞态检测落地与并发收口） |
 | Phase 52 | **部署整合**：证据平面进入部署 SSOT（控制面参考部署 `deploy/opscore-controlplane.service` + secrets 契约 + :8082 单绑定纪律 + 机械守卫 T386~T388） | ✅ CLOSED（ADR-083/084） |
+| Phase 53~55 | **登记债清偿队列**：①能力集经主机注册表分发（SourceCache 提示通道）+ 修复判别器揭发的**远程目标快照归属缺陷**（Build 播种规则；T389~T393）；②吊销粒度精化（admin 代吊销 + jti 按令牌名单；T394~T398）；③P2 打磨包（缺席体显式 400、run 结果语义 200+success、注释语言约定、demo 禁用声明；T399/T400） | ✅ CLOSED（ADR-085~090；每项均带先红后绿 + 变异） |
 
 > 演进纪律见 [docs/operations.md](docs/operations.md)：Major 变更须 Scope → Architecture →
 > Implementation 三级签字，且先定范围、不直接编码。冻结面（执行引擎与证据原语）的
