@@ -248,3 +248,92 @@ func TestAuthService_RefreshRevocationFloor(t *testing.T) {
 		t.Fatalf("revoke for an unknown user must be a no-op, got %v", err)
 	}
 }
+
+// T394 (ADR-087/088): the jti denylist is PER TOKEN — the denied token dies,
+// the same user's other session and other users keep rotating, and the floor
+// stays an independent mechanism.
+func TestP54T394JtiDenylistIsPerToken(t *testing.T) {
+	srv := NewAuthService(newTestStore(t), "access-secret", "refresh-secret")
+	if _, err := srv.Register("alice", "pw-alice"); err != nil {
+		t.Fatalf("register alice: %v", err)
+	}
+	if _, err := srv.Register("bob", "pw-bob"); err != nil {
+		t.Fatalf("register bob: %v", err)
+	}
+	_, refA1, _, err := srv.Login("alice", "pw-alice")
+	if err != nil {
+		t.Fatalf("login alice #1: %v", err)
+	}
+	_, refA2, _, err := srv.Login("alice", "pw-alice")
+	if err != nil {
+		t.Fatalf("login alice #2: %v", err)
+	}
+	_, refB, _, err := srv.Login("bob", "pw-bob")
+	if err != nil {
+		t.Fatalf("login bob: %v", err)
+	}
+
+	claims, err := srv.ParseRefreshClaims(refA1)
+	if err != nil {
+		t.Fatalf("parse refresh claims: %v", err)
+	}
+	if err := srv.DenyRefreshToken(claims.Jti, claims.Exp); err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+
+	if _, _, err := srv.Refresh(refA1); !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("T394: the denied token must be revoked, got %v", err)
+	}
+	if _, _, err := srv.Refresh(refA2); err != nil {
+		t.Fatalf("T394: the user's OTHER session must keep rotating, got %v", err)
+	}
+	if _, _, err := srv.Refresh(refB); err != nil {
+		t.Fatalf("T394: another user must be unaffected, got %v", err)
+	}
+
+	// The floor remains an independent mechanism (and independent per user).
+	if err := srv.RevokeRefresh("bob"); err != nil {
+		t.Fatalf("floor revoke: %v", err)
+	}
+	if _, _, err := srv.Refresh(refB); !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("T394: the floor must still revoke, got %v", err)
+	}
+	if _, _, err := srv.Refresh(refA2); err != nil {
+		t.Fatalf("T394: bob's floor must not touch alice, got %v", err)
+	}
+
+	// An empty jti can never be minted, so denying one is refused outright.
+	if err := srv.DenyRefreshToken("", 0); err == nil {
+		t.Fatal("T394: empty jti must be refused")
+	}
+}
+
+// T395 (ADR-087/088): rotation + per-token revoke = "log out that session":
+// denying the OLD token's jti leaves the rotated successor alive.
+func TestP54T395RevokingOldJtiKeepsRotatedSuccessor(t *testing.T) {
+	srv := NewAuthService(newTestStore(t), "access-secret", "refresh-secret")
+	if _, err := srv.Register("alice", "pw-alice"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	_, oldRef, _, err := srv.Login("alice", "pw-alice")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	claims, err := srv.ParseRefreshClaims(oldRef)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	_, newRef, err := srv.Refresh(oldRef)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if err := srv.DenyRefreshToken(claims.Jti, claims.Exp); err != nil {
+		t.Fatalf("deny: %v", err)
+	}
+	if _, _, err := srv.Refresh(oldRef); !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("T395: the old token must die, got %v", err)
+	}
+	if _, _, err := srv.Refresh(newRef); err != nil {
+		t.Fatalf("T395: the rotated successor must keep rotating, got %v", err)
+	}
+}

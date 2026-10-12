@@ -715,18 +715,73 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 // (that would let an attacker lock the real user out), while the real user --
 // who holds a valid access token within its 15-minute TTL -- can always revoke
 // before the attacker can use the refresh token.
+// handleRevoke revokes refresh credentials (ADR-082; granularity refined by
+// P54, ADR-087/088). Three shapes, one intent each:
+//
+//   - no body            -> the caller's own revocation floor (unchanged);
+//   - {"username": "..."} -> that user's floor (all their sessions);
+//   - {"refresh_token"}   -> exactly that token, by jti (one session).
+//
+// Authorization strictly PRECEDES any state change: revoking someone else
+// requires the admin role, and a refused request must leave the target's
+// tokens untouched. Possessing a refresh token authenticates WHICH token is
+// named, never WHETHER the caller may revoke it.
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	username, err := s.subject(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthenticated")
 		return
 	}
-	if err := s.auth.RevokeRefresh(username); err != nil {
-		slog.Error("auth: revoke failed", "user", username, "err", err)
-		writeError(w, http.StatusInternalServerError, "revoke failed")
+	var body struct {
+		Username     string `json:"username"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	// The body is optional (the body-less form is the original contract):
+	// tolerate an empty stream, refuse anything malformed.
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": "refresh tokens revoked"})
+	if body.Username != "" && body.RefreshToken != "" {
+		writeError(w, http.StatusBadRequest, "specify either username or refresh_token, not both")
+		return
+	}
+	switch {
+	case body.RefreshToken != "":
+		claims, err := s.auth.ParseRefreshClaims(body.RefreshToken)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid refresh token")
+			return
+		}
+		if claims.Sub != username && !s.isAdmin(username) {
+			s.writeAuthError(w, auth.ErrForbidden)
+			return
+		}
+		if err := s.auth.DenyRefreshToken(claims.Jti, claims.Exp); err != nil {
+			slog.Error("auth: per-token revoke failed", "user", username, "err", err)
+			writeError(w, http.StatusInternalServerError, "revoke failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "refresh token revoked"})
+	case body.Username != "":
+		if body.Username != username && !s.isAdmin(username) {
+			s.writeAuthError(w, auth.ErrForbidden)
+			return
+		}
+		if err := s.auth.RevokeRefresh(body.Username); err != nil {
+			slog.Error("auth: revoke failed", "user", username, "target", body.Username, "err", err)
+			writeError(w, http.StatusInternalServerError, "revoke failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "refresh tokens revoked", "username": body.Username})
+	default:
+		if err := s.auth.RevokeRefresh(username); err != nil {
+			slog.Error("auth: revoke failed", "user", username, "err", err)
+			writeError(w, http.StatusInternalServerError, "revoke failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "refresh tokens revoked"})
+	}
 }
 
 func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {

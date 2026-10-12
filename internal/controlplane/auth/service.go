@@ -106,9 +106,10 @@ func tokenFloorKey(username string) string { return "auth:token-floor:" + userna
 // RevokeRefresh invalidates every refresh token issued to username before now:
 // it records a revocation FLOOR in the config store, and Refresh rejects any
 // refresh token whose `iat` precedes the floor. The granularity is per user
-// (every device dies together) — per-token revocation would need the jti
-// denylist the original review deferred, and the floor supersedes it for the
-// leak scenario P1-2 describes.
+// (every device dies together). Per-TOKEN revocation ("log out the other
+// sessions") is the jti denylist's job — see DenyRefreshToken (P54,
+// ADR-087/088); the two mechanisms answer different questions and Refresh
+// consults both.
 //
 // The floor does not touch ACCESS tokens by design: they expire on their own
 // 15-minute TTL, so revoking the long-lived credential is the part that needs
@@ -136,6 +137,43 @@ func (s *AuthService) refreshFloor(username string) (int64, bool, error) {
 	return floor, true, nil
 }
 
+// tokenDenyKey is the config-store key denying ONE refresh token by its jti
+// (P54, ADR-087/088). Per-token: revoking a single session leaves the user's
+// other sessions rotating — the shape the floor (a time bound) cannot express.
+func tokenDenyKey(jti string) string { return "auth:token-denylist:" + jti }
+
+// DenyRefreshToken records jti as revoked; exp is informational (diagnostics /
+// future compaction) — a hit is a hit, the value is never consulted to decide.
+// One key per jti: no read-modify-write, so concurrent revokes cannot lose an
+// entry. Entries are inert once the token expires (its jti can never appear in
+// a valid token again) but are never deleted — the Config store has no Delete,
+// registered as the mechanism's growth bound (ADR-087 §6).
+func (s *AuthService) DenyRefreshToken(jti string, exp int64) error {
+	if jti == "" {
+		return errors.New("auth: jti required")
+	}
+	return s.stor.Config().Set(tokenDenyKey(jti), strconv.FormatInt(exp, 10))
+}
+
+// refreshDenied reports whether jti is on the denylist. A storage error
+// propagates: a denylist that cannot be READ is a denylist that cannot be
+// honored (fail-closed, same discipline as the floor).
+func (s *AuthService) refreshDenied(jti string) (bool, error) {
+	v, ok, err := s.stor.Config().Get(tokenDenyKey(jti))
+	if err != nil {
+		return false, err
+	}
+	return ok && v != "", nil
+}
+
+// ParseRefreshClaims validates a refresh token with the refresh secret and
+// returns its claims — "only the holder of the token can name it" is the
+// authentication the per-token revoke endpoint relies on. (The endpoint still
+// checks the subject against the caller / admin role before denying.)
+func (s *AuthService) ParseRefreshClaims(token string) (Claims, error) {
+	return ParseToken(token, s.refreshSecret)
+}
+
 // Refresh validates a refresh token and rotates both tokens.
 //
 // P1-2: the refresh is rejected when the token's `iat` precedes username's
@@ -155,6 +193,16 @@ func (s *AuthService) Refresh(refreshToken string) (access, refresh string, err 
 		// survive. Cost: a re-login in the same second as the revoke is
 		// rejected for up to one second (the user retries and succeeds).
 		return "", "", ErrTokenRevoked
+	}
+	// P54 (ADR-087/088): per-token revocation, checked AFTER the floor (the
+	// coarse mechanism) and BEFORE rotation. The rotated successor carries a
+	// fresh jti, so denying the old one is exactly "log out that session".
+	if claims.Jti != "" {
+		if denied, derr := s.refreshDenied(claims.Jti); derr != nil {
+			return "", "", derr // fail-closed: an unreadable denylist is not an empty one
+		} else if denied {
+			return "", "", ErrTokenRevoked
+		}
 	}
 	access, err = SignToken(NewClaims(claims.Sub, s.accessTTL), s.accessSecret)
 	if err != nil {
