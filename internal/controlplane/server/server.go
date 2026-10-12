@@ -43,6 +43,7 @@ import (
 	"github.com/YuDong999/opscore/internal/core"
 	corecap "github.com/YuDong999/opscore/internal/core/capability"
 	"github.com/YuDong999/opscore/internal/core/execution"
+	"github.com/YuDong999/opscore/internal/core/snapshot"
 	"github.com/YuDong999/opscore/internal/protection"
 	"github.com/YuDong999/opscore/internal/storage"
 )
@@ -139,6 +140,12 @@ type Config struct {
 	// BootstrapAdmin instead (Phase 4 will replace this with admin-gated
 	// provisioning + approval).
 	AllowRegister bool
+	// CapabilityCacheHints (Phase 53, ADR-085) enables the host-registry
+	// capability cache: a successful probe publishes its snapshot hash into the
+	// named host's labels, and a FAILED probe falls back to the host's
+	// last-known snapshot (Source=SourceCache) instead of leaving the resolver
+	// with nothing. Default false: a disabled deployment is byte-identical.
+	CapabilityCacheHints bool
 }
 
 // BootstrapAdmin names the first-run administrator account.
@@ -159,6 +166,7 @@ type Server struct {
 	demoMode      bool
 	useSudo       bool
 	allowRegister bool
+	capCacheHints bool
 	loginLimiter  *loginFailureLimiter
 	// bus is the in-process execution.EventBus fan-out. The
 	// ExecutionService publishes lifecycle events onto it; the WS hub
@@ -214,6 +222,7 @@ func New(cfg Config) (*Server, error) {
 		demoMode:         cfg.DemoMode,
 		useSudo:          cfg.UseSudo,
 		allowRegister:    cfg.AllowRegister,
+		capCacheHints:    cfg.CapabilityCacheHints,
 		loginLimiter:     newLoginFailureLimiter(time.Now),
 		bus:              bus,
 		wsHub:            hub,
@@ -369,7 +378,11 @@ func (s *Server) subject(r *http.Request) (string, error) {
 	return "", errors.New("missing bearer token or session cookie")
 }
 
-func (s *Server) coreCtx(r *http.Request, username string, target core.TargetHost, parent context.Context) core.Context {
+// coreCtx builds the execution context for a target. hostName is the registry
+// name a named-host request resolved from ("" for inline/absent targets); it
+// keys the capability-cache hints (Phase 53, ADR-085) — the request said
+// "web-01", so the hint belongs to "web-01", never to a spec-matched stranger.
+func (s *Server) coreCtx(r *http.Request, username string, target core.TargetHost, parent context.Context, hostName string) core.Context {
 	if parent == nil {
 		parent = r.Context()
 	}
@@ -381,14 +394,133 @@ func (s *Server) coreCtx(r *http.Request, username string, target core.TargetHos
 		Build()
 	// Phase 2.6: attach the observed capability/host snapshot for remote
 	// targets (best-effort SSH probe, cached). The Resolver then consumes it
-	// instead of guessing the dominant Linux tool.
+	// instead of guessing the dominant Linux tool. (ADR-085/086 defect D: this
+	// probe is REACHABLE only because Build() no longer seeds the local facts
+	// under a remote target's key — the enrich guard below the builder's
+	// snapshot would otherwise short-circuit it forever.)
 	ctx = core.EnrichContextForTarget(ctx, target)
+	// Phase 53 (ADR-085/086): publish the freshly observed set into the named
+	// host's registry labels, or replay the host's last-known set when the
+	// probe above yielded nothing. Feature-gated; both sides are no-ops for
+	// unnamed targets and when disabled.
+	ctx = s.applyCapabilityCacheHints(ctx, hostName, target)
 	// Phase 2.8 closure: content-address the observed capability snapshot into
 	// the CapabilitySnapshotStore so the CapabilityHash frozen into the
 	// ExecutionRecord/AuditEvent resolves to a real payload (weak reference,
 	// ADR-009). Idempotent on hash, so re-enriching the same host reuses the row.
 	persistCapabilitySnapshot(ctx, s.stor, s.logger)
 	return ctx
+}
+
+// capabilityHintLabel is the registry label carrying the content hash of a
+// host's last successfully collected CapabilitySnapshot (Phase 53, ADR-085).
+// It is a HINT, not a trust input: the value only references a
+// content-addressed payload, so a forged hint can at worst point at another
+// genuinely collected set or at nothing (fail-closed, ADR-085 §4.4).
+const capabilityHintLabel = "capability_snapshot_hash"
+
+// applyCapabilityCacheHints is the single seam of the capability cache
+// (ADR-086 §2.3): fresh observations are PUBLISHED; a missing one (failed or
+// skipped probe) REPLAYS the host's last-known set. Returns ctx unchanged in
+// every disabled / unnamed / failed case.
+func (s *Server) applyCapabilityCacheHints(ctx core.Context, hostName string, target core.TargetHost) core.Context {
+	if !s.capCacheHints || hostName == "" {
+		return ctx
+	}
+	if snap := ctx.CapabilitySnapshot(); snap != nil {
+		s.publishCapabilityHint(hostName, snap)
+		return ctx // fresh observations always win (I2)
+	}
+	return s.capabilityCacheFallback(ctx, hostName, target)
+}
+
+// publishCapabilityHint records snap's content hash into the named host's
+// labels. Best-effort by design: the registry is advisory metadata, never a
+// dependency of the dispatch path. Idempotent: the label is written only when
+// the hash actually changed.
+func (s *Server) publishCapabilityHint(hostName string, snap *snapshot.CapabilitySnapshot) {
+	if s.hosts == nil || snap == nil {
+		return
+	}
+	h, err := s.hosts.GetByName(hostName)
+	if err != nil {
+		return // host not registered (e.g. deleted mid-flight): nothing to hint
+	}
+	hash := snap.Hash()
+	if h.Labels != nil && h.Labels[capabilityHintLabel] == hash {
+		return // unchanged: no write, no churn
+	}
+	labels := make(map[string]string, len(h.Labels)+1)
+	for k, v := range h.Labels {
+		labels[k] = v
+	}
+	labels[capabilityHintLabel] = hash
+	h.Labels = labels
+	if _, err := s.hosts.Save(h); err != nil {
+		s.logger.Warn("capability cache hint publish failed", "host", hostName, "err", err)
+	}
+}
+
+// capabilityCacheFallback replays the named host's last-known capability set
+// when the fresh probe produced nothing. Every failure — host gone, hint
+// absent, payload gone, payload corrupt — returns ctx unchanged: the caller
+// then follows today's guess path, never a partial or fabricated snapshot.
+func (s *Server) capabilityCacheFallback(ctx core.Context, hostName string, target core.TargetHost) core.Context {
+	if s.hosts == nil || s.stor == nil || target.IsZero() {
+		return ctx
+	}
+	h, err := s.hosts.GetByName(hostName)
+	if err != nil || h.Labels == nil {
+		return ctx
+	}
+	hint := h.Labels[capabilityHintLabel]
+	if hint == "" {
+		return ctx
+	}
+	payload, err := s.stor.Snapshots().GetByHash(hint)
+	if err != nil {
+		s.logger.Warn("capability cache hint dangling — no payload for hash",
+			"host", hostName, "hash", hint, "err", err)
+		return ctx
+	}
+	// The store wraps every payload in a versioned envelope
+	// (storage.SnapshotEnvelope — see PersistCapabilitySnapshot). Decode it and
+	// refuse anything we cannot fully vouch for: an unknown schema version or a
+	// payload whose recomputed content hash does not equal the reference means
+	// the hint does NOT resolve to the set it claims, and a guess path is more
+	// honest than a wrong replay.
+	var env storage.SnapshotEnvelope
+	if err := json.Unmarshal(payload, &env); err != nil {
+		s.logger.Warn("capability cache payload corrupt — refusing a partial snapshot",
+			"host", hostName, "hash", hint, "err", err)
+		return ctx
+	}
+	if env.SchemaVersion != storage.CapabilitySnapshotSchemaVersion || len(env.Payload) == 0 {
+		s.logger.Warn("capability cache payload schema unsupported — refusing",
+			"host", hostName, "hash", hint, "schema", env.SchemaVersion)
+		return ctx
+	}
+	var snap snapshot.CapabilitySnapshot
+	if err := json.Unmarshal(env.Payload, &snap); err != nil {
+		s.logger.Warn("capability cache payload corrupt — refusing a partial snapshot",
+			"host", hostName, "hash", hint, "err", err)
+		return ctx
+	}
+	// Content-addressed honesty: the hint is a reference to a hash; it only
+	// resolves if the payload's content actually IS that hash.
+	if snap.Hash() != hint {
+		s.logger.Warn("capability cache reference mismatch — payload content is not the referenced hash",
+			"host", hostName, "hash", hint, "content_hash", snap.Hash())
+		return ctx
+	}
+	// The served copy is tagged SourceCache so the staleness is visible in the
+	// inventory payload and the audit chain; Hash() does not cover Source, so
+	// the content-addressed reference the audit froze still resolves (ADR-085
+	// F10). CollectedAt keeps the ORIGINAL observation time.
+	snap.Source = snapshot.SourceCache
+	child := core.WithTarget(ctx, target)
+	child.SetSnapshot(target, &snap)
+	return child
 }
 
 // persistCapabilitySnapshot is the control-plane integration point for the
@@ -443,31 +575,35 @@ func (s *Server) handleGetSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 // parseTargetBody extracts an optional "target" from decoded params (so it
-// does not leak into the operation input) and returns a TargetHost. Two shapes
-// are accepted:
+// does not leak into the operation input) and returns a TargetHost plus the
+// registry NAME it was resolved from (empty for inline/absent targets). Two
+// shapes are accepted:
 //   - a string  -> a named host reference, resolved through the Host Registry
 //     (e.g. "web-01"); the server must have a HostStore configured.
 //   - an object -> an inline connection spec (the original behaviour).
 //
-// A present-but-invalid target is an error; an absent one is not.
-func parseTargetBody(params map[string]any, hosts hostregistry.HostStore) (core.TargetHost, error) {
+// A present-but-invalid target is an error; an absent one is not. The name is
+// returned so the capability-cache hints (Phase 53, ADR-085) are keyed by the
+// host the request actually named, not by spec-matching heuristics.
+func parseTargetBody(params map[string]any, hosts hostregistry.HostStore) (core.TargetHost, string, error) {
 	raw, ok := params["target"]
 	if !ok {
-		return core.TargetHost{}, nil
+		return core.TargetHost{}, "", nil
 	}
 	switch v := raw.(type) {
 	case string:
 		if v == "" {
-			return core.TargetHost{}, fmt.Errorf("target name must not be empty")
+			return core.TargetHost{}, "", fmt.Errorf("target name must not be empty")
 		}
-		return hostregistry.ResolveTarget(hosts, v)
+		t, err := hostregistry.ResolveTarget(hosts, v)
+		return t, v, err
 	case map[string]any:
 		t := core.TargetHost{}
 		if a, ok := v["address"].(string); ok {
 			t.Address = a
 		}
 		if t.Address == "" {
-			return core.TargetHost{}, fmt.Errorf("target.address is required")
+			return core.TargetHost{}, "", fmt.Errorf("target.address is required")
 		}
 		if p, ok := v["port"].(float64); ok {
 			t.Port = int(p)
@@ -487,9 +623,9 @@ func parseTargetBody(params map[string]any, hosts hostregistry.HostStore) (core.
 		if sd, ok := v["sudo"].(bool); ok {
 			t.Sudo = sd
 		}
-		return t, nil
+		return t, "", nil
 	default:
-		return core.TargetHost{}, fmt.Errorf("target must be a host name (string) or an object")
+		return core.TargetHost{}, "", fmt.Errorf("target must be a host name (string) or an object")
 	}
 }
 
@@ -690,7 +826,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	target, err := parseTargetBody(params, s.hosts)
+	target, targetName, err := parseTargetBody(params, s.hosts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid target: "+err.Error())
 		return
@@ -702,7 +838,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, r *http.Request) {
 	if s.useSudo {
 		target.Sudo = true // server policy: managed host needs privilege escalation
 	}
-	ctx := s.coreCtx(r, username, target, r.Context())
+	ctx := s.coreCtx(r, username, target, r.Context(), targetName)
 	plan, err := s.dispatcher.Plan(ctx, opName, params)
 	if err != nil {
 		if errors.Is(err, core.ErrOperationNotFound) {
@@ -755,7 +891,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	target, err := parseTargetBody(params, s.hosts)
+	target, targetName, err := parseTargetBody(params, s.hosts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid target: "+err.Error())
 		return
@@ -767,7 +903,7 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	if s.useSudo {
 		target.Sudo = true // server policy: managed host needs privilege escalation
 	}
-	ctx := s.coreCtx(r, username, target, parentCtx)
+	ctx := s.coreCtx(r, username, target, parentCtx, targetName)
 
 	// Execute through the Runtime when present so the run is recorded (giving
 	// it an execution id the client can later cancel) and cancellable. The
@@ -898,7 +1034,10 @@ func (s *Server) handleBatch(w http.ResponseWriter, r *http.Request) {
 		parentCtx = pc
 		defer cancel()
 	}
-	parent := s.coreCtx(r, username, s.defaultTarget, parentCtx)
+	// Batch fan-out children are enriched in the kernel (dispatcher.go), which
+	// knows no registry: the parent context carries no host name, so the
+	// capability-cache hints never apply on this path (ADR-085 §4.1).
+	parent := s.coreCtx(r, username, s.defaultTarget, parentCtx, "")
 	results := s.dispatcher.Batch(parent, body.Op, targets, params)
 	// Phase 21: feed the breaker (protection feedback only — R21-10).
 	if adm != nil {
@@ -1029,6 +1168,7 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 	// Resolve the target: a named host (path) takes precedence over the server
 	// default. An absent default + no name falls back to a zero (local) target.
 	target := s.defaultTarget
+	hostName := "" // Phase 53: the registry name, when the request named one
 	if name := r.PathValue("name"); name != "" {
 		if s.hosts == nil {
 			writeError(w, http.StatusNotFound, "host registry not enabled")
@@ -1040,10 +1180,11 @@ func (s *Server) handleInventory(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		target = t
+		hostName = name
 	}
 	// coreCtx enriches (SSH probe for remote targets) and content-addresses the
 	// capability snapshot, so the returned inventory matches what was persisted.
-	ctx := s.coreCtx(r, username, target, r.Context())
+	ctx := s.coreCtx(r, username, target, r.Context(), hostName)
 	view := inventory.Build(ctx)
 
 	// Phase 2.9 closure: surface the real read-only op output as inventory
@@ -1279,7 +1420,7 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 	if params == nil {
 		params = map[string]any{}
 	}
-	target, err := parseTargetBody(params, s.hosts)
+	target, targetName, err := parseTargetBody(params, s.hosts)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid target: "+err.Error())
 		return
@@ -1291,7 +1432,7 @@ func (s *Server) handleCreateExecution(w http.ResponseWriter, r *http.Request) {
 	if s.useSudo {
 		target.Sudo = true
 	}
-	ctx := s.coreCtx(r, username, target, parentCtx)
+	ctx := s.coreCtx(r, username, target, parentCtx, targetName)
 	plan, err := s.dispatcher.Plan(ctx, body.Op, params)
 	if err != nil {
 		if errors.Is(err, core.ErrOperationNotFound) {

@@ -61,5 +61,7 @@
 
 | 质量基线 2026-10-11「遗留 #1」声称 P1-5「探测未迁移到目标机；迁移是接线」 | 目标机 SSH 探测已存在且已接线（`internal/core/ssh.go` `probeRemoteCapability` + `dispatcher.go:82` + `server.go:385` + `resolver.go:100-113` remote 消费；`DetectCapability()` 生产零调用方）——基线表述停在 2026-07-22 的旧实况 | 下一轮评估会重开一个实质已闭合的候选（Phase 52 启动轮已按 R210 裁定收敛，并以维护轮清偿真实残差：SSH systemd 判定命令缺陷） | 已于 2026-10-11 以基线补记（§五）+ 判别用例 `TestProbeRemoteCapability_SystemdBySystemctlBinary` 纠正 |
 
+| 质量基线 2026-10-11 §5 #1 与 Phase 52 会话记录均称目标机探测「已存在**且已接线**」（`dispatcher.go:82` 与 `server.go:385` 两处） | 「已接线」只对**批处理扇出**（`dispatcher.go:82`，子上下文缓存全新）成立；**server 单目标路径**（plan/execute/submit/`/api/inventory`）的探测**从未运行**——`Build()` 把本机快照种到远端目标键下（`context.go:307-309`），`EnrichContextForTarget` 的「已富化」守卫（`ssh.go:475`）随即短路；inventory 把**控制面自身**的观测归属给远端主机（判别器 T390/T392/T393 实测红，红证据在 ADR-085 §3） | 远端目标的观测被静默跳过、能力归属错误；`SourceCache` 回退因「快照永不为空」而永不触发 | 已于 2026-10-12 修复（ADR-085/086：`Build()` 播种规则 + T392/T393 回归钉 + 四个变异） |
+
 > Drift 处理原则（R71）：代码事实 ≠ 文档时，**绝不改冻结代码迁就文档**；记录为上述
 > Fact→Drift→Impact，必要时列为 Future Major Candidate。文档不得发明不存在的 endpoint。

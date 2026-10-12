@@ -470,6 +470,8 @@ func cmdServe(args []string) {
 	adminPass := fs.String("admin-pass", cfgVal(vals, "admin-pass", "admin"), "bootstrap admin password")
 	jwtSecret := fs.String("jwt-secret", cfgVal(vals, "jwt-secret", "change-me-in-prod"), "JWT signing secret")
 	allowRegister := fs.Bool("allow-register", cfgBool(vals, "allow-register", false), "allow open self-registration (default off; security surface)")
+	// Phase 53 (ADR-085): host-registry capability cache hints (opt-in).
+	capCacheHints := fs.Bool("capability-cache-hints", cfgBool(vals, "capability-cache-hints", false), "publish/replay last-known capability snapshots via host-registry labels (default off; requires the host registry)")
 	// Default SSH target (every operation executes here unless overridden per-request).
 	tHost := fs.String("target-host", cfgVal(vals, "target-host", ""), "default remote host (empty = local). Operations run over SSH to this host")
 	tPort := fs.Int("target-port", cfgInt(vals, "target-port", 22), "default remote SSH port")
@@ -694,7 +696,7 @@ func cmdServe(args []string) {
 			VerifyInterval: *exportVerifyInterval,
 			VerifyCapacity: *exportVerifyCapacity,
 			// Phase 44: verifier identity & trust-anchor independence.
-			VerifierKeyPath:   *exportVerifierKey,
+			VerifierKeyPath:    *exportVerifierKey,
 			VerifierTrustPaths: parseExportFormats(*exportVerifierTrust),
 			// Phase 43: destruction accountability (KAK and anchor flags
 			// are deliberately reused — no new trust anchor is introduced).
@@ -717,23 +719,24 @@ func cmdServe(args []string) {
 	}
 
 	srv, err := server.New(server.Config{
-		Storage:          stor,
-		Dispatcher:       dispatcher,
-		Runtime:          runtime,
-		HostStore:        hostStore,
-		AccessSecret:     *jwtSecret + ":access",
-		RefreshSecret:    *jwtSecret + ":refresh",
-		Logger:           logger,
-		DefaultTarget:    defaultTarget,
-		DemoMode:         demoOn,
-		UseSudo:          *tSudo && !demoOn,
-		AllowRegister:    *allowRegister,
-		BootstrapAdmin:   &server.BootstrapAdmin{Username: *adminUser, Password: *adminPass},
-		Gate:             bundle.gate,
-		AlertTracker:     bundle.alertTracker,
-		AlertPolicy:      bundle.alertPolicy,
-		TransitionStore:  bundle.transitionStore,
-		HistoryScheduler: exportScheduler,
+		Storage:              stor,
+		Dispatcher:           dispatcher,
+		Runtime:              runtime,
+		HostStore:            hostStore,
+		AccessSecret:         *jwtSecret + ":access",
+		RefreshSecret:        *jwtSecret + ":refresh",
+		Logger:               logger,
+		DefaultTarget:        defaultTarget,
+		DemoMode:             demoOn,
+		UseSudo:              *tSudo && !demoOn,
+		AllowRegister:        *allowRegister,
+		CapabilityCacheHints: *capCacheHints,
+		BootstrapAdmin:       &server.BootstrapAdmin{Username: *adminUser, Password: *adminPass},
+		Gate:                 bundle.gate,
+		AlertTracker:         bundle.alertTracker,
+		AlertPolicy:          bundle.alertPolicy,
+		TransitionStore:      bundle.transitionStore,
+		HistoryScheduler:     exportScheduler,
 	})
 	if err != nil {
 		logger.Error("server init failed", "err", err)

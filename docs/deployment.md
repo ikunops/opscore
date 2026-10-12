@@ -89,6 +89,11 @@
   （不回退、不假装）。
 - **生命周期**：SIGTERM → serve 上下文取消 → HTTP 面 drain，导出调度器在飞 tick
   落定后退出（`TimeoutStopSec=30` 足够）。
+- **能力缓存提示（opt-in，Phase 53 / ADR-085）**：`--capability-cache-hints` 让命名主机
+  的成功探针把快照哈希发布到该主机的注册表 `labels["capability_snapshot_hash"]`
+  （经 `GET /api/hosts/{name}` 可见），并在该主机探针**失败**时重放其**上次已知**的
+  能力集（`source=cache` + 原始 `CollectedAt` 如实标注；新鲜探针永远优先）。删除该
+  label 即放弃缓存。默认关闭：未启用时行为逐字节不变。
 - **机械守卫**：单元引用不存在的 flag、携带字面 secret、或地址越界，都会使
   `cmd/opscore` 的 T386~T388 变红（ADR-084）——部署产物不得发明二进制的参数。
 

@@ -52,6 +52,12 @@ ExecStart=/usr/local/bin/opscore serve \
 #                 --export-acceptance-capacity 4096
 #   formats:      --export-formats json,csv --export-retain 96
 #
+# Capability cache hints (Phase 53, ADR-085; opt-in). Publishes each named
+# host's last-known capability snapshot hash into its registry labels
+# (visible/clearable via GET/POST /api/hosts) and replays that set when a
+# probe fails. Off by default: a disabled deployment is byte-identical.
+#   --capability-cache-hints
+#
 # Secrets: /etc/opscore/controlplane.env (MANDATORY; a missing file makes the
 # unit refuse to start) carries OPESCORE_JWT_SECRET and OPESCORE_ADMIN_PASS
 # only. Neither value ever appears on the command line above: argv is visible

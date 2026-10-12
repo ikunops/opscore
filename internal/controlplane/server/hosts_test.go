@@ -73,38 +73,48 @@ func TestParseTargetBody_Resolution(t *testing.T) {
 	store := hostregistry.NewMemoryHostStore()
 	_, _ = store.Save(hostregistry.Host{Name: "h1", Target: core.TargetHost{Address: "1.2.3.4", Port: 2222, User: "u"}})
 
-	// string -> resolved from registry
-	th, err := parseTargetBody(map[string]any{"target": "h1"}, store)
+	// string -> resolved from registry, and the registry NAME is returned for
+	// the capability-cache hints (Phase 53, ADR-085)
+	th, name, err := parseTargetBody(map[string]any{"target": "h1"}, store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if th.Address != "1.2.3.4" || th.Port != 2222 || th.User != "u" {
 		t.Fatalf("resolve failed: %+v", th)
 	}
+	if name != "h1" {
+		t.Fatalf("resolved name = %q, want %q", name, "h1")
+	}
 
-	// object -> inline (existing behaviour preserved)
-	th, err = parseTargetBody(map[string]any{"target": map[string]any{"address": "9.9.9.9", "port": 22.0}}, store)
+	// object -> inline (existing behaviour preserved); no registry name
+	th, name, err = parseTargetBody(map[string]any{"target": map[string]any{"address": "9.9.9.9", "port": 22.0}}, store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if th.Address != "9.9.9.9" {
 		t.Fatalf("inline parse failed: %+v", th)
 	}
+	if name != "" {
+		t.Fatalf("inline target must carry no registry name, got %q", name)
+	}
 
 	// unknown name -> error
-	if _, err := parseTargetBody(map[string]any{"target": "nope"}, store); err == nil {
+	if _, _, err := parseTargetBody(map[string]any{"target": "nope"}, store); err == nil {
 		t.Fatal("expected error for unknown host name")
 	}
 
 	// nil store + string -> error
-	if _, err := parseTargetBody(map[string]any{"target": "h1"}, nil); err == nil {
+	if _, _, err := parseTargetBody(map[string]any{"target": "h1"}, nil); err == nil {
 		t.Fatal("expected error when registry not configured")
 	}
 
-	// absent -> zero target
-	th, err = parseTargetBody(map[string]any{}, store)
+	// absent -> zero target, no name
+	th, name, err = parseTargetBody(map[string]any{}, store)
 	if err != nil || !th.IsZero() {
 		t.Fatalf("absent target should be zero, got %+v err=%v", th, err)
+	}
+	if name != "" {
+		t.Fatalf("absent target must carry no registry name, got %q", name)
 	}
 }
 

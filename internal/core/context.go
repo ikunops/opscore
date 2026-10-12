@@ -304,8 +304,26 @@ func (b *ContextBuilder) Build() Context {
 		}
 	}
 
-	states := map[TargetKey]*targetState{
-		b.target.Key(): {cap: capSnap, host: hostSnap},
+	// Seeding rule (ADR-086 §2.1 / ADR-085 §3): auto-detected LOCAL facts
+	// describe THIS machine only and are never cached under a remote (non-zero)
+	// target's key — a remote target's cache starts EMPTY, so
+	// EnrichContextForTarget probes it for real and a failed probe leaves it
+	// honestly snapshot-less instead of attributing the control plane's own
+	// capabilities to someone else. Explicitly supplied snapshots
+	// (WithCapabilitySnapshot/WithHostSnapshot) describe the TARGET and always
+	// seed it; the local (zero) target keeps its auto-detected facts.
+	seedCap, seedHost := capSnap, hostSnap
+	if !b.target.IsZero() {
+		if b.capSnap == nil {
+			seedCap = nil
+		}
+		if b.hostSnap == nil {
+			seedHost = nil
+		}
+	}
+	states := map[TargetKey]*targetState{}
+	if b.target.IsZero() || seedCap != nil || seedHost != nil {
+		states[b.target.Key()] = &targetState{cap: seedCap, host: seedHost}
 	}
 
 	return &contextImpl{
