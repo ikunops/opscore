@@ -1069,7 +1069,7 @@ func cmdPlan(args []string) {
 	tHost := fs.String("target-host", "", "remote host for this op (empty = local)")
 	tPort := fs.Int("target-port", 22, "remote SSH port")
 	tUser := fs.String("target-user", "root", "remote SSH user")
-	tPass := fs.String("target-pass", "", "remote SSH password")
+	tPass := fs.String("target-pass", envValue("target-pass"), "remote SSH password (prefer env OPSCORE_TARGET_PASS; argv is visible to local users)")
 	tKey := fs.String("target-key", "", "remote SSH key path")
 	tInsecure := fs.Bool("target-insecure", false, "skip host key verification (dev only)")
 	tSudo := fs.Bool("target-sudo", false, "run remote command via sudo -n")
@@ -1126,7 +1126,7 @@ func cmdRun(args []string) {
 	tHost := fs.String("target-host", "", "remote host for this op (empty = local)")
 	tPort := fs.Int("target-port", 22, "remote SSH port")
 	tUser := fs.String("target-user", "root", "remote SSH user")
-	tPass := fs.String("target-pass", "", "remote SSH password")
+	tPass := fs.String("target-pass", envValue("target-pass"), "remote SSH password (prefer env OPSCORE_TARGET_PASS; argv is visible to local users)")
 	tKey := fs.String("target-key", "", "remote SSH key path")
 	tInsecure := fs.Bool("target-insecure", false, "skip host key verification (dev only)")
 	tSudo := fs.Bool("target-sudo", false, "run remote command via sudo -n")
@@ -1210,7 +1210,7 @@ func cmdHost(args []string) {
 		addr := fs.String("address", "", "SSH address (required)")
 		port := fs.Int("port", 22, "SSH port")
 		user := fs.String("user", "root", "SSH user")
-		pass := fs.String("password", "", "SSH password")
+		pass := fs.String("password", envValue("password"), "SSH password (prefer env OPSCORE_PASSWORD; argv is visible to local users)")
 		key := fs.String("key-path", "", "path to PEM private key")
 		insecure := fs.Bool("insecure", false, "skip host key verification (dev only)")
 		sudo := fs.Bool("sudo", false, "run remote commands via sudo -n")
@@ -1320,6 +1320,11 @@ Host Registry (Phase 2.3):
   Register named targets once (CLI 'host add' or POST /api/hosts), then run
   operations against them by name: --target <name> (CLI) or "target":"<name>"
   (API). Groups enable Phase 2.5 Batch fan-out. Secrets are never echoed back.
+
+Password discipline (ADR-093):
+  SSH passwords are best supplied via env (OPSCORE_TARGET_PASS for --target-pass,
+  OPSCORE_PASSWORD for 'host add --password') or a named host in the hosts file
+  (0600). Command-line flags are visible to every local user via argv.
 
 Architecture:
   CLI -> Dispatcher -> Handler.Plan -> ExecutionPlan -> Executor -> CommandStep -> (local | SSH) -> AuditSink
