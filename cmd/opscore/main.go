@@ -464,6 +464,26 @@ func cfgBool(vals map[string]string, key string, def bool) bool {
 	return def
 }
 
+// openStorage resolves the --storage kind to a concrete backend. The flag's
+// domain is exactly {memory, sqlite}; anything else is an operator error and
+// is refused (ADR-092) rather than silently downgraded to the in-memory store
+// — a typo must not turn a persistent deployment into one whose database file
+// is never opened and whose state vanishes on restart.
+func openStorage(kind, dbPath string) (storage.Storage, error) {
+	switch kind {
+	case "memory":
+		return storage.NewMemoryStorage(), nil
+	case "sqlite":
+		s, err := sqlite.NewSQLiteStorage(dbPath)
+		if err != nil {
+			return nil, fmt.Errorf("open sqlite %q: %w", dbPath, err)
+		}
+		return s, nil
+	default:
+		return nil, fmt.Errorf("unknown backend %q (want \"memory\" or \"sqlite\")", kind)
+	}
+}
+
 // cmdServe runs the Control Plane HTTP server (Phase 1.5).
 func cmdServe(args []string) {
 	// Stage 1: discover the config path (default opscore.env if present) so
@@ -583,18 +603,18 @@ func cmdServe(args []string) {
 		os.Exit(1)
 	}
 
-	// 1. Storage
-	var stor storage.Storage
-	switch *storageKind {
-	case "sqlite":
-		s, err := sqlite.NewSQLiteStorage(*dbPath)
-		if err != nil {
-			logger.Error("failed to open sqlite", "err", err)
-			os.Exit(1)
-		}
-		stor = s
-	default:
-		stor = storage.NewMemoryStorage()
+	// 1. Storage. An unknown --storage kind is REFUSED, never silently served
+	// from memory (ADR-092): the flag's domain is exactly {memory, sqlite},
+	// and a typo falling back to memory would produce a "persistent"
+	// deployment whose database file is never touched and whose state
+	// evaporates on restart — the false-clean class P30-I11/P34-I5 forbid
+	// elsewhere in this codebase (the password/secret gates above already
+	// treat any non-memory value as persistent, so the components would
+	// otherwise disagree about what this deployment even is).
+	stor, err := openStorage(*storageKind, *dbPath)
+	if err != nil {
+		logger.Error("refusing to start: invalid --storage", "kind", *storageKind, "err", err)
+		os.Exit(1)
 	}
 	defer stor.Close()
 
