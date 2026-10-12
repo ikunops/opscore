@@ -172,6 +172,12 @@ if (CFG.defaultTarget) {
 }
 
 // ---------- 工具 ----------
+// esc: escape a value for the HTML text/attribute contexts before it reaches
+// innerHTML (ADR-094). Every dynamic value rendered into the console tabs goes
+// through this — the data includes target-host-controlled text (systemctl unit
+// descriptions) and stored audit details, so unescaped interpolation would let
+// a managed host run script in the admin's browser.
+function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
 function toast(msg, kind){
   const el = document.createElement('div');
   el.className = 'toast ' + (kind||'');
@@ -263,17 +269,17 @@ function renderServices(svcs){
     return;
   }
   tbody.innerHTML = svcs.map(s=>{
-    const aTag = s.active==='active' ? '<span class="tag active">active</span>' : '<span class="tag inactive">'+s.active+'</span>';
+    const aTag = s.active==='active' ? '<span class="tag active">active</span>' : '<span class="tag inactive">'+esc(s.active)+'</span>';
     return `<tr>
-      <td class="mono">${s.unit}</td>
-      <td><span class="tag loaded">${s.load}</span></td>
+      <td class="mono">${esc(s.unit)}</td>
+      <td><span class="tag loaded">${esc(s.load)}</span></td>
       <td>${aTag}</td>
-      <td>${s.sub}</td>
-      <td>${s.desc}</td>
+      <td>${esc(s.sub)}</td>
+      <td>${esc(s.desc)}</td>
       <td>
-        <button class="btn sm ok" data-act="start" data-name="${s.unit}">启动</button>
-        <button class="btn sm danger" data-act="stop" data-name="${s.unit}">停止</button>
-        <button class="btn sm" data-act="restart" data-name="${s.unit}">重启</button>
+        <button class="btn sm ok" data-act="start" data-name="${esc(s.unit)}">启动</button>
+        <button class="btn sm danger" data-act="stop" data-name="${esc(s.unit)}">停止</button>
+        <button class="btn sm" data-act="restart" data-name="${esc(s.unit)}">重启</button>
       </td></tr>`;
   }).join('');
   tbody.querySelectorAll('button[data-act]').forEach(btn=>{
@@ -288,7 +294,7 @@ async function refreshServices(){
   const r = await runOp('system.service.list', {});
   const tbody = document.getElementById('svcBody');
   if(r.status!==200 || (r.body && !r.body.success)){
-    tbody.innerHTML = '<tr><td colspan="6" class="muted">加载失败：'+(r.body&&r.body.error?r.body.error:r.status)+'</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="muted">加载失败：'+esc(r.body&&r.body.error?r.body.error:r.status)+'</td></tr>';
     document.getElementById('svcCount').textContent='错误';
     allServices = [];
     return;
@@ -315,13 +321,13 @@ async function refreshAudit(){
   if(!access){ toast('请先登录','err'); return; }
   const r = await api('GET','/api/audit?limit=50',undefined,true);
   const tbody=document.getElementById('auditBody');
-  if(r.status!==200){ tbody.innerHTML='<tr><td colspan="7" class="muted">加载失败：'+(r.body.error||r.status)+'</td></tr>'; return; }
+  if(r.status!==200){ tbody.innerHTML='<tr><td colspan="7" class="muted">加载失败：'+esc(r.body.error||r.status)+'</td></tr>'; return; }
   const evs = (r.body && r.body.events) || [];
   if(evs.length===0){ tbody.innerHTML='<tr><td colspan="7" class="muted">暂无记录。</td></tr>'; return; }
   tbody.innerHTML = evs.map(e=>{
     const ok = e.result==='success'||e.result==='ok';
-    const tag = ok?'<span class="tag active">'+e.result+'</span>':'<span class="tag inactive">'+e.result+'</span>';
-    return `<tr><td class="mono">${e.timestamp||''}</td><td>${e.actor||''}</td><td class="mono">${e.operation||''}</td><td>${e.action||''}</td><td class="mono">${e.target||''}</td><td>${tag}</td><td class="muted">${(e.detail||'').slice(0,80)}</td></tr>`;
+    const tag = ok?'<span class="tag active">'+esc(e.result)+'</span>':'<span class="tag inactive">'+esc(e.result)+'</span>';
+    return `<tr><td class="mono">${esc(e.timestamp||'')}</td><td>${esc(e.actor||'')}</td><td class="mono">${esc(e.operation||'')}</td><td>${esc(e.action||'')}</td><td class="mono">${esc(e.target||'')}</td><td>${tag}</td><td class="muted">${esc((e.detail||'').slice(0,80))}</td></tr>`;
   }).join('');
 }
 document.getElementById('refreshAudit').onclick = refreshAudit;

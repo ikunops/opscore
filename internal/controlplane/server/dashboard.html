@@ -462,7 +462,7 @@ function renderQuotas(q) {
       <td>${d.principal ? esc(d.principal) : '<span class="sub">all principals</span>'}</td>
       <td>${d.rss_bytes ? esc(String(d.rss_bytes)) : "unlimited"}</td>
       <td>${d.cpu_secs ? esc(String(d.cpu_secs)) : "unlimited"}</td>
-      <td><button class="ghost-btn" onclick="clearQuota('${esc(d.capability)}','${esc(d.principal || "")}')">clear</button></td>
+      <td><button class="ghost-btn" onclick="clearQuota('${jsq(d.capability)}','${jsq(d.principal)}')">clear</button></td>
     </tr>`).join("");
 }
 
@@ -500,7 +500,7 @@ function renderKills(k) {
       <td><span class="pill ${r.killed ? "on" : "off"}">${r.killed ? "KILLED" : "live"}</span></td>
       <td>${r.killed_at ? new Date(r.killed_at).toLocaleString() : "—"}</td>
       <td>${esc(r.killed_by || "system")}</td>
-      <td>${r.killed ? `<button class="ghost-btn" onclick="release('${esc(r.capability_id)}')">release</button>` : ""}</td>
+      <td>${r.killed ? `<button class="ghost-btn" onclick="release('${jsq(r.capability_id)}')">release</button>` : ""}</td>
     </tr>`).join("");
 
   const op = k.operator_kills || [];
@@ -633,6 +633,13 @@ function renderEvidenceIntegrity(d) {
 
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c])); }
 
+// jsq: escape a value for the inline-handler JS-string-in-attribute context
+// (onclick="f('<here>')"). A plain HTML-entity escape is NOT enough there: the
+// browser decodes entities BEFORE compiling the JS, so &#39; comes back as a
+// literal quote and breaks out of the string (ADR-094). Backslashes first,
+// then JS quotes/newlines, then the HTML attribute layer.
+function jsq(s) { return String(s == null ? "" : s).replace(/\\/g,"\\\\").replace(/'/g,"\\'").replace(/\r/g,"\\r").replace(/\n/g,"\\n").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
 // Strict RFC3339 parse: invalid -> null (never silently "hit"). Returns null on parse failure
 // so callers can exclude (bad at) or skip the filter (bad since) instead of defaulting to true.
 function parseTime(s) {
@@ -715,7 +722,7 @@ function renderInvestigate(d, a) {
       <tr>
         <td><code>${esc(cap)}</code></td>
         <td class="mono">${n}</td>
-        <td><button class="ghost-btn" onclick="investFillKill('${esc(cap)}')">→ kill form</button></td>
+        <td><button class="ghost-btn" onclick="investFillKill('${jsq(cap)}')">→ kill form</button></td>
       </tr>`).join("");
   }
 
