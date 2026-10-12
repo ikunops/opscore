@@ -366,8 +366,9 @@ func buildProtectionGate(stor storage.Storage, logger *slog.Logger, transitionPa
 // loadConfigFile reads a minimal KEY=VALUE config (one per line; # starts a
 // comment; blank lines ignored). It lets deployment settings live in a file
 // instead of a long command line. Missing file is not an error (config is
-// optional). Env vars (OPESCORE_<KEY>) take precedence over the file, and
-// explicit CLI flags take precedence over both.
+// optional). Env vars (canonical OPSCORE_<KEY>, legacy OPESCORE_<KEY> alias;
+// ADR-091) take precedence over the file, and explicit CLI flags take
+// precedence over both.
 func loadConfigFile(path string) (map[string]string, error) {
 	vals := map[string]string{}
 	data, err := os.ReadFile(path)
@@ -391,27 +392,45 @@ func loadConfigFile(path string) (map[string]string, error) {
 	return vals, nil
 }
 
-// cfgVal resolves a string flag's default: file value -> OPESCORE_<KEY> env -> def.
+// envValue resolves the environment override for a flag key: the canonical
+// OPSCORE_<KEY> spelling first, then the historical OPESCORE_<KEY> spelling as
+// a compatibility alias (ADR-091 — one product, one canonical prefix; the
+// legacy name keeps working so deployed units do not break). Empty values
+// count as absent; "canonical wins when both are set" is asserted by test.
+func envValue(key string) string {
+	suffix := strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
+	if v := os.Getenv("OPSCORE_" + suffix); v != "" {
+		return v
+	}
+	return os.Getenv("OPESCORE_" + suffix)
+}
+
+// cfgVal resolves a string flag's default: env (OPSCORE_<KEY>; OPESCORE_<KEY>
+// legacy) -> file value -> def. ENV WINS OVER THE FILE — the contract this
+// package has always documented (loadConfigFile above) and the only sane
+// order for the secrets it seeds: config files get committed, baked into
+// images, and copied between environments; the process environment does not
+// (the same rationale the read edge's OPSCORE_MANAGEMENT_TOKEN documents).
+// Explicit CLI flags replace the default wholesale and still win over both.
 func cfgVal(vals map[string]string, key, def string) string {
-	if v, ok := vals[key]; ok && v != "" {
+	if v := envValue(key); v != "" {
 		return v
 	}
-	envKey := "OPESCORE_" + strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
-	if v := os.Getenv(envKey); v != "" {
+	if v, ok := vals[key]; ok && v != "" {
 		return v
 	}
 	return def
 }
 
-// cfgInt resolves an int flag's default the same way as cfgVal.
+// cfgInt resolves an int flag's default the same way as cfgVal; an unparsable
+// value falls through to the next source (env -> file -> def).
 func cfgInt(vals map[string]string, key string, def int) int {
-	if v, ok := vals[key]; ok && v != "" {
+	if v := envValue(key); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
 	}
-	envKey := "OPESCORE_" + strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
-	if v := os.Getenv(envKey); v != "" {
+	if v, ok := vals[key]; ok && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
@@ -419,8 +438,9 @@ func cfgInt(vals map[string]string, key string, def int) int {
 	return def
 }
 
-// cfgBool resolves a bool flag's default: file value -> OPESCORE_<KEY> env -> def.
-// Accepted truthy strings: 1/true/yes/on/y (case-insensitive).
+// cfgBool resolves a bool flag's default the same way as cfgVal; an
+// unparsable value falls through to the next source. Accepted truthy strings:
+// 1/true/yes/on/y (case-insensitive).
 func cfgBool(vals map[string]string, key string, def bool) bool {
 	resolve := func(s string) (bool, bool) {
 		switch strings.ToLower(strings.TrimSpace(s)) {
@@ -431,13 +451,12 @@ func cfgBool(vals map[string]string, key string, def bool) bool {
 		}
 		return false, false
 	}
-	if v, ok := vals[key]; ok {
-		if b, ok2 := resolve(v); ok2 {
+	if v := envValue(key); v != "" {
+		if b, ok := resolve(v); ok {
 			return b
 		}
 	}
-	envKey := "OPESCORE_" + strings.ToUpper(strings.ReplaceAll(key, "-", "_"))
-	if v := os.Getenv(envKey); v != "" {
+	if v, ok := vals[key]; ok {
 		if b, ok2 := resolve(v); ok2 {
 			return b
 		}

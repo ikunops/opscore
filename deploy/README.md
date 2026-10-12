@@ -46,8 +46,10 @@
 
 1. 安装同一 `make build` 产出的 `opscore` 二进制到 `/usr/local/bin/opscore`。
 2. 安装 secrets：`install -m600 controlplane.env.example /etc/opscore/controlplane.env`，
-   填入两枚值——`OPESCORE_JWT_SECRET`（≥32 随机字节，hex/base64；轮换即作废全部已签发
-   令牌）与 `OPESCORE_ADMIN_PASS`（Phase 27 策略：≥12 字符、非默认、非用户名）。
+   填入两枚值——`OPSCORE_JWT_SECRET`（≥32 随机字节，hex/base64；轮换即作废全部已签发
+   令牌）与 `OPSCORE_ADMIN_PASS`（Phase 27 策略：≥12 字符、非默认、非用户名）。规范前缀
+   为 `OPSCORE_`，历史拼写 `OPESCORE_` 作为兼容别名保留（ADR-091）；env 优先于
+   KEY=VALUE 配置文件。
 3. 安装单元：`cp opscore-controlplane.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now opscore-controlplane`。
 4. 证据管线出厂**全关**（每个面都需要操作者提供密钥/端点/路径才有意义；未启用的面一律
    `503`）。按单元内注释逐项开启需要的面（签名 `--export-sign-key`/`--export-trust-keys`、

@@ -59,14 +59,14 @@ ExecStart=/usr/local/bin/opscore serve \
 #   --capability-cache-hints
 #
 # Secrets: /etc/opscore/controlplane.env (MANDATORY; a missing file makes the
-# unit refuse to start) carries OPESCORE_JWT_SECRET and OPESCORE_ADMIN_PASS
+# unit refuse to start) carries OPSCORE_JWT_SECRET and OPSCORE_ADMIN_PASS
 # only. Neither value ever appears on the command line above: argv is visible
 # to every local user.
 EnvironmentFile=/etc/opscore/controlplane.env
 # Fail closed when either secret is absent: refuse to start rather than let
 # the binary fall back to its well-known development defaults.
-ExecStartPre=/usr/bin/test -n "${OPESCORE_JWT_SECRET}"
-ExecStartPre=/usr/bin/test -n "${OPESCORE_ADMIN_PASS}"
+ExecStartPre=/usr/bin/test -n "${OPSCORE_JWT_SECRET}"
+ExecStartPre=/usr/bin/test -n "${OPSCORE_ADMIN_PASS}"
 # Graceful shutdown: SIGTERM cancels the serve context; HTTP surfaces drain
 # and the export scheduler settles its in-flight tick before exiting.
 TimeoutStopSec=30

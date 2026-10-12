@@ -78,10 +78,12 @@
 `NoNewPrivileges`、`ProtectSystem=strict`、`ReadWritePaths=/var/lib/opscore`）。
 
 - **secrets 契约**：`/etc/opscore/controlplane.env`（**强制**；缺文件 = 单元拒启）只含
-  `OPESCORE_JWT_SECRET` 与 `OPESCORE_ADMIN_PASS` 两枚，示例见
-  `deploy/controlplane.env.example`。**secret 绝不上 argv**（argv 对本机所有用户可见）。
-  缺 secret 时 `ExecStartPre` 拒启——绝不落回二进制的开发默认值；`admin-pass` 须满足
-  Phase 27 策略（≥12 字符、非默认口令、非用户名）。
+  `OPSCORE_JWT_SECRET` 与 `OPSCORE_ADMIN_PASS` 两枚，示例见
+  `deploy/controlplane.env.example`。**规范前缀为 `OPSCORE_<KEY>`**（ADR-091；历史拼写
+  `OPESCORE_<KEY>` 作为兼容别名保留，两者同设时规范名胜）；**env 优先于 KEY=VALUE
+  配置文件**（文件会被提交/烤进镜像，env 不会）。**secret 绝不上 argv**（argv 对本机
+  所有用户可见）。缺 secret 时 `ExecStartPre` 拒启——绝不落回二进制的开发默认值；
+  `admin-pass` 须满足 Phase 27 策略（≥12 字符、非默认口令、非用户名）。
 - **证据 flag 全部 opt-in，且只经 CLI 传入**：`--export-interval` 等是字面默认注册
   （配置文件/env 喂不进去）；`--export-interval` 与 `--export-dir` 必须成对
   （P34-I5 fail-fast）；签名/锚定/生命周期/验证/销毁/输入各面需要操作者提供

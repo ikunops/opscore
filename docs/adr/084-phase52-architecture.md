@@ -117,3 +117,11 @@ ExecStartPre=/bin/sh -c 'test -n "${OPESCORE_JWT_SECRET}" -a -n "${OPESCORE_ADMI
   「文档不得发明不存在的 flag」的部署版本机械化，见 operations.md §6 Drift 纪律）。
 - **不声称**覆盖面：参考单元是 systemd/Linux 形态；容器、Windows、多节点拓扑不在本轮
   （ADR-083 §5.5/§5.4 已登记非目标）。
+
+## 9. 更新（ADR-091，2026-10-12）
+
+§2.4/§3 中的 env 通道名与优先级由 ADR-091 修正：**规范前缀 `OPSCORE_<KEY>`**（历史
+`OPESCORE_<KEY>` 保留为兼容别名，规范名胜），且 **env 优先于 KEY=VALUE 配置文件**。
+本文档原按当时代码描述为 file-first——而 `loadConfigFile` 的契约注释历来是 env-first，
+两处矛盾由 ADR-091 判定 env-first 为准并修复代码（含一处把 file-first 钉死的既有测试）。
+参考单元与环境变量示例已改用规范名；T386 期望键同步更新。

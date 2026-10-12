@@ -65,8 +65,8 @@ make build
 #   运营探针      → :8081   (/healthz /readyz /versionz)
 
 # —— 控制面（证据平面的家；参考单元 deploy/opscore-controlplane.service）——
-export OPESCORE_JWT_SECRET=$(head -c 32 /dev/urandom | base64)   # secrets 只经 env 通道
-export OPESCORE_ADMIN_PASS='<至少12字符、非默认口令>'
+export OPSCORE_JWT_SECRET=$(head -c 32 /dev/urandom | base64)   # secrets 只经 env 通道
+export OPSCORE_ADMIN_PASS='<至少12字符、非默认口令；请替换为你自己的口令>'
 ./opscore serve --addr 127.0.0.1:8090 --mgmt-addr :8082 --storage sqlite --db ./opscore.db \
   --export-interval 15m --export-dir ./exports
 #   操作 API        → :8090

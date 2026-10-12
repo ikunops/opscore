@@ -143,7 +143,10 @@ func TestT386ControlplaneUnitContract(t *testing.T) {
 	if len(defined) != 2 {
 		t.Fatalf("T386: secrets example must define exactly 2 keys, got %v", defined)
 	}
-	for _, key := range []string{"OPESCORE_JWT_SECRET", "OPESCORE_ADMIN_PASS"} {
+	// Canonical OPSCORE_<KEY> spelling (ADR-091); the historical OPESCORE_
+	// alias stays accepted by the binary but the shipped artifacts teach the
+	// canonical name.
+	for _, key := range []string{"OPSCORE_JWT_SECRET", "OPSCORE_ADMIN_PASS"} {
 		v, ok := defined[key]
 		if !ok {
 			t.Fatalf("T386: secrets example must define %s", key)

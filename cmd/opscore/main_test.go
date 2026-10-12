@@ -42,15 +42,25 @@ func TestLoadConfigFile_MissingIsOK(t *testing.T) {
 }
 
 func TestCfgVal_Precedence(t *testing.T) {
-	t.Run("file over env over default", func(t *testing.T) {
-		t.Setenv("OPESCORE_ADDR", ":7777") // env present
+	// ADR-091: the chain is env -> file -> default. This test previously
+	// pinned "file over env", which directly contradicted loadConfigFile's own
+	// documented contract ("Env vars take precedence over the file") and let a
+	// stale config-file line silently defeat an env-injected secret.
+	t.Run("env over file over default", func(t *testing.T) {
+		t.Setenv("OPESCORE_ADDR", ":7777") // legacy spelling; still honored (ADR-091)
 		vals := map[string]string{"addr": ":8888"}
-		if got := cfgVal(vals, "addr", ":8080"); got != ":8888" {
-			t.Errorf("file should win over env/default: got %q", got)
+		if got := cfgVal(vals, "addr", ":8080"); got != ":7777" {
+			t.Errorf("env must win over the file (the documented contract): got %q", got)
 		}
 		delete(vals, "addr")
 		if got := cfgVal(vals, "addr", ":8080"); got != ":7777" {
 			t.Errorf("env should win over default: got %q", got)
+		}
+	})
+	t.Run("file when env absent", func(t *testing.T) {
+		vals := map[string]string{"addr": ":8888"}
+		if got := cfgVal(vals, "addr", ":8080"); got != ":8888" {
+			t.Errorf("file should apply when env is absent: got %q", got)
 		}
 	})
 	t.Run("default when neither", func(t *testing.T) {
@@ -91,9 +101,9 @@ func TestValidateBootstrapAdminPassword(t *testing.T) {
 	// gateApplies=false (demo or memory mode) => policy exempt, always ok.
 	t.Run("exempt when gate not applicable", func(t *testing.T) {
 		cases := []struct{ user, pass string }{
-			{"admin", "admin"},   // weak but exempt
-			{"root", "root"},     // username==pass but exempt
-			{"", ""},             // empty but exempt
+			{"admin", "admin"}, // weak but exempt
+			{"root", "root"},   // username==pass but exempt
+			{"", ""},           // empty but exempt
 		}
 		for _, c := range cases {
 			if ok, _ := validateBootstrapAdminPassword(c.user, c.pass, false); !ok {
