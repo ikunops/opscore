@@ -43,8 +43,9 @@ Deployment (harness + cmd/opscore-server)              ← 唯一组合根
 | 二进制 | 入口 | 用途 |
 |--------|------|------|
 | `opscore` | `cmd/opscore` | Phase 0 执行 CLI（`list` / `plan` / `run`） |
+| **`opscore serve`** | `cmd/opscore` 子命令 | **控制面进程（证据平面的家）**：执行 API + 调度导出/签名清单/链账本/锚定/验证/销毁与输入问责 + `:8082` 证据/保护读面与控制台 |
 | `opscore-cli` | `cmd/opscore-cli` | Phase 11.1 只读 CLI，只绑 `external/v1` |
-| **`opscore-server`** | `cmd/opscore-server` | **推荐部署入口**：Phase 12.2 Deployment Harness 唯一组合根 |
+| **`opscore-server`** | `cmd/opscore-server` | **读边（推荐部署入口）**：Phase 12.2 Deployment Harness 唯一组合根 |
 | `opscore-pkg` | `cmd/opscore-pkg` | 打包辅助 |
 
 ## 快速开始
@@ -59,9 +60,17 @@ make build
 ./opscore run  system.service.restart --name nginx      # 真正执行
 
 # —— 部署面（推荐）——
-./opscore-server -config deploy/opscore.json.example    # 启动只读服务 + 运营探针
+./opscore-server -config deploy/opscore.json.example    # 读边：只读服务 + 运营探针
 #   external/v1  → :8080   (/external/v1/{execution,host,policy,correlation})
 #   运营探针      → :8081   (/healthz /readyz /versionz)
+
+# —— 控制面（证据平面的家；参考单元 deploy/opscore-controlplane.service）——
+export OPESCORE_JWT_SECRET=$(head -c 32 /dev/urandom | base64)   # secrets 只经 env 通道
+export OPESCORE_ADMIN_PASS='<至少12字符、非默认口令>'
+./opscore serve --addr 127.0.0.1:8090 --mgmt-addr :8082 --storage sqlite --db ./opscore.db \
+  --export-interval 15m --export-dir ./exports
+#   操作 API        → :8090
+#   证据/保护读面    → :8082   (/management/v1/protection/{decisions,alerts,alerts/history/export...})
 ```
 
 ## 文档导航
@@ -69,7 +78,7 @@ make build
 | 文档 | 内容 |
 |------|------|
 | [docs/architecture.md](docs/architecture.md) | 7 层架构、SSOT 映射、Boundary Matrix |
-| [docs/deployment.md](docs/deployment.md) | 单节点部署、配置、双 bind、优雅关闭 |
+| [docs/deployment.md](docs/deployment.md) | 单节点部署（读边 + 控制面两进程）、配置、bind 分配、优雅关闭 |
 | [docs/policy-lifecycle.md](docs/policy-lifecycle.md) | Policy 持久化与只读生命周期 |
 | [docs/external-contract.md](docs/external-contract.md) | 版本化只读公共契约（external/v1） |
 | [docs/operations.md](docs/operations.md) | 演进章程、继电器铁律、机械守卫、Drift Log |
@@ -85,6 +94,7 @@ make build
 | Phase 24~39 | **证据链地基**：告警历史导出的快照内部一致性、跨快照 seq 覆盖、Ed25519 签名 + 独立信任锚、逐跳发布链、与保留期无关的 chain ledger | ✅ CLOSED |
 | Phase 40~51 | **证据链的域外/时间/身份维度**：发布锚定（域外见证）、密钥生命周期、验证报告、销毁留痕、验证者独立性（VAK）、输入完整性、见证对账、投递清偿、判定留痕、锚定兑现、验证者授权生命周期、生命周期主体域 | ✅ CLOSED（ADR-052~081） |
 | 证据体系 | **两次独立对抗挑战判定收敛**：十二个问题面各有机制、状态面、判别用例与变异；登记债全部清偿或具名 | ✅（ADR-079~081 为竞态检测落地与并发收口） |
+| Phase 52 | **部署整合**：证据平面进入部署 SSOT（控制面参考部署 `deploy/opscore-controlplane.service` + secrets 契约 + :8082 单绑定纪律 + 机械守卫 T386~T388） | ✅ CLOSED（ADR-083/084） |
 
 > 演进纪律见 [docs/operations.md](docs/operations.md)：Major 变更须 Scope → Architecture →
 > Implementation 三级签字，且先定范围、不直接编码。冻结面（执行引擎与证据原语）的
@@ -100,8 +110,8 @@ Demo 保留了原始的 metrics 采集、服务识别、防火墙操作等逻辑
 
 - **语言**: Go 1.22+
 - **依赖**: 极少（配置层用 `encoding/json`，无 yaml）
-- **入口**: `opscore-server`（HTTP 只读服务）+ `opscore`（执行 CLI）
-- **部署**: 单节点 systemd / distroless 容器（多节点为预留 inert seam）
+- **入口**: `opscore-server`（读边，HTTP 只读服务）+ `opscore serve`（控制面，证据平面的家）+ `opscore`（执行 CLI）
+- **部署**: 单节点 systemd（读边 + 控制面两进程参考单元）/ distroless 容器（读边；多节点为预留 inert seam）
 
 ## License
 

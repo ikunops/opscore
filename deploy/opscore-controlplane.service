@@ -1,0 +1,81 @@
+[Unit]
+Description=OpsCore Control Plane (single-node; execution API + evidence plane)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The Control Plane is the home of the evidence pipeline (scheduled export,
+# signed manifests, chain ledger, anchoring, verification attestation,
+# destruction and input-integrity accountability) and of the :8082
+# protection/evidence read surface + operational console. The read edge
+# (opscore-server) serves the external/v1 contract as a separate process; this
+# unit introduces NO second read wiring and wraps the existing `opscore serve`
+# subcommand unchanged (no new production wiring path is created here).
+#
+# Address discipline (one host, two processes): the read edge owns :8080
+# (external/v1) and :8081 (probe). This unit therefore binds the operational
+# API to loopback :8090 and keeps :8082 as the evidence/protection read
+# surface. Exactly ONE control-plane process may bind :8082 (deployment caveat
+# R97): if the read edge's management write surface is enabled on the same
+# host, point it elsewhere (`management.listen` in opscore.json).
+WorkingDirectory=/var/lib/opscore
+ExecStart=/usr/local/bin/opscore serve \
+    --addr 127.0.0.1:8090 \
+    --mgmt-addr :8082 \
+    --storage sqlite \
+    --db /var/lib/opscore/controlplane.db \
+    --export-interval 15m \
+    --export-dir /var/lib/opscore/exports \
+    --export-ledger-capacity 4096
+#
+# Evidence pipeline opt-in flags. ALL OFF in this reference: every surface
+# below needs a key/endpoint/path that only the operator can supply, and a
+# disabled face answers 503 rather than pretending to be on. Enable only what
+# your trust anchors exist for (uncomment and adjust):
+#
+#   signing:      --export-sign-key /var/lib/opscore/keys/export-sign.pem
+#                 --export-trust-keys /var/lib/opscore/keys/export-trust-1.pem
+#   anchoring:    --export-anchor-endpoint https://witness.example/anchor
+#                 --export-anchor-timeout 10s --export-anchor-max-attempts 5
+#                 --export-anchor-capacity 4096
+#   lifecycle:    --export-key-authority /var/lib/opscore/keys/key-authority.json
+#                 --export-key-authority-trust /var/lib/opscore/keys/kak-trust.pem
+#                 --export-key-lifecycle-capacity 4096
+#   verification: --export-verify-attest --export-verify-interval 6h
+#                 --export-verify-capacity 1024
+#                 --export-verifier-key /var/lib/opscore/keys/verifier.pem
+#                 --export-verifier-trust /var/lib/opscore/keys/verifier-trust.pem
+#   destruction:  --export-destruction-log /var/lib/opscore/exports/destruction.jsonl
+#                 --export-destruction-capacity 4096
+#   input:        --export-acceptance-log /var/lib/opscore/exports/acceptance.jsonl
+#                 --export-acceptance-capacity 4096
+#   formats:      --export-formats json,csv --export-retain 96
+#
+# Secrets: /etc/opscore/controlplane.env (MANDATORY; a missing file makes the
+# unit refuse to start) carries OPESCORE_JWT_SECRET and OPESCORE_ADMIN_PASS
+# only. Neither value ever appears on the command line above: argv is visible
+# to every local user.
+EnvironmentFile=/etc/opscore/controlplane.env
+# Fail closed when either secret is absent: refuse to start rather than let
+# the binary fall back to its well-known development defaults.
+ExecStartPre=/usr/bin/test -n "${OPESCORE_JWT_SECRET}"
+ExecStartPre=/usr/bin/test -n "${OPESCORE_ADMIN_PASS}"
+# Graceful shutdown: SIGTERM cancels the serve context; HTTP surfaces drain
+# and the export scheduler settles its in-flight tick before exiting.
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=2
+# Run as a dedicated non-root user with restrictive perms on the data dir.
+User=opscore
+Group=opscore
+# Hardening, mirroring the read-edge unit (deploy/opscore.service).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/opscore
+StateDirectory=opscore
+StateDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
