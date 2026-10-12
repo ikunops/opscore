@@ -36,6 +36,9 @@
 - **零新依赖**：配置层用 `encoding/json`（无 yaml）；`go.mod` 仅极少依赖。
 - **`governancepolicy` 守卫**：`NewFileRepository` 内部 `MkdirAll`、空 dir → `ErrInvalidID`、
   `Repository` 无 `Close`（基于单次文件读写）；`TestNoEngineEval` 禁止调用引擎。
+- **注释语言约定（P55/ADR-089）**：代码注释与错误消息**英文**（可 grep、日志/审计单一
+  语言、错误串进 API 响应）；ADR、运维文档、UI 文案**中文**。既有注释**不追溯重写**
+  （避免噪声 diff 淹没语义变更）。
 
 ## 4. 质量门禁（Quality Gate）
 
